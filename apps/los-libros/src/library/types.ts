@@ -97,7 +97,7 @@ export interface Highlight {
   noteId?: string;
 }
 
-export type HighlightColor = 'yellow' | 'green' | 'blue' | 'pink' | 'purple';
+export type HighlightColor = 'yellow' | 'green' | 'blue' | 'pink' | 'purple' | 'orange';
 
 /**
  * Reading progress
@@ -109,6 +109,45 @@ export interface ReadingProgress {
   page?: number;
   totalPages?: number;
   lastRead: Date;
+}
+
+/**
+ * Readium Locator - Industry standard for EPUB position persistence
+ *
+ * This model provides robust position restoration that survives:
+ * - Reflow (font size, window size changes)
+ * - Minor content edits
+ * - Different reading systems
+ *
+ * @see https://github.com/readium/architecture/tree/master/models/locators
+ */
+export interface ReadiumLocator {
+  /** Resource path within the EPUB (chapter file) */
+  href: string;
+  /** MIME type of the resource */
+  type: string;
+  /** Optional chapter title for display */
+  title?: string;
+  /** Position within the resource */
+  locations: {
+    /** Full EPUB CFI with element path and character offset */
+    cfi: string;
+    /** Progress within the chapter (0-1) */
+    progression: number;
+    /** Optional position in 1024-byte list (for sorting) */
+    position?: number;
+    /** Total positions in the book (for calculating overall progress) */
+    totalPositions?: number;
+  };
+  /** Text context for fuzzy matching fallback */
+  text: {
+    /** First visible text (up to 100 chars) for fallback matching */
+    highlight: string;
+    /** Text before the position (up to 32 chars) */
+    before?: string;
+    /** Text after the position (up to 32 chars) */
+    after?: string;
+  };
 }
 
 /**

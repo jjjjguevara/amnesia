@@ -95,6 +95,8 @@
   function handleFlowChange(event: Event) {
     const target = event.target as HTMLSelectElement;
     handleChange({ flow: target.value as 'paginated' | 'scrolled' });
+    // Close settings panel when switching reading mode to show the mode change
+    dispatch('close');
   }
 
   function handlePageAnimationChange(event: Event) {

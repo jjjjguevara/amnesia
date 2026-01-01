@@ -16,7 +16,12 @@
   import HighlightsTab from './HighlightsTab.svelte';
   import BookmarksTab from './BookmarksTab.svelte';
   import NotesTab from './NotesTab.svelte';
-  import ImagesTab from './ImagesTab.svelte';
+  import ImagesTab, { type BookImage } from './ImagesTab.svelte';
+  import TocTab from './TocTab.svelte';
+  import SearchTab from './SearchTab.svelte';
+  import ImageLightbox from '../../reader/components/ImageLightbox.svelte';
+  import type { TocEntry } from '../../reader/renderer/types';
+  import { getSearchIndex, type SearchResult } from '../../reader/search-index';
   import {
     Search,
     X,
@@ -36,6 +41,24 @@
   let highlights: Highlight[] = [];
   let bookmarks: Bookmark[] = [];
   let notes: ReadingNote[] = [];
+  let bookImages: BookImage[] = [];
+  let imagesLoading = false;
+  let imagesLoadedForBook: string | null = null;
+
+  // Lightbox state
+  let lightboxOpen = false;
+  let lightboxStartIndex = 0;
+
+  // ToC state
+  let toc: TocEntry[] = [];
+  let currentChapter: string | null = null;
+
+  // Search state
+  let searchResults: Map<string, SearchResult[]> = new Map();
+  let searchLoading = false;
+  let searchIndexReady = false;
+  let searchIndexProgress = 0;
+  let searchIndexTotal = 0;
 
   // Subscribe to sidebar store
   const unsubscribeSidebar = sidebarStore.subscribe(state => {
@@ -89,6 +112,117 @@
     highlights = [];
     bookmarks = [];
     notes = [];
+    bookImages = [];
+    imagesLoadedForBook = null;
+    toc = [];
+    currentChapter = null;
+  }
+
+  function getTocCount(entries: TocEntry[]): number {
+    let count = entries.length;
+    for (const entry of entries) {
+      count += getTocCount(entry.children);
+    }
+    return count;
+  }
+
+  // Extract images when images tab is selected
+  $: if (activeTab === 'images' && activeBookId && imagesLoadedForBook !== activeBookId) {
+    extractBookImages();
+  }
+
+  async function extractBookImages() {
+    if (!activeBookPath || !plugin.settings.serverUrl) {
+      bookImages = [];
+      return;
+    }
+
+    imagesLoading = true;
+    const currentBookId = activeBookId;
+
+    try {
+      const { createApiClient, getDeviceId } = await import('../../reader/renderer');
+      const deviceId = getDeviceId();
+      const apiClient = createApiClient({ baseUrl: plugin.settings.serverUrl, deviceId });
+
+      // Check if server is available
+      const serverAvailable = await apiClient.healthCheck();
+      if (!serverAvailable) {
+        console.warn('Server not available for image extraction');
+        bookImages = [];
+        imagesLoading = false;
+        return;
+      }
+
+      // Load and upload the book to get parsed data
+      const { loadBook } = await import('../../reader/book-loader');
+      const vaultBooks = plugin.libraryStore.getValue().books;
+      const calibreBooks = plugin.calibreService?.getStore().getValue().books ?? [];
+
+      const loadedBook = await loadBook(plugin.app, activeBookPath, vaultBooks, calibreBooks);
+      const filename = activeBookPath.split('/').pop() || 'book.epub';
+      const parsedBook = await apiClient.uploadBook(loadedBook.arrayBuffer, filename);
+
+      const imageItems: BookImage[] = [];
+
+      // Extract images from each spine item
+      for (let spineIndex = 0; spineIndex < parsedBook.spine.length; spineIndex++) {
+        const spineItem = parsedBook.spine[spineIndex];
+        try {
+          const content = await apiClient.getChapter(parsedBook.id, spineItem.href);
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(content.html, 'text/html');
+          const imgElements = doc.querySelectorAll('img');
+
+          for (const img of Array.from(imgElements)) {
+            const src = img.getAttribute('src') || img.getAttribute('data-src');
+            if (src && !imageItems.find(i => i.href === src)) {
+              try {
+                const dataUrl = await apiClient.getResourceAsDataUrl(parsedBook.id, src);
+                imageItems.push({
+                  id: `img-${imageItems.length}`,
+                  href: src,
+                  blobUrl: dataUrl,
+                  spineIndex,
+                  spineHref: spineItem.href,
+                });
+              } catch (e) {
+                console.warn(`Failed to load image ${src}:`, e);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn(`Failed to process chapter ${spineItem.href}:`, e);
+        }
+      }
+
+      // Add cover image if exists
+      if (parsedBook.metadata.coverHref && !imageItems.find(i => i.href === parsedBook.metadata.coverHref)) {
+        try {
+          const coverUrl = await apiClient.getResourceAsDataUrl(parsedBook.id, parsedBook.metadata.coverHref);
+          imageItems.unshift({
+            id: 'cover',
+            href: parsedBook.metadata.coverHref,
+            blobUrl: coverUrl,
+            spineIndex: 0,
+            spineHref: parsedBook.spine[0]?.href || '',
+          });
+        } catch (e) {
+          console.warn('Failed to load cover image:', e);
+        }
+      }
+
+      // Only update if we're still on the same book
+      if (currentBookId === activeBookId) {
+        bookImages = imageItems;
+        imagesLoadedForBook = currentBookId;
+      }
+    } catch (e) {
+      console.error('Failed to extract images:', e);
+      bookImages = [];
+    }
+
+    imagesLoading = false;
   }
 
   function handleSearchInput(event: Event) {
@@ -144,9 +278,40 @@
     bookmarks = artifacts.bookmarks;
   }
 
+  function updateBookmark(id: string, name: string) {
+    if (!activeBookId || !plugin.bookmarkService) return;
+    plugin.bookmarkService.updateBookmark({ id, name });
+    const artifacts = plugin.bookmarkService.getBookArtifacts(activeBookId);
+    bookmarks = artifacts.bookmarks;
+  }
+
+  // Track current bookmark index for prev/next navigation
+  let currentBookmarkIndex = -1;
+
+  function navigateToNextBookmark() {
+    if (!activeBookPath || bookmarks.length < 2) return;
+    const sorted = [...bookmarks].sort((a, b) => (a.pagePercent || 0) - (b.pagePercent || 0));
+    currentBookmarkIndex = (currentBookmarkIndex + 1) % sorted.length;
+    navigateToCfi(sorted[currentBookmarkIndex].cfi);
+  }
+
+  function navigateToPrevBookmark() {
+    if (!activeBookPath || bookmarks.length < 2) return;
+    const sorted = [...bookmarks].sort((a, b) => (a.pagePercent || 0) - (b.pagePercent || 0));
+    currentBookmarkIndex = currentBookmarkIndex <= 0 ? sorted.length - 1 : currentBookmarkIndex - 1;
+    navigateToCfi(sorted[currentBookmarkIndex].cfi);
+  }
+
   function deleteNote(id: string) {
     if (!activeBookId || !plugin.bookmarkService) return;
     plugin.bookmarkService.deleteNote(activeBookId, id);
+    const artifacts = plugin.bookmarkService.getBookArtifacts(activeBookId);
+    notes = artifacts.notes;
+  }
+
+  function updateNote(id: string, content: string, tags: string[]) {
+    if (!activeBookId || !plugin.bookmarkService) return;
+    plugin.bookmarkService.updateNote({ id, content, tags });
     const artifacts = plugin.bookmarkService.getBookArtifacts(activeBookId);
     notes = artifacts.notes;
   }
@@ -155,6 +320,98 @@
     if (!activeBookPath) return;
     plugin.openImagesView(activeBookPath, activeBookTitle || 'Book Images');
   }
+
+  function navigateToImage(spineIndex: number, imageHref: string) {
+    if (!activeBookPath) return;
+
+    // Find the reader view and navigate to the chapter containing the image
+    const leaves = plugin.app.workspace.getLeavesOfType('los-libros-reader');
+    for (const leaf of leaves) {
+      const view = leaf.view as any;
+      if (view.bookPath === activeBookPath || view.getState?.()?.bookPath === activeBookPath) {
+        // Navigate to the spine index (chapter) containing the image
+        view.navigateToChapter?.(spineIndex);
+        plugin.app.workspace.revealLeaf(leaf);
+        return;
+      }
+    }
+  }
+
+  function handleOpenLightbox(index: number, images: BookImage[]) {
+    lightboxStartIndex = index;
+    lightboxOpen = true;
+  }
+
+  function closeLightbox() {
+    lightboxOpen = false;
+  }
+
+  function navigateToTocEntry(href: string) {
+    if (!activeBookPath) return;
+
+    // Find the reader view and navigate
+    const leaves = plugin.app.workspace.getLeavesOfType('los-libros-reader');
+    for (const leaf of leaves) {
+      const view = leaf.view as any;
+      if (view.bookPath === activeBookPath || view.getState?.()?.bookPath === activeBookPath) {
+        view.navigateToHref?.(href);
+        plugin.app.workspace.revealLeaf(leaf);
+        return;
+      }
+    }
+  }
+
+  // Method to update ToC from reader
+  export function setToc(entries: TocEntry[]) {
+    toc = entries;
+  }
+
+  export function setCurrentChapter(chapter: string | null) {
+    currentChapter = chapter;
+  }
+
+  // Search methods
+  function handleSearch(query: string) {
+    const searchIndex = getSearchIndex();
+    if (!searchIndex.ready) return;
+
+    searchLoading = true;
+    // Use setTimeout to allow UI to update
+    setTimeout(() => {
+      searchResults = searchIndex.searchGrouped(query);
+      searchLoading = false;
+    }, 0);
+  }
+
+  function clearSearchResults() {
+    searchResults = new Map();
+  }
+
+  function navigateToSearchResult(spineIndex: number, text: string) {
+    if (!activeBookPath) return;
+
+    // Find the reader view and navigate
+    const leaves = plugin.app.workspace.getLeavesOfType('los-libros-reader');
+    for (const leaf of leaves) {
+      const view = leaf.view as any;
+      if (view.bookPath === activeBookPath || view.getState?.()?.bookPath === activeBookPath) {
+        // Navigate to the chapter and then find the text
+        view.navigateToChapterAndText?.(spineIndex, text);
+        plugin.app.workspace.revealLeaf(leaf);
+        return;
+      }
+    }
+  }
+
+  // Export methods to update search index state from reader
+  export function updateSearchIndexState(ready: boolean, progress: number, total: number) {
+    searchIndexReady = ready;
+    searchIndexProgress = progress;
+    searchIndexTotal = total;
+  }
+
+  // Calculate total search results count
+  $: totalSearchResults = Array.from(searchResults.values()).reduce((sum, arr) => sum + arr.length, 0);
 
   function handleExportData() {
     // Export notes functionality - can be implemented later
@@ -201,47 +458,49 @@
 </script>
 
 <div class="book-sidebar">
-  <!-- Header with ViewModeSwitcher and ControlsBar -->
+  <!-- Header row: ViewModeSwitcher + Controls (right-aligned) -->
   <div class="sidebar-header">
     <ViewModeSwitcher
+      searchResultsCount={totalSearchResults}
+      tocCount={getTocCount(toc)}
       highlightsCount={highlights.length}
       bookmarksCount={bookmarks.length}
       notesCount={notes.length}
     />
-    <ControlsBar
-      {activeTab}
-      {showSearch}
-      {hasActiveBook}
-      on:exportData={handleExportData}
-      on:toggleFilter={handleToggleFilter}
-    />
+    {#if activeBookTitle}
+      <div class="book-title-inline">
+        <span class="book-title">{activeBookTitle}</span>
+      </div>
+    {/if}
+    {#if hasActiveBook && activeTab !== 'search'}
+      <div class="header-controls">
+        <ControlsBar
+          {activeTab}
+          {showSearch}
+          {hasActiveBook}
+          on:exportData={handleExportData}
+          on:toggleFilter={handleToggleFilter}
+        />
+      </div>
+    {/if}
   </div>
 
-  <!-- Expanded panels -->
-  {#if showSearch && hasActiveBook}
-    <div class="expanded-panel">
-      <div class="search-bar">
-        <Search size={14} />
+  <!-- Expanded panels (filter search for highlights/bookmarks/notes) -->
+  {#if showSearch && hasActiveBook && activeTab !== 'search'}
+    <div class="expanded-panel search-row">
+      <div class="search-input-container global-search-input-container">
         <input
-          type="text"
-          placeholder="Search {activeTab}..."
+          type="search"
+          enterkeyhint="search"
+          spellcheck="false"
+          placeholder="Filter {activeTab}..."
           value={searchQuery}
           on:input={handleSearchInput}
         />
         {#if searchQuery}
-          <button class="clear-btn" on:click={clearSearch}>
-            <X size={14} />
-          </button>
+          <div class="search-input-clear-button" on:click={clearSearch} on:keydown={(e) => e.key === 'Enter' && clearSearch()} role="button" tabindex="0" aria-label="Clear search"></div>
         {/if}
       </div>
-    </div>
-  {/if}
-
-  <!-- Book title bar (when a book is selected) -->
-  {#if activeBookTitle}
-    <div class="book-title-bar">
-      <BookOpen size={14} />
-      <span class="book-title">{activeBookTitle}</span>
     </div>
   {/if}
 
@@ -253,6 +512,23 @@
         <p>No book selected</p>
         <p class="hint">Open a book to view its highlights, bookmarks, and notes</p>
       </div>
+    {:else if activeTab === 'search'}
+      <SearchTab
+        results={searchResults}
+        loading={searchLoading}
+        indexReady={searchIndexReady}
+        indexProgress={searchIndexProgress}
+        indexTotal={searchIndexTotal}
+        on:search={(e) => handleSearch(e.detail.query)}
+        on:navigate={(e) => navigateToSearchResult(e.detail.spineIndex, e.detail.text)}
+        on:clear={clearSearchResults}
+      />
+    {:else if activeTab === 'toc'}
+      <TocTab
+        {toc}
+        {currentChapter}
+        on:navigate={(e) => navigateToTocEntry(e.detail.href)}
+      />
     {:else if activeTab === 'highlights'}
       <HighlightsTab
         highlights={filteredHighlights}
@@ -264,110 +540,84 @@
         bookmarks={filteredBookmarks}
         on:navigate={(e) => navigateToCfi(e.detail.cfi)}
         on:delete={(e) => deleteBookmark(e.detail.id)}
+        on:update={(e) => updateBookmark(e.detail.id, e.detail.name)}
+        on:navigatePrev={navigateToPrevBookmark}
+        on:navigateNext={navigateToNextBookmark}
       />
     {:else if activeTab === 'notes'}
       <NotesTab
         notes={filteredNotes}
         on:navigate={(e) => navigateToCfi(e.detail.cfi)}
         on:delete={(e) => deleteNote(e.detail.id)}
+        on:update={(e) => updateNote(e.detail.id, e.detail.content, e.detail.tags)}
       />
     {:else if activeTab === 'images'}
       <ImagesTab
-        bookPath={activeBookPath}
-        bookTitle={activeBookTitle}
-        on:openGallery={openImagesGallery}
+        images={bookImages}
+        loading={imagesLoading}
+        on:navigate={(e) => navigateToImage(e.detail.spineIndex, e.detail.imageHref)}
+        on:openLightbox={(e) => handleOpenLightbox(e.detail.index, e.detail.images)}
       />
     {/if}
   </div>
 </div>
+
+<!-- Image Lightbox -->
+<ImageLightbox
+  images={bookImages}
+  startIndex={lightboxStartIndex}
+  open={lightboxOpen}
+  on:close={closeLightbox}
+/>
 
 <style>
   .book-sidebar {
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--background-primary);
+    /* No background - inherit from Obsidian's default leaf styling */
     color: var(--text-normal);
-    gap: 8px;
   }
 
   .sidebar-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 8px;
+    padding: 0 8px;
+    margin: 0;
     gap: 8px;
+    height: 32px;
     flex-shrink: 0;
     position: relative;
     z-index: 10;
   }
 
-  .expanded-panel {
-    width: 100%;
-    padding: 0 8px;
-    box-sizing: border-box;
-  }
-
-  .search-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    background: var(--background-secondary);
-    border-radius: var(--radius-s);
-  }
-
-  .search-bar input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    font-size: 0.85rem;
-    color: var(--text-normal);
-  }
-
-  .search-bar input::placeholder {
-    color: var(--text-muted);
-  }
-
-  .clear-btn {
-    padding: 2px;
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    color: var(--text-muted);
+  .header-controls {
+    margin-left: auto;
     display: flex;
     align-items: center;
   }
 
-  .clear-btn:hover {
-    color: var(--text-normal);
-  }
-
-  .book-title-bar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    background: var(--background-secondary);
-    margin: 0 8px;
-    border-radius: var(--radius-s);
-    color: var(--text-muted);
-  }
-
+  /* Book title styles are in global styles.css for :has() selector support */
   .book-title {
-    font-size: 0.8rem;
+    font-size: var(--font-ui-small);
     font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    flex: 1;
+    color: var(--text-muted);
+  }
+
+  .controls-row {
+    padding: 0 6px 4px;
+    flex-shrink: 0;
+  }
+
+  /* Expanded panel inherits from Obsidian's .search-row class */
+  .expanded-panel {
+    padding-left: 6px;
+    padding-right: 6px;
   }
 
   .sidebar-content {
     flex: 1;
     overflow-y: auto;
-    padding: 0 8px 8px;
   }
 
   .empty-state {
@@ -382,11 +632,11 @@
 
   .empty-state p {
     margin: 8px 0 0;
-    font-size: 0.9rem;
+    font-size: var(--font-ui-small);
   }
 
   .empty-state .hint {
-    font-size: 0.8rem;
+    font-size: var(--font-ui-smaller);
     opacity: 0.7;
     max-width: 200px;
   }

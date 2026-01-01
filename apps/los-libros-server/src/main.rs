@@ -24,7 +24,9 @@ mod epub;
 mod error;
 mod html;
 mod library;
+mod ocr;
 mod opds;
+mod pdf;
 mod routes;
 mod state;
 mod storage;
@@ -105,6 +107,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/api/v1/health", get(health_check))
         .nest("/api/v1/books", routes::books::router())
+        .nest("/api/v1/pdf", routes::pdf::router())
         .nest("/opds", routes::opds::router(library_cache))
         .nest("/files", routes::files::router())
         .nest("/api/v1/progress", routes::progress::router(db_pool.clone()))

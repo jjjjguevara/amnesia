@@ -70,6 +70,10 @@ pub struct AnnotationTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum Selector {
+    // ============================================
+    // EPUB Selectors
+    // ============================================
+
     /// EPUB CFI fragment identifier
     #[serde(rename = "FragmentSelector")]
     Fragment {
@@ -118,6 +122,58 @@ pub enum Selector {
         #[serde(rename = "endOffset")]
         end_offset: usize,
     },
+
+    // ============================================
+    // PDF Selectors
+    // ============================================
+
+    /// PDF page selector (page number with optional position)
+    #[serde(rename = "PdfPageSelector")]
+    PdfPage {
+        /// Page number (1-indexed)
+        page: usize,
+        /// Optional position within page (normalized 0-1, origin top-left)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position: Option<PdfPosition>,
+    },
+    /// PDF text quote selector (text with context on a specific page)
+    #[serde(rename = "PdfTextQuoteSelector")]
+    PdfTextQuote {
+        /// Page number (1-indexed)
+        page: usize,
+        /// The exact text that was highlighted
+        exact: String,
+        /// Text before the selection (for context)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+        /// Text after the selection (for context)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suffix: Option<String>,
+    },
+    /// PDF region selector (bounding box on a specific page)
+    #[serde(rename = "PdfRegionSelector")]
+    PdfRegion {
+        /// Page number (1-indexed)
+        page: usize,
+        /// Bounding box (normalized 0-1 coordinates, origin top-left)
+        rect: PdfRect,
+    },
+}
+
+/// Normalized position on PDF page (0-1, origin top-left)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PdfPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Normalized rectangle on PDF page (0-1, origin top-left)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PdfRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Body/content of an annotation
@@ -272,6 +328,41 @@ impl Annotation {
             _ => None,
         })
     }
+
+    /// Get the PDF page number if this is a PDF annotation
+    pub fn pdf_page(&self) -> Option<usize> {
+        self.target.selectors.iter().find_map(|s| match s {
+            Selector::PdfPage { page, .. } => Some(*page),
+            Selector::PdfTextQuote { page, .. } => Some(*page),
+            Selector::PdfRegion { page, .. } => Some(*page),
+            _ => None,
+        })
+    }
+
+    /// Get the PDF text quote if available
+    pub fn pdf_text_quote(&self) -> Option<&str> {
+        self.target.selectors.iter().find_map(|s| match s {
+            Selector::PdfTextQuote { exact, .. } => Some(exact.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Get the PDF region if available
+    pub fn pdf_region(&self) -> Option<&PdfRect> {
+        self.target.selectors.iter().find_map(|s| match s {
+            Selector::PdfRegion { rect, .. } => Some(rect),
+            _ => None,
+        })
+    }
+
+    /// Check if this annotation is for a PDF document
+    pub fn is_pdf_annotation(&self) -> bool {
+        self.target.selectors.iter().any(|s| matches!(s,
+            Selector::PdfPage { .. } |
+            Selector::PdfTextQuote { .. } |
+            Selector::PdfRegion { .. }
+        ))
+    }
 }
 
 impl AnnotationTarget {
@@ -310,6 +401,85 @@ impl AnnotationTarget {
     /// Add a text position selector
     pub fn add_text_position(&mut self, start: usize, end: usize) {
         self.selectors.push(Selector::TextPosition { start, end });
+    }
+
+    // ============================================
+    // PDF Target Constructors
+    // ============================================
+
+    /// Create a target for a PDF page
+    pub fn from_pdf_page(source: &str, page: usize) -> Self {
+        Self {
+            source: source.to_string(),
+            selectors: vec![Selector::PdfPage {
+                page,
+                position: None,
+            }],
+        }
+    }
+
+    /// Create a target for a PDF page with position
+    pub fn from_pdf_page_position(source: &str, page: usize, position: PdfPosition) -> Self {
+        Self {
+            source: source.to_string(),
+            selectors: vec![Selector::PdfPage {
+                page,
+                position: Some(position),
+            }],
+        }
+    }
+
+    /// Create a target for PDF text selection
+    pub fn from_pdf_text(
+        source: &str,
+        page: usize,
+        exact: &str,
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) -> Self {
+        Self {
+            source: source.to_string(),
+            selectors: vec![Selector::PdfTextQuote {
+                page,
+                exact: exact.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                suffix: suffix.map(|s| s.to_string()),
+            }],
+        }
+    }
+
+    /// Create a target for a PDF region (scanned document)
+    pub fn from_pdf_region(source: &str, page: usize, rect: PdfRect) -> Self {
+        Self {
+            source: source.to_string(),
+            selectors: vec![Selector::PdfRegion { page, rect }],
+        }
+    }
+
+    /// Add a PDF page selector
+    pub fn add_pdf_page(&mut self, page: usize, position: Option<PdfPosition>) {
+        self.selectors.push(Selector::PdfPage { page, position });
+    }
+
+    /// Add a PDF text quote selector
+    pub fn add_pdf_text_quote(
+        &mut self,
+        page: usize,
+        exact: &str,
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) {
+        self.selectors.push(Selector::PdfTextQuote {
+            page,
+            exact: exact.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            suffix: suffix.map(|s| s.to_string()),
+        });
+    }
+
+    /// Add a PDF region selector
+    pub fn add_pdf_region(&mut self, page: usize, rect: PdfRect) {
+        self.selectors.push(Selector::PdfRegion { page, rect });
     }
 }
 
@@ -360,5 +530,110 @@ mod tests {
         // Verify round-trip
         let parsed: Annotation = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.book_id, "book-123");
+    }
+
+    // ============================================
+    // PDF Selector Tests
+    // ============================================
+
+    #[test]
+    fn test_pdf_page_selector() {
+        let target = AnnotationTarget::from_pdf_page("document.pdf", 5);
+        let highlight = Annotation::new_highlight("pdf-123", target);
+
+        assert!(highlight.is_pdf_annotation());
+        assert_eq!(highlight.pdf_page(), Some(5));
+        assert!(!highlight.cfi().is_some()); // No CFI for PDF
+    }
+
+    #[test]
+    fn test_pdf_page_with_position() {
+        let position = PdfPosition { x: 0.25, y: 0.75 };
+        let target = AnnotationTarget::from_pdf_page_position("document.pdf", 10, position);
+        let highlight = Annotation::new_highlight("pdf-123", target);
+
+        assert!(highlight.is_pdf_annotation());
+        assert_eq!(highlight.pdf_page(), Some(10));
+    }
+
+    #[test]
+    fn test_pdf_text_selector() {
+        let target = AnnotationTarget::from_pdf_text(
+            "document.pdf",
+            3,
+            "highlighted text",
+            Some("before "),
+            Some(" after"),
+        );
+        let highlight = Annotation::new_highlight("pdf-123", target);
+
+        assert!(highlight.is_pdf_annotation());
+        assert_eq!(highlight.pdf_page(), Some(3));
+        assert_eq!(highlight.pdf_text_quote(), Some("highlighted text"));
+    }
+
+    #[test]
+    fn test_pdf_region_selector() {
+        let rect = PdfRect {
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.4,
+        };
+        let target = AnnotationTarget::from_pdf_region("document.pdf", 7, rect);
+        let highlight = Annotation::new_highlight("pdf-123", target);
+
+        assert!(highlight.is_pdf_annotation());
+        assert_eq!(highlight.pdf_page(), Some(7));
+        let region = highlight.pdf_region().unwrap();
+        assert!((region.x - 0.1).abs() < f64::EPSILON);
+        assert!((region.width - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pdf_selector_serialization() {
+        let rect = PdfRect {
+            x: 0.1,
+            y: 0.2,
+            width: 0.5,
+            height: 0.3,
+        };
+        let target = AnnotationTarget::from_pdf_region("document.pdf", 5, rect);
+        let highlight = Annotation::new_highlight("pdf-123", target).with_color("#00ff00");
+
+        let json = serde_json::to_string_pretty(&highlight).unwrap();
+        assert!(json.contains("PdfRegionSelector"));
+        assert!(json.contains("\"page\": 5"));
+        assert!(json.contains("\"x\": 0.1"));
+
+        // Verify round-trip
+        let parsed: Annotation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.book_id, "pdf-123");
+        assert!(parsed.is_pdf_annotation());
+        assert_eq!(parsed.pdf_page(), Some(5));
+    }
+
+    #[test]
+    fn test_pdf_multi_selector() {
+        let mut target = AnnotationTarget::from_pdf_page("document.pdf", 5);
+        target.add_pdf_text_quote(5, "some text", Some("before "), None);
+        target.add_progression(0.5);
+
+        assert_eq!(target.selectors.len(), 3);
+
+        let highlight = Annotation::new_highlight("pdf-123", target);
+        assert!(highlight.is_pdf_annotation());
+        assert_eq!(highlight.pdf_page(), Some(5));
+        assert_eq!(highlight.pdf_text_quote(), Some("some text"));
+        assert_eq!(highlight.progression(), Some(0.5));
+    }
+
+    #[test]
+    fn test_epub_annotation_is_not_pdf() {
+        let target = AnnotationTarget::from_cfi("chapter1.xhtml", "epubcfi(/6/4!/4/2)");
+        let highlight = Annotation::new_highlight("book-123", target);
+
+        assert!(!highlight.is_pdf_annotation());
+        assert!(highlight.pdf_page().is_none());
     }
 }

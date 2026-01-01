@@ -24,9 +24,14 @@ export type SelectionCallback = (selection: SelectionData) => void;
 
 /**
  * Text Selection Handler
+ *
+ * Works with both regular documents and Shadow DOM.
+ * For Shadow DOM, listens on the shadow root for events
+ * but uses window.getSelection() for the selection API.
  */
 export class SelectionHandler {
   private doc: Document;
+  private eventTarget: EventTarget; // Shadow root or document
   private config: RendererConfig;
   private onSelection: SelectionCallback;
 
@@ -37,14 +42,46 @@ export class SelectionHandler {
   // Track actual pointer position for accurate popup placement
   private lastPointerPosition = { x: 0, y: 0 };
 
+  // Bound event handlers for cleanup
+  private boundMouseMove: (e: MouseEvent) => void;
+  private boundMouseUp: (e: MouseEvent) => void;
+  private boundTouchEnd: (e: TouchEvent) => void;
+  private boundSelectionChange: () => void;
+
   constructor(
     doc: Document,
     config: RendererConfig,
-    onSelection: SelectionCallback
+    onSelection: SelectionCallback,
+    shadowRoot?: ShadowRoot
   ) {
     this.doc = doc;
+    this.eventTarget = shadowRoot || doc;
     this.config = config;
     this.onSelection = onSelection;
+
+    // Bind handlers for proper cleanup
+    this.boundMouseMove = (e: MouseEvent) => {
+      this.lastPointerPosition = { x: e.clientX, y: e.clientY };
+    };
+    this.boundMouseUp = (e: MouseEvent) => {
+      this.lastPointerPosition = { x: e.clientX, y: e.clientY };
+      this.handleSelectionEnd();
+    };
+    this.boundTouchEnd = (e: TouchEvent) => {
+      if (e.changedTouches.length > 0) {
+        const touch = e.changedTouches[0];
+        this.lastPointerPosition = { x: touch.clientX, y: touch.clientY };
+      }
+      setTimeout(() => this.handleSelectionEnd(), 100);
+    };
+    this.boundSelectionChange = () => {
+      if (this.selectionTimeout) {
+        clearTimeout(this.selectionTimeout);
+      }
+      this.selectionTimeout = window.setTimeout(() => {
+        this.handleSelectionChange();
+      }, 200);
+    };
 
     this.setupEventListeners();
   }
@@ -53,36 +90,14 @@ export class SelectionHandler {
    * Set up event listeners for selection
    */
   private setupEventListeners(): void {
-    // Track mouse movement to capture pointer position
-    this.doc.addEventListener('mousemove', (e: MouseEvent) => {
-      this.lastPointerPosition = { x: e.clientX, y: e.clientY };
-    });
+    // For Shadow DOM, listen on the shadow root for mouse/touch events
+    // These events bubble up within the shadow DOM
+    this.eventTarget.addEventListener('mousemove', this.boundMouseMove as EventListener);
+    this.eventTarget.addEventListener('mouseup', this.boundMouseUp as EventListener);
+    this.eventTarget.addEventListener('touchend', this.boundTouchEnd as EventListener);
 
-    // Mouse selection - capture position on mouseup
-    this.doc.addEventListener('mouseup', (e: MouseEvent) => {
-      this.lastPointerPosition = { x: e.clientX, y: e.clientY };
-      this.handleSelectionEnd();
-    });
-
-    // Touch selection - capture position on touchend
-    this.doc.addEventListener('touchend', (e: TouchEvent) => {
-      if (e.changedTouches.length > 0) {
-        const touch = e.changedTouches[0];
-        this.lastPointerPosition = { x: touch.clientX, y: touch.clientY };
-      }
-      // Delay for touch selection to finalize
-      setTimeout(() => this.handleSelectionEnd(), 100);
-    });
-
-    // Selection change (for programmatic selections)
-    this.doc.addEventListener('selectionchange', () => {
-      if (this.selectionTimeout) {
-        clearTimeout(this.selectionTimeout);
-      }
-      this.selectionTimeout = window.setTimeout(() => {
-        this.handleSelectionChange();
-      }, 200);
-    });
+    // Selection change event is always on document
+    this.doc.addEventListener('selectionchange', this.boundSelectionChange);
   }
 
   /**
@@ -90,15 +105,18 @@ export class SelectionHandler {
    */
   private handleSelectionEnd(): void {
     console.log('[SelectionHandler] handleSelectionEnd called');
-    const selection = this.doc.getSelection();
-    if (!selection || selection.isCollapsed) {
-      console.log('[SelectionHandler] No selection or collapsed');
+    // Use window.getSelection() which works with both regular DOM and Shadow DOM
+    const selection = window.getSelection();
+    if (!selection) {
+      console.log('[SelectionHandler] No selection');
       return;
     }
 
+    // Check text content instead of isCollapsed - Shadow DOM has quirks where
+    // isCollapsed can be true even when text is selected
     const text = selection.toString().trim();
     if (!text) {
-      console.log('[SelectionHandler] Empty text');
+      console.log('[SelectionHandler] Empty text or collapsed');
       return;
     }
 
@@ -110,13 +128,13 @@ export class SelectionHandler {
    * Handle selection change events
    */
   private handleSelectionChange(): void {
-    const selection = this.doc.getSelection();
-    if (!selection || selection.isCollapsed) {
+    const selection = window.getSelection();
+    if (!selection) {
       this.lastSelection = null;
       return;
     }
 
-    // Only process if selection actually changed
+    // Check text content instead of isCollapsed for Shadow DOM compatibility
     const text = selection.toString().trim();
     if (!text) {
       this.lastSelection = null;
@@ -409,5 +427,11 @@ export class SelectionHandler {
     if (this.selectionTimeout) {
       clearTimeout(this.selectionTimeout);
     }
+
+    // Remove event listeners
+    this.eventTarget.removeEventListener('mousemove', this.boundMouseMove as EventListener);
+    this.eventTarget.removeEventListener('mouseup', this.boundMouseUp as EventListener);
+    this.eventTarget.removeEventListener('touchend', this.boundTouchEnd as EventListener);
+    this.doc.removeEventListener('selectionchange', this.boundSelectionChange);
   }
 }

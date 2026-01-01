@@ -6,6 +6,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::epub::BookCache;
+use crate::pdf::PdfCache;
 use crate::storage::S3Client;
 
 /// Shared application state
@@ -19,6 +20,7 @@ struct AppStateInner {
     pub s3_client: S3Client,
     pub db: SqlitePool,
     pub book_cache: BookCache,
+    pub pdf_cache: PdfCache,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
                 s3_client,
                 db,
                 book_cache: BookCache::new(),
+                pdf_cache: PdfCache::new(),
             }),
         }
     }
@@ -52,5 +55,10 @@ impl AppState {
     /// Get the book cache
     pub fn book_cache(&self) -> &BookCache {
         &self.inner.book_cache
+    }
+
+    /// Get the PDF cache
+    pub fn pdf_cache(&self) -> &PdfCache {
+        &self.inner.pdf_cache
     }
 }

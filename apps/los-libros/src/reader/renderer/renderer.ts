@@ -31,6 +31,7 @@ import { Scroller } from './scroller';
 import { HighlightOverlay } from './overlay';
 import { SelectionHandler } from './selection';
 import { HighlightAnchor } from './highlight-anchor';
+import { CSSHighlightManager, isCSSHighlightAPISupported } from './css-highlights';
 import { getObsidianThemeColors, isObsidianDarkMode } from '../reader-settings';
 
 /**
@@ -127,6 +128,7 @@ export class EpubRenderer {
   private paginator: Paginator | null = null;
   private scroller: Scroller | null = null;
   private overlay: HighlightOverlay | null = null;
+  private cssHighlights: CSSHighlightManager | null = null;
   private selection: SelectionHandler | null = null;
 
   // Navigation state
@@ -145,6 +147,8 @@ export class EpubRenderer {
   private isLoading = false;
   private loadingChapter: string | null = null;
   private isNavigating = false; // Lock for chapter navigation to prevent overlapping
+  private isNavigatingToChapter = false; // Flag to prevent race condition during chapter navigation
+  private navigationCooldownUntil = 0; // Timestamp until which visual chapter detection is disabled
 
   // Event forwarding AbortController to prevent duplicate listeners
   private eventForwardingController: AbortController | null = null;
@@ -275,13 +279,31 @@ export class EpubRenderer {
       this.applyRendererStyles();
     }
 
-    // Create highlight overlay (outside iframe for proper event handling)
-    // Pass click handler to emit highlightClicked event when user clicks on existing highlights
+    // Create highlight overlay (used for selection preview only)
+    // Stored highlights now use CSS Custom Highlight API when available
     this.overlay = new HighlightOverlay(
       this.container,
       this.iframe,
       (annotationId, position) => this.emit('highlightClicked', { annotationId, position })
     );
+
+    // Create CSS highlight manager for stored highlights
+    // This uses the native CSS Custom Highlight API which:
+    // - Doesn't require coordinate transforms (browser handles it internally)
+    // - Highlights move naturally with content during animations
+    // - 5x faster than SVG/DOM-based highlighting
+    if (this.iframe.contentDocument && isCSSHighlightAPISupported()) {
+      console.log('[Renderer] Using CSS Custom Highlight API for highlights');
+      this.cssHighlights = new CSSHighlightManager(
+        this.iframe.contentDocument,
+        (highlightId, position) => this.emit('highlightClicked', { annotationId: highlightId, position })
+      );
+      // Clear SVG overlay since we're using CSS highlights for stored highlights
+      // SVG overlay will only be used for selection preview
+      this.overlay?.clearHighlights();
+    } else {
+      console.log('[Renderer] CSS Custom Highlight API not available, using SVG overlay');
+    }
 
     // Set up selection handler
     if (this.iframe.contentDocument) {
@@ -428,6 +450,7 @@ export class EpubRenderer {
     }, { signal });
 
     // Handle wheel events for live gesture-based page turning in paginated mode
+    let wheelLogCount = 0;
     doc.addEventListener('wheel', (e) => {
       if (this.config.mode === 'paginated' && this.paginator) {
         e.preventDefault();
@@ -435,6 +458,19 @@ export class EpubRenderer {
         // Determine the primary scroll axis
         const isHorizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY);
         const delta = isHorizontal ? e.deltaX : e.deltaY;
+
+        // Log every 10th wheel event to avoid spam
+        wheelLogCount++;
+        if (wheelLogCount % 10 === 1) {
+          console.log('[Renderer] Wheel event', {
+            deltaX: Math.round(e.deltaX),
+            deltaY: Math.round(e.deltaY),
+            deltaMode: e.deltaMode,
+            isHorizontal,
+            delta: Math.round(delta),
+            wheelLogCount,
+          });
+        }
 
         // Pass the delta to the paginator for live gesture handling
         // Use a sensitivity multiplier for better trackpad response
@@ -604,7 +640,8 @@ export class EpubRenderer {
     const container = doc.getElementById('content-container');
     if (!container) return null;
 
-    const pageWidth = container.clientWidth + this.config.columnGap;
+    // Use paginator's page width for consistent calculations
+    const pageWidth = this.paginator?.getPageWidth() || (container.clientWidth + this.config.columnGap);
     const currentOffset = bookWidePage * pageWidth;
 
     // Find the current chapter element
@@ -634,6 +671,11 @@ export class EpubRenderer {
    * which chapter element contains the currently visible content.
    */
   private updateCurrentChapterFromPage(): void {
+    // Skip during active navigation or cooldown period
+    // This prevents visual detection from overwriting the navigated-to chapter
+    if (this.isNavigatingToChapter) return;
+    if (Date.now() < this.navigationCooldownUntil) return;
+
     const doc = this.iframe?.contentDocument;
     if (!doc || !this.paginator) return;
 
@@ -642,7 +684,8 @@ export class EpubRenderer {
     if (!container) return;
 
     // Calculate the current x-offset being viewed
-    const pageWidth = container.clientWidth + this.config.columnGap;
+    // Use paginator's page width for consistent calculations
+    const pageWidth = this.paginator.getPageWidth();
     const currentOffset = pageInfo.current * pageWidth;
 
     // Only check VISIBLE chapters (those that are loaded, not placeholders)
@@ -708,51 +751,123 @@ export class EpubRenderer {
    */
   private async navigateToChapterPage(index: number, pageOffset?: number | 'end'): Promise<void> {
     const doc = this.iframe?.contentDocument;
-    if (!doc || !this.paginator) return;
-
-    // Ensure the target chapter and its neighbors are loaded (for windowing)
-    if (!this.loadedChapters.has(index)) {
-      console.log(`[EpubRenderer] Loading chapter ${index} before navigation`);
-      await this.updateChapterWindow(index);
-      // Wait for layout to settle after loading
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    if (!doc || !this.paginator) {
+      console.warn(`[navigateToChapterPage] No doc or paginator, aborting`);
+      return;
     }
 
-    const chapter = doc.querySelector(`.epub-chapter[data-chapter-index="${index}"]`) as HTMLElement;
-    if (!chapter) return;
+    // Set flag to prevent updateCurrentChapterFromPage from interfering during navigation
+    this.isNavigatingToChapter = true;
 
-    const container = doc.getElementById('content-container');
-    if (!container) return;
+    try {
+      console.log(`[navigateToChapterPage] Starting navigation to chapter ${index}, loaded: ${this.loadedChapters.has(index)}`);
 
-    // Calculate the page where this chapter starts
-    // The chapter's offsetLeft tells us its position in the column layout
-    const pageWidth = container.clientWidth + this.config.columnGap;
-    const chapterStartPage = Math.floor(chapter.offsetLeft / pageWidth);
+      // STEP 1: Load the target chapter and its window FIRST
+      // This must happen before we calculate offsets, as loading chapters causes layout reflow
+      console.log(`[navigateToChapterPage] Calling ensureChapterLoaded(${index})`);
+      await this.ensureChapterLoaded(index);
 
-    // Calculate target page based on offset
-    let targetPage = chapterStartPage;
-    if (pageOffset === 'end') {
-      // Go to the last page of this chapter
-      // Find the next chapter to determine the end of this chapter
-      const nextChapter = doc.querySelector(`.epub-chapter[data-chapter-index="${index + 1}"]`) as HTMLElement;
-      if (nextChapter) {
-        const nextChapterStartPage = Math.floor(nextChapter.offsetLeft / pageWidth);
-        targetPage = nextChapterStartPage - 1;
-      } else {
-        // This is the last chapter, go to the last page of the book
-        targetPage = this.paginator.getCurrentPage().total - 1;
+      // Verify chapter is loaded
+      if (!this.loadedChapters.has(index)) {
+        console.warn(`[navigateToChapterPage] Chapter ${index} failed to load, aborting`);
+        return;
       }
-    } else if (typeof pageOffset === 'number') {
-      targetPage = chapterStartPage + pageOffset;
+
+      // Also update the chapter window now (before calculating offsets)
+      // This ensures all adjacent chapters are loaded and layout is stable
+      await this.updateChapterWindow(index);
+
+      // Wait for layout to fully settle after loading chapters
+      // Use setTimeout instead of RAF (RAF may not fire reliably in iframes)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const container = doc.getElementById('content-container');
+      if (container) {
+        // Force reflow by reading scrollWidth
+        void container.scrollWidth;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      this.paginator.handleResize();
+      await new Promise((resolve) => setTimeout(resolve, 50)); // Extra settle time
+
+      // STEP 2: Now calculate the page offset (after all chapters are loaded)
+      const chapter = doc.querySelector(`.epub-chapter[data-chapter-index="${index}"]`) as HTMLElement;
+      if (!chapter) {
+        console.warn(`[navigateToChapterPage] Chapter element ${index} not found in DOM`);
+        return;
+      }
+
+      // Verify chapter has actual content (not a placeholder)
+      if (!chapter.textContent || chapter.textContent.length < 10) {
+        console.warn(`[navigateToChapterPage] Chapter ${index} has no content, aborting`);
+        return;
+      }
+
+      // Get page width from paginator (viewport width + column gap)
+      const pageWidth = this.paginator.getPageWidth();
+
+      // Sanity check on pageWidth
+      if (pageWidth <= 0 || pageWidth > 5000) {
+        console.warn(`[navigateToChapterPage] Invalid pageWidth: ${pageWidth}, aborting`);
+        return;
+      }
+
+      // Use scrollIntoView to let the browser calculate the correct scroll position
+      // This is more reliable than manual offset calculation in CSS column layouts
+      const scrollContainer = this.paginator.getScrollContainer();
+      if (!scrollContainer) {
+        console.warn('[navigateToChapterPage] Scroll container not found');
+        return;
+      }
+
+      // Find the first text content in the chapter to scroll to
+      // This is more reliable than scrolling to the chapter div itself
+      let scrollTarget: Element = chapter;
+      const firstTextParent = chapter.querySelector('p, h1, h2, h3, h4, h5, h6, div, span');
+      if (firstTextParent) {
+        scrollTarget = firstTextParent;
+      }
+
+      // Scroll target into view (instant, no animation yet)
+      scrollTarget.scrollIntoView({ behavior: 'instant', block: 'start', inline: 'start' });
+
+      // Read the resulting scroll position and snap to page boundary
+      const scrollLeft = scrollContainer.scrollLeft;
+      let targetPage = Math.round(scrollLeft / pageWidth);
+
+      // Handle pageOffset
+      if (pageOffset === 'end') {
+        // Go to the last page of this chapter
+        const nextChapter = doc.querySelector(`.epub-chapter[data-chapter-index="${index + 1}"]`) as HTMLElement;
+        if (nextChapter) {
+          nextChapter.scrollIntoView({ behavior: 'instant', block: 'start', inline: 'start' });
+          const nextScrollLeft = scrollContainer.scrollLeft;
+          const nextPage = Math.round(nextScrollLeft / pageWidth);
+          targetPage = nextPage - 1;
+        } else {
+          targetPage = this.paginator.getCurrentPage().total - 1;
+        }
+      } else if (typeof pageOffset === 'number') {
+        targetPage = targetPage + pageOffset;
+      }
+
+      console.log(`[navigateToChapterPage] Chapter ${index} scrollIntoView -> scrollLeft: ${scrollLeft.toFixed(0)}, targetPage: ${targetPage}`);
+
+      // STEP 3: Navigate to the calculated page (with animation)
+      this.paginator.goToPage(targetPage);
+      this.currentSpineIndex = index;
+      this.updateLocation();
+
+      // Wait for scroll animation to complete before clearing flag
+      // This prevents handlePageChange from overwriting currentSpineIndex
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      console.log(`[navigateToChapterPage] Navigation complete, currentSpineIndex: ${this.currentSpineIndex}`);
+    } finally {
+      // Always clear navigation flag
+      this.isNavigatingToChapter = false;
+      // Set cooldown to prevent visual chapter detection from overriding for 1 second
+      this.navigationCooldownUntil = Date.now() + 1000;
     }
-
-    this.paginator.goToPage(targetPage);
-    this.currentSpineIndex = index;
-    this.updateLocation();
-
-    // Update chapter window to ensure adjacent chapters are loaded
-    await this.updateChapterWindow(index);
   }
 
   /**
@@ -770,130 +885,155 @@ export class EpubRenderer {
    * Set display mode (paginated or scrolled)
    */
   async setMode(mode: DisplayMode): Promise<void> {
-    if (mode === this.config.mode) return;
+    console.log('[Renderer] ==> setMode called', { requestedMode: mode, currentMode: this.config.mode });
+
+    if (mode === this.config.mode) {
+      console.log('[Renderer] setMode: same mode, skipping');
+      return;
+    }
 
     // Disable windowing during mode switch to prevent content unloading
     // while we're navigating to the target position
     this.isModeSwitching = true;
 
-    // Save book-wide progress percentage (0-100) for position restoration
-    const currentLocation = this.currentLocation;
-    let bookPercentage = currentLocation?.percentage || 0;
+    try {
+      // Save book-wide progress percentage (0-100) for position restoration
+      const currentLocation = this.currentLocation;
+      let bookPercentage = currentLocation?.percentage || 0;
 
-    // Calculate percentage from current position based on current mode
-    const oldMode = this.config.mode;
-    if (oldMode === 'paginated' && this.paginator) {
-      const pageInfo = this.paginator.getCurrentPage();
-      bookPercentage = pageInfo.total > 0 ? (pageInfo.current / pageInfo.total) * 100 : 0;
-    } else if (oldMode === 'scrolled' && this.scroller) {
-      bookPercentage = this.scroller.getScrollProgress() * 100;
-    }
-
-    // Also save progress within current chapter for fine-grained restoration
-    const progressInChapter = this.config.mode === 'scrolled' ? this.getScrollProgressInChapter() :
-      (currentLocation?.pageInChapter || 0) / Math.max(1, currentLocation?.totalPagesInChapter || 1);
-
-    this.config.mode = mode;
-
-    // Switch handlers - content is already loaded (all chapters in DOM)
-    // We just need to switch the mode handler and re-apply styles
-    if (mode === 'paginated') {
-      // Clean up scrolled mode resources
-      this.scroller?.destroy();
-      this.scroller = null;
-
-      // Abort scroll tracking listeners from scrolled mode
-      if (this.scrollTrackingController) {
-        this.scrollTrackingController.abort();
-        this.scrollTrackingController = null;
-      }
-      this.paginator = new Paginator(
-        this.iframe!,
-        this.config,
-        (page) => this.handlePageChange(page),
-        () => this.applyRendererStyles() // Style update for first-page transitions
-      );
-
-      // Apply paginated mode styles (CSS columns)
-      this.applyRendererStyles();
-
-      // Wait for layout to reflow with new column styles
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Initialize paginator with the merged content
-      await this.paginator.initialize();
-
-      // Navigate to the saved book percentage position
-      const pageInfo = this.paginator.getCurrentPage();
-      const targetPage = Math.round((bookPercentage / 100) * pageInfo.total);
-      this.paginator.goToPage(targetPage);
-
-      // Wait for navigation to complete before re-enabling windowing
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Update current chapter based on new position
-      this.updateCurrentChapterFromPage();
-
-      // Set up highlight transform sync for paginated mode
-      this.setupHighlightTransformSync();
-
-      // Re-enable windowing and apply it for the current position
-      this.isModeSwitching = false;
-      await this.updateChapterWindow(this.currentSpineIndex);
-    } else {
-      // Switching to scrolled mode
-      this.paginator?.destroy();
-      this.paginator = null;
-      this.scroller = new Scroller(
-        this.iframe!,
-        this.config,
-        (scrollY) => this.handleScroll(scrollY)
-      );
-
-      // CRITICAL: Reset the inline transform from paginated mode
-      // The paginator sets style.transform which has higher specificity than CSS
-      const doc = this.iframe?.contentDocument;
-      const container = doc?.getElementById('content-container');
-      if (container) {
-        container.style.transform = 'none';
-        container.style.transition = 'none';
+      // Calculate percentage from current position based on current mode
+      const oldMode = this.config.mode;
+      if (oldMode === 'paginated' && this.paginator) {
+        const pageInfo = this.paginator.getCurrentPage();
+        bookPercentage = pageInfo.total > 0 ? (pageInfo.current / pageInfo.total) * 100 : 0;
+      } else if (oldMode === 'scrolled' && this.scroller) {
+        bookPercentage = this.scroller.getScrollProgress() * 100;
       }
 
-      // Load ALL chapters for scrolled mode (paginated mode uses windowing with placeholders)
-      // This ensures user can scroll to any chapter, not just the windowed ones
-      await this.loadAllPlaceholderChapters();
+      // Also save progress within current chapter for fine-grained restoration
+      const progressInChapter = this.config.mode === 'scrolled' ? this.getScrollProgressInChapter() :
+        (currentLocation?.pageInChapter || 0) / Math.max(1, currentLocation?.totalPagesInChapter || 1);
 
-      // Apply scrolled mode styles (reset columns, enable vertical scroll)
-      this.applyRendererStyles();
+      console.log('[Renderer] setMode: saving position', {
+        oldMode,
+        newMode: mode,
+        bookPercentage: Math.round(bookPercentage * 10) / 10,
+        progressInChapter: Math.round(progressInChapter * 1000) / 1000,
+      });
 
-      // Wait for layout to reflow
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      this.config.mode = mode;
 
-      // Initialize scroller (skip scroll reset - we'll scroll to position ourselves)
-      await this.scroller.initialize(true);
+      // Switch handlers - content is already loaded (all chapters in DOM)
+      // We just need to switch the mode handler and re-apply styles
+      if (mode === 'paginated') {
+        console.log('[Renderer] setMode: switching to paginated mode');
 
-      // Scroll to the saved book percentage position
-      this.scrollToBookPercentage(bookPercentage);
+        // Clean up scrolled mode resources
+        this.scroller?.destroy();
+        this.scroller = null;
 
-      // Wait for scroll to complete
-      await new Promise((resolve) => setTimeout(resolve, 100));
+        // Abort scroll tracking listeners from scrolled mode
+        if (this.scrollTrackingController) {
+          this.scrollTrackingController.abort();
+          this.scrollTrackingController = null;
+        }
+        this.paginator = new Paginator(
+          this.iframe!,
+          this.config,
+          (page) => this.handlePageChange(page),
+          () => this.applyRendererStyles() // Style update for first-page transitions
+        );
 
-      // Set up scroll tracking after scroll is complete
-      this.setupScrollChapterTracking();
+        console.log('[Renderer] setMode: applying paginated styles');
+        // Apply paginated mode styles (CSS columns)
+        this.applyRendererStyles();
 
-      // Set up highlight scroll sync
-      this.setupScrollHighlightSync();
+        // Wait for layout to reflow with new column styles (minimal wait)
+        // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+        console.log('[Renderer] setMode: waiting for layout reflow...');
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Re-enable windowing (not used in scrolled mode but keep state clean)
+        // Initialize paginator with the merged content
+        console.log('[Renderer] setMode: initializing paginator');
+        await this.paginator.initialize();
+
+        // Navigate to the saved book percentage position
+        const pageInfo = this.paginator.getCurrentPage();
+        const targetPage = Math.round((bookPercentage / 100) * pageInfo.total);
+        console.log('[Renderer] setMode: navigating to position', {
+          bookPercentage,
+          totalPages: pageInfo.total,
+          targetPage,
+        });
+        this.paginator.goToPage(targetPage, true); // instant navigation
+
+        // Quick wait for navigation
+        // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // Update current chapter based on new position
+        this.updateCurrentChapterFromPage();
+
+        // Set up highlight transform sync for paginated mode
+        this.setupHighlightTransformSync();
+
+        // Apply windowing for the current position
+        console.log('[Renderer] setMode: updating chapter window');
+        await this.updateChapterWindow(this.currentSpineIndex);
+      } else {
+        // Switching to scrolled mode
+        this.paginator?.destroy();
+        this.paginator = null;
+        this.scroller = new Scroller(
+          this.iframe!,
+          this.config,
+          (scrollY) => this.handleScroll(scrollY)
+        );
+
+        // Reset scroll position from paginated mode (CSS Scroll Snap)
+        const doc = this.iframe?.contentDocument;
+        const viewportWrapper = doc?.getElementById('viewport-wrapper');
+        if (viewportWrapper) {
+          viewportWrapper.scrollLeft = 0;
+        }
+
+        // NOTE: Don't load all chapters here - it's too slow for large books
+        // Scrolled mode will use on-demand loading via scroll events
+        // Just make sure visible chapters are loaded
+
+        // Apply scrolled mode styles (reset columns, enable vertical scroll)
+        this.applyRendererStyles();
+
+        // Wait for layout to reflow (minimal wait)
+        // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // Initialize scroller (skip scroll reset - we'll scroll to position ourselves)
+        await this.scroller.initialize(true);
+
+        // Scroll to the saved book percentage position
+        this.scrollToBookPercentage(bookPercentage);
+
+        // Wait for scroll to complete (minimal wait)
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // Set up scroll tracking after scroll is complete
+        this.setupScrollChapterTracking();
+
+        // Set up highlight scroll sync
+        this.setupScrollHighlightSync();
+      }
+
+      // Re-anchor highlights for the new layout mode
+      // Highlight rects are layout-dependent and become invalid after mode switch
+      this.reanchorHighlights();
+    } catch (e) {
+      console.error('[EpubRenderer] Error during mode switch:', e);
+      throw e; // Re-throw to let caller handle it
+    } finally {
+      // Always re-enable windowing, even if an error occurred
       this.isModeSwitching = false;
     }
-
-    // Re-anchor highlights for the new layout mode
-    // Highlight rects are layout-dependent and become invalid after mode switch
-    this.reanchorHighlights();
   }
 
   /**
@@ -1013,8 +1153,8 @@ export class EpubRenderer {
       this.chapterPageCounts.clear();
 
       // Wait for reflow to complete before recalculating
-      await new Promise(r => requestAnimationFrame(r));
-      await new Promise(r => setTimeout(r, 100));
+      // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+      await new Promise(r => setTimeout(r, 150));
 
       // Update location with fresh page counts
       this.updateLocation();
@@ -1108,6 +1248,10 @@ export class EpubRenderer {
 
   /**
    * Add a highlight to the current chapter's overlay
+   * NOTE: When CSS Custom Highlight API is active, this is a no-op because
+   * stored highlights are managed via setStoredHighlights() → reanchorHighlights().
+   * The SVG overlay is only used for selection preview in that case.
+   *
    * @param id Unique highlight ID
    * @param annotationId ID for the annotation (can be same as id)
    * @param color Highlight color
@@ -1119,6 +1263,9 @@ export class EpubRenderer {
     color: HighlightColor,
     rects: Array<{ x: number; y: number; width: number; height: number }>
   ): void {
+    // Skip if CSS highlights are active - stored highlights are managed via reanchorHighlights()
+    if (this.cssHighlights) return;
+
     if (!this.overlay) return;
 
     const renderedHighlight: RenderedHighlight = {
@@ -1135,6 +1282,9 @@ export class EpubRenderer {
    * Remove a highlight from the overlay
    */
   removeHighlight(highlightId: string): void {
+    this.storedHighlights = this.storedHighlights.filter(h => h.id !== highlightId);
+    // Remove from both CSS highlights and SVG overlay
+    this.cssHighlights?.remove(highlightId);
     this.overlay?.removeHighlight(highlightId);
   }
 
@@ -1142,6 +1292,12 @@ export class EpubRenderer {
    * Update a highlight's color
    */
   updateHighlightColor(highlightId: string, color: HighlightColor): void {
+    const stored = this.storedHighlights.find(h => h.id === highlightId);
+    if (stored) {
+      stored.color = color;
+    }
+    // Update in both CSS highlights and SVG overlay
+    this.cssHighlights?.updateColor(highlightId, color);
     this.overlay?.updateHighlightColor(highlightId, color);
   }
 
@@ -1149,6 +1305,7 @@ export class EpubRenderer {
    * Clear all highlights from the overlay
    */
   clearHighlights(): void {
+    this.cssHighlights?.clear();
     this.overlay?.clearHighlights();
   }
 
@@ -1276,21 +1433,28 @@ export class EpubRenderer {
    * Call this when highlights are loaded or updated
    */
   setStoredHighlights(highlights: Highlight[]): void {
+    console.log('[Renderer] ==> setStoredHighlights', {
+      highlightCount: highlights.length,
+      spineIndices: [...new Set(highlights.map(h => h.spineIndex))],
+      loadedChapters: Array.from(this.loadedChapters),
+    });
     this.storedHighlights = highlights;
     this.reanchorHighlights();
   }
 
   /**
    * Set up transform sync for paginated mode highlights
-   * This makes highlights move smoothly with page turn animations
+   *
+   * NOTE: We now use viewport coordinates directly and re-compute highlights
+   * after each page turn (with 350ms delay). Transform sync is disabled to
+   * prevent coordinate drift during animations.
    */
   private setupHighlightTransformSync(): void {
-    if (!this.overlay || !this.paginator) return;
+    if (!this.overlay) return;
 
-    const contentContainer = this.paginator.getContentContainer();
-    if (contentContainer) {
-      this.overlay.observeContentTransform(contentContainer);
-    }
+    // Stop any existing transform observation - we don't need it anymore
+    // Highlights use viewport coordinates and are re-anchored after page turns
+    this.overlay.stopObservingTransform();
   }
 
   /**
@@ -1317,28 +1481,112 @@ export class EpubRenderer {
 
   /**
    * Re-anchor all highlights for the current view
-   * Called on: page change, resize, font change, column change
-   *
-   * This is the core of the dynamic highlight system - it converts
-   * stored selectors (CFI + TextQuote) to DOMRects
+   * Uses CSS Custom Highlight API when available, falls back to SVG overlay.
    */
   reanchorHighlights(): void {
-    if (!this.overlay || !this.iframe?.contentDocument) {
+    console.log('[Renderer] ==> reanchorHighlights called', {
+      storedHighlightsCount: this.storedHighlights.length,
+      hasCssHighlights: !!this.cssHighlights,
+      hasOverlay: !!this.overlay,
+      loadedChapters: Array.from(this.loadedChapters),
+    });
+
+    if (!this.iframe?.contentDocument) {
+      console.warn('[Renderer] reanchorHighlights: no iframe contentDocument');
       return;
     }
 
     const doc = this.iframe.contentDocument;
 
-    // Force browser to recalculate layout before reading positions
-    // Reading scrollHeight forces a reflow, ensuring scroll position is accurate
+    // Force reflow before reading positions
     const _forceReflow = doc.documentElement.scrollHeight;
 
     const anchor = new HighlightAnchor(doc);
+
+    // Use CSS Custom Highlight API if available (preferred)
+    if (this.cssHighlights) {
+      console.log('[Renderer] reanchorHighlights: using CSS Custom Highlight API');
+      this.reanchorWithCSSHighlights(anchor);
+    } else if (this.overlay) {
+      console.log('[Renderer] reanchorHighlights: using SVG overlay fallback');
+      // Fallback to SVG overlay
+      this.reanchorWithSVGOverlay(anchor);
+    } else {
+      console.warn('[Renderer] reanchorHighlights: no highlight system available');
+    }
+  }
+
+  /**
+   * Re-anchor highlights using CSS Custom Highlight API
+   * This is the preferred method - highlights move naturally with content
+   */
+  private reanchorWithCSSHighlights(anchor: HighlightAnchor): void {
+    if (!this.cssHighlights) return;
+
+    const doc = this.iframe?.contentDocument;
+    if (!doc) return;
+
+    let anchored = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const highlight of this.storedHighlights) {
+      // Skip highlights not in currently loaded chapters
+      if (!this.loadedChapters.has(highlight.spineIndex)) {
+        skipped++;
+        continue;
+      }
+
+      // Skip if already rendered
+      if (this.cssHighlights.has(highlight.id)) {
+        continue;
+      }
+
+      // Use the new selector if available, fallback to legacy fields
+      const selector = highlight.selector ?? {
+        primary: { type: 'CfiSelector' as const, cfi: highlight.cfi },
+        fallback: {
+          type: 'TextQuoteSelector' as const,
+          exact: highlight.text,
+        },
+      };
+
+      // Get the chapter element to restrict search scope
+      // This prevents anchoring to wrong occurrences in other chapters
+      const chapterElement = doc.querySelector(
+        `.epub-chapter[data-chapter-index="${highlight.spineIndex}"]`
+      );
+
+      // Anchor within the specific chapter
+      const result = anchor.anchor(selector, chapterElement ?? undefined);
+
+      if (result.range && result.status !== 'orphaned') {
+        // CSS Custom Highlight API - just register the range
+        // Browser handles all coordinate transforms internally
+        this.cssHighlights.add(highlight.id, result.range, highlight.color);
+        anchored++;
+      } else {
+        failed++;
+        console.debug(`[Renderer] Failed to anchor highlight: ${highlight.text.slice(0, 30)}...`, result.status);
+      }
+    }
+
+    if (anchored > 0 || failed > 0) {
+      console.log(`[Renderer] CSS Highlights: anchored=${anchored}, skipped=${skipped}, failed=${failed}`);
+    }
+  }
+
+  /**
+   * Re-anchor highlights using SVG overlay (fallback for older browsers)
+   */
+  private reanchorWithSVGOverlay(anchor: HighlightAnchor): void {
+    if (!this.overlay || !this.iframe) return;
+
+    const doc = this.iframe.contentDocument;
+    if (!doc) return;
+
     const iframeRect = this.iframe.getBoundingClientRect();
     const containerRect = this.container.getBoundingClientRect();
-
-    // Get current transform offset to convert viewport coords to content-space coords
-    const transformOffset = this.getCurrentTransformOffset();
 
     const anchoredHighlights: AnchoredHighlight[] = [];
 
@@ -1357,24 +1605,19 @@ export class EpubRenderer {
         },
       };
 
-      const result = anchor.anchor(selector);
+      // Get the chapter element to restrict search scope
+      const chapterElement = doc.querySelector(
+        `.epub-chapter[data-chapter-index="${highlight.spineIndex}"]`
+      );
+
+      // Anchor within the specific chapter
+      const result = anchor.anchor(selector, chapterElement ?? undefined);
 
       if (result.range && result.status !== 'orphaned') {
-        // Get rects from the range
         const viewportRects = HighlightAnchor.getViewportRects(result.range, iframeRect, containerRect);
 
         if (viewportRects.length > 0) {
-          // Convert to content-space coordinates by reversing the transform
-          // This allows the overlay transform sync to position them correctly
-          const contentSpaceRects = viewportRects.map(rect => new DOMRect(
-            rect.x - transformOffset.x,
-            rect.y - transformOffset.y,
-            rect.width,
-            rect.height
-          ));
-
-          // Merge adjacent rects for rendering efficiency
-          const mergedRects = HighlightAnchor.mergeRects(contentSpaceRects);
+          const mergedRects = HighlightAnchor.mergeRects(viewportRects);
 
           anchoredHighlights.push({
             id: highlight.id,
@@ -1388,45 +1631,30 @@ export class EpubRenderer {
       }
     }
 
-    // Update overlay with re-anchored highlights
+    // Update overlay
     this.overlay.setHighlights(anchoredHighlights);
 
-    // In scrolled mode, sync the overlay to current scroll position
-    // This must be called AFTER setHighlights() to position new highlights correctly
-    if (this.config.mode === 'scrolled') {
-      const doc = this.iframe?.contentDocument;
-      if (doc) {
-        const scrollContainer = doc.scrollingElement || doc.documentElement;
-        this.overlay.updateScrollPosition(scrollContainer.scrollTop);
-      }
+    // In scrolled mode, sync scroll position
+    if (this.config.mode === 'scrolled' && this.iframe?.contentDocument) {
+      const doc = this.iframe.contentDocument;
+      const scrollContainer = doc.scrollingElement || doc.documentElement;
+      this.overlay.updateScrollPosition(scrollContainer.scrollTop);
     }
   }
 
   /**
-   * Get the current transform offset applied to content
-   * Returns {x, y} offset that content has been moved
+   * Get the current scroll offset applied to content
+   * Returns {x, y} offset that content has been scrolled
    */
   private getCurrentTransformOffset(): { x: number; y: number } {
     if (this.config.mode === 'paginated' && this.paginator) {
-      const contentContainer = this.paginator.getContentContainer();
-      if (contentContainer) {
-        const transform = contentContainer.style.transform;
-        // Parse translate3d(-Xpx, 0, 0) or matrix(...)
-        const match = transform.match(/translate3d\(([^,]+),\s*([^,]+)/);
-        if (match) {
-          return {
-            x: parseFloat(match[1]) || 0,
-            y: parseFloat(match[2]) || 0,
-          };
-        }
-        // Try matrix format
-        const matrixMatch = transform.match(/matrix\([^,]+,[^,]+,[^,]+,[^,]+,\s*([^,]+),\s*([^)]+)\)/);
-        if (matrixMatch) {
-          return {
-            x: parseFloat(matrixMatch[1]) || 0,
-            y: parseFloat(matrixMatch[2]) || 0,
-          };
-        }
+      // With CSS Scroll Snap, we use native scrolling on viewport-wrapper
+      const scrollContainer = (this.paginator as any).getScrollContainer?.() as HTMLElement | null;
+      if (scrollContainer) {
+        return {
+          x: -scrollContainer.scrollLeft, // Negative because content moves left when scrolling right
+          y: 0,
+        };
       }
     } else if (this.config.mode === 'scrolled') {
       const doc = this.iframe?.contentDocument;
@@ -1452,6 +1680,7 @@ export class EpubRenderer {
     this.paginator?.destroy();
     this.scroller?.destroy();
     this.overlay?.destroy();
+    this.cssHighlights?.destroy();
     this.selection?.destroy();
 
     // Disconnect theme observer
@@ -1634,8 +1863,9 @@ export class EpubRenderer {
     this.setupLinkHandlers();
 
     // Wait for content to render
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // NOTE: requestAnimationFrame may not fire reliably in iframes during initial load
+    // Use setTimeout as a more reliable alternative for this initialization step
+    await new Promise((resolve) => setTimeout(resolve, 150));
 
     // Apply styles
     this.applyRendererStyles();
@@ -1789,6 +2019,10 @@ export class EpubRenderer {
 
     console.log(`[EpubRenderer:Windowing] Unloading chapter ${index}`);
 
+    // Clear CSS highlights for this chapter before removing content
+    // The ranges will become invalid when the DOM is cleared
+    this.cssHighlights?.clearForChapter(index);
+
     chapterDiv.innerHTML = '';
     chapterDiv.classList.add('epub-chapter-placeholder');
     chapterDiv.classList.remove('epub-chapter-loading');
@@ -1851,6 +2085,186 @@ export class EpubRenderer {
   }
 
   /**
+   * Ensure a specific chapter is loaded and ready for navigation.
+   * Unlike updateChapterWindow, this method waits if loading is in progress
+   * and guarantees the chapter is loaded before returning.
+   * Also loads a window of adjacent chapters for smooth reading.
+   */
+  private async ensureChapterLoaded(index: number): Promise<void> {
+    if (!this.book) return;
+
+    const totalChapters = this.book.spine.length;
+
+    // Update currentSpineIndex FIRST to prevent windowing from unloading this chapter
+    this.currentSpineIndex = index;
+
+    // If already loaded, we're done
+    if (this.loadedChapters.has(index)) {
+      console.log(`[ensureChapterLoaded] Chapter ${index} already loaded`);
+      return;
+    }
+
+    // If another loading operation is in progress, wait for it (with timeout)
+    if (this.isLoadingChapters) {
+      console.log(`[ensureChapterLoaded] Waiting for ongoing loading to complete...`);
+      const maxWait = 5000; // 5 second timeout
+      const startTime = Date.now();
+      await new Promise<void>((resolve) => {
+        const checkInterval = setInterval(() => {
+          if (!this.isLoadingChapters || Date.now() - startTime > maxWait) {
+            clearInterval(checkInterval);
+            resolve();
+          }
+        }, 50);
+      });
+
+      // After waiting, the chapter might now be loaded
+      if (this.loadedChapters.has(index)) {
+        console.log(`[ensureChapterLoaded] Chapter ${index} loaded after waiting`);
+        return;
+      }
+    }
+
+    console.log(`[ensureChapterLoaded] Loading window around chapter ${index}`);
+
+    // Calculate window to load (target + neighbors)
+    const windowStart = Math.max(0, index - 2);
+    const windowEnd = Math.min(totalChapters - 1, index + 4);
+
+    // Find chapters that need loading
+    const toLoad: number[] = [];
+    for (let i = windowStart; i <= windowEnd; i++) {
+      if (!this.loadedChapters.has(i)) {
+        toLoad.push(i);
+      }
+    }
+
+    if (toLoad.length === 0) {
+      console.log(`[ensureChapterLoaded] All chapters in window already loaded`);
+      return;
+    }
+
+    // Mark as loading to prevent concurrent loads
+    this.isLoadingChapters = true;
+
+    try {
+      // Load chapters in parallel
+      const loadPromises = toLoad.map(async (i) => {
+        const chapterDiv = this.chapterElements.get(i);
+        if (chapterDiv) {
+          await this.loadChapterContent(i, chapterDiv);
+        }
+      });
+
+      await Promise.all(loadPromises);
+
+      // Wait for layout to settle
+      // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Update paginator - but only if no gesture active (would cause drift)
+      if (this.paginator && !this.paginator.isGestureActive()) {
+        this.paginator.handleResize();
+        // Wait for resize to take effect
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } else if (this.paginator?.isGestureActive()) {
+        console.log('[ensureChapterLoaded] Skipping handleResize - gesture active');
+      }
+    } finally {
+      this.isLoadingChapters = false;
+    }
+
+    console.log(`[ensureChapterLoaded] Loaded chapters [${toLoad}], target ${index} loaded: ${this.loadedChapters.has(index)}`);
+  }
+
+  /**
+   * Load chapters starting FROM the target index (not centered around it).
+   * This is useful for highlight navigation where we need more scroll room
+   * for content within the target chapter.
+   */
+  async loadChaptersStartingFrom(index: number): Promise<void> {
+    if (!this.book) return;
+
+    const totalChapters = this.book.spine.length;
+    if (index < 0 || index >= totalChapters) return;
+
+    // Wait for any ongoing loading
+    if (this.isLoadingChapters) {
+      const maxWait = 3000;
+      const startTime = Date.now();
+      await new Promise<void>((resolve) => {
+        const check = () => {
+          if (!this.isLoadingChapters || Date.now() - startTime > maxWait) {
+            resolve();
+          } else {
+            // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+            setTimeout(check, 16);
+          }
+        };
+        check();
+      });
+    }
+
+
+    // Load chapters starting from target (with just 1 before for context)
+    const windowStart = Math.max(0, index - 1);
+    const windowEnd = Math.min(totalChapters - 1, index + 6);
+
+    // Unload chapters outside this new window
+    const chaptersToUnload: number[] = [];
+    for (const loadedIndex of this.loadedChapters) {
+      if (loadedIndex < windowStart || loadedIndex > windowEnd) {
+        chaptersToUnload.push(loadedIndex);
+      }
+    }
+
+    // Unload old chapters
+    for (const i of chaptersToUnload) {
+      const chapterDiv = this.chapterElements.get(i);
+      if (chapterDiv) {
+        chapterDiv.innerHTML = '';
+        this.loadedChapters.delete(i);
+      }
+    }
+
+    // Find chapters that need loading
+    const toLoad: number[] = [];
+    for (let i = windowStart; i <= windowEnd; i++) {
+      if (!this.loadedChapters.has(i)) {
+        toLoad.push(i);
+      }
+    }
+
+    if (toLoad.length === 0) return;
+
+    this.isLoadingChapters = true;
+
+    try {
+      const loadPromises = toLoad.map(async (i) => {
+        const chapterDiv = this.chapterElements.get(i);
+        if (chapterDiv) {
+          await this.loadChapterContent(i, chapterDiv);
+        }
+      });
+
+      await Promise.all(loadPromises);
+
+      // Wait for layout to settle
+      // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Update paginator
+      if (this.paginator) {
+        this.paginator.handleResize();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    } finally {
+      this.isLoadingChapters = false;
+    }
+
+  }
+
+  /**
    * Update the chapter window when navigation changes
    * Called when the current chapter index changes
    */
@@ -1858,6 +2272,10 @@ export class EpubRenderer {
     if (this.config.mode !== 'paginated' || !this.book) return;
     if (this.isLoadingChapters) return; // Prevent concurrent loads
     if (this.isModeSwitching) return; // Skip windowing during mode switch
+    if (this.isNavigatingToChapter) return; // Skip during active navigation to prevent layout shifts
+
+    // Track if gesture is active - we'll still load chapters but skip resize
+    const gestureActive = this.paginator?.isGestureActive() || false;
 
     const totalChapters = this.book.spine.length;
 
@@ -1958,10 +2376,13 @@ export class EpubRenderer {
       }
 
       // Reinitialize paginator if content changed significantly
-      if (toLoad.length > 0 && this.paginator) {
-        // Recalculate after content change
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+      // But skip if gesture is active (would cause scroll position drift)
+      if (toLoad.length > 0 && this.paginator && !gestureActive) {
+        // Recalculate after content change - use setTimeout instead of RAF (more reliable in iframes)
+        await new Promise((resolve) => setTimeout(resolve, 50));
         this.paginator.handleResize();
+      } else if (toLoad.length > 0 && gestureActive) {
+        console.log('[EpubRenderer:Windowing] Chapters loaded, skipping handleResize - gesture active');
       }
     } finally {
       this.isLoadingChapters = false;
@@ -2079,11 +2500,8 @@ export class EpubRenderer {
   private async injectContent(chapter: ChapterContent): Promise<void> {
     if (!this.contentContainer || !this.iframe?.contentDocument) return;
 
-    // CRITICAL: Reset transform before injecting new content
-    // The old chapter's transform should not persist when loading a new chapter
-    // This prevents the state desync bug where old transform values cause content to disappear
-    this.contentContainer.style.transform = 'none';
-    this.contentContainer.style.transition = 'none';
+    // Reset any residual styles before injecting new content
+    // (CSS Scroll Snap uses native scrolling on viewport-wrapper, not transforms)
 
     // Process HTML to handle relative URLs
     const processedHtml = await this.processHtml(chapter.html, chapter.href);
@@ -2100,13 +2518,15 @@ export class EpubRenderer {
     // Set up link handling (uses the AbortController's signal)
     this.setupLinkHandlers();
 
-    // Update highlight overlay
-    if (this.overlay && chapter.highlights) {
+    // Update highlight overlay (only if not using CSS highlights)
+    // When CSS highlights are active, stored highlights are managed via reanchorHighlights()
+    if (!this.cssHighlights && this.overlay && chapter.highlights) {
       this.overlay.setHighlights(chapter.highlights);
     }
 
     // Wait for content to render
-    await new Promise((resolve) => requestAnimationFrame(resolve));
+    // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+    await new Promise((resolve) => setTimeout(resolve, 16));
   }
 
   /**
@@ -2243,13 +2663,17 @@ export class EpubRenderer {
     }
 
     const spineIndex = Math.floor(parseInt(spineMatch[1], 10) / 2) - 1;
+    console.log(`[navigateToCfi] CFI: ${cfi} -> spineIndex: ${spineIndex}, mode: ${this.config.mode}`);
 
     if (this.config.mode === 'scrolled') {
       // In continuous scroll mode, scroll to the chapter element
       this.scrollToChapterElement(spineIndex, instant);
     } else {
       // In paginated mode, navigate to the chapter page
+      // (navigateToChapterPage handles chapter loading for windowing)
+      console.log(`[navigateToCfi] Calling navigateToChapterPage(${spineIndex})`);
       await this.navigateToChapterPage(spineIndex);
+      console.log(`[navigateToCfi] navigateToChapterPage completed, currentSpineIndex: ${this.currentSpineIndex}`);
     }
 
     // TODO: Navigate to specific element/offset within chapter
@@ -2316,24 +2740,48 @@ export class EpubRenderer {
         const element = this.iframe.contentDocument.getElementById(targetHash);
         if (element) {
           element.scrollIntoView({ behavior: 'smooth' });
+          this.applyLinkTargetAnimation(element);
           console.log('[Navigation] Scrolled to hash:', targetHash);
         }
       }
     } else {
-      // In paginated mode, navigate to the chapter page
-      // Content is already loaded, just navigate within it
+      // In paginated mode, ensure target chapter is loaded before navigation
+      if (!this.loadedChapters.has(spineIndex)) {
+        console.log(`[Navigation] Chapter ${spineIndex} not loaded, loading window...`);
+        await this.updateChapterWindow(spineIndex);
+        // Wait for layout to settle after loading new chapters
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+
+      // Navigate to the chapter page first to ensure we're in the right area
+      await this.navigateToChapterPage(spineIndex);
+
+      // Now try to find and navigate to the hash element
       if (targetHash && this.iframe?.contentDocument) {
-        // Navigate to the element containing the hash
+        // Wait a bit for the page to render after navigation
+        await new Promise((resolve) => setTimeout(resolve, 100));
         const element = this.iframe.contentDocument.getElementById(targetHash);
         if (element) {
           this.scrollToElement(element);
+          this.applyLinkTargetAnimation(element);
           console.log('[Navigation] Navigated to hash:', targetHash);
           return;
         }
       }
-      // Fallback to chapter start
-      await this.navigateToChapterPage(spineIndex);
     }
+  }
+
+  /**
+   * Apply a blinking animation to highlight a navigation target
+   */
+  private applyLinkTargetAnimation(element: HTMLElement): void {
+    // Add the animation class
+    element.classList.add('epub-link-target');
+
+    // Remove the class after animation completes (3 blinks at 0.5s each = 1.5s)
+    setTimeout(() => {
+      element.classList.remove('epub-link-target');
+    }, 1500);
   }
 
   /**
@@ -2350,7 +2798,8 @@ export class EpubRenderer {
 
     // Calculate which page contains this element
     // The element's offsetLeft tells us its horizontal position in the column layout
-    const pageWidth = container.clientWidth + this.config.columnGap;
+    // Use paginator's page width for consistent calculations
+    const pageWidth = this.paginator.getPageWidth();
     const targetPage = Math.floor(element.offsetLeft / pageWidth);
 
     this.paginator.goToPage(targetPage);
@@ -2367,7 +2816,19 @@ export class EpubRenderer {
       // In continuous scroll mode, scroll to that percentage of the document
       this.scroller.scrollToPercentage(percentage);
     } else if (this.paginator) {
-      // In paginated mode, navigate to that percentage of total pages
+      // In paginated mode with chapter windowing:
+      // First estimate which chapter the percentage corresponds to
+      const totalChapters = this.book.spine.length;
+      const estimatedChapter = Math.floor((percentage / 100) * totalChapters);
+      const targetChapter = Math.max(0, Math.min(estimatedChapter, totalChapters - 1));
+
+      console.log(`[navigateToPercentage] ${percentage}% -> estimated chapter ${targetChapter} of ${totalChapters}`);
+
+      // Ensure the target chapter and its neighbors are loaded
+      await this.ensureChapterLoaded(targetChapter);
+
+      // Now navigate to the percentage within loaded content
+      // The paginator will calculate based on currently loaded chapters
       this.paginator.goToPercentage(percentage);
       this.updateCurrentChapterFromPage();
     }
@@ -2535,11 +2996,18 @@ export class EpubRenderer {
       }
 
       // Calculate column width - each "page" shows columnsPerPage columns
+      // CRITICAL: Round to whole pixels to avoid browser rounding inconsistencies
+      // Fractional pixels cause drift between calculated pages and actual scroll positions
       const totalGapsPerPage = (columnsPerPage - 1) * columnGap;
       const columnWidth = Math.floor((viewportWidth - totalGapsPerPage) / columnsPerPage);
 
-      // Page width is how much we translate to move to next "page"
-      const pageWidth = viewportWidth + columnGap;
+      // CRITICAL: Calculate the exact viewport width that fits the columns perfectly
+      // This prevents drift between scroll positions and column boundaries
+      const exactViewportWidth = columnWidth * columnsPerPage + totalGapsPerPage;
+
+      // Page width is how much we scroll to move to next "page"
+      // Must use exactViewportWidth to match the actual column layout
+      const pageWidth = exactViewportWidth + columnGap;
 
       styleEl.textContent = `
         html {
@@ -2553,18 +3021,28 @@ export class EpubRenderer {
           box-sizing: border-box;
           overflow: hidden;
         }
-        /* Viewport wrapper creates the clipping boundary for paginated content */
+        /* Viewport wrapper is the scroll container for pagination */
         #viewport-wrapper {
-          width: ${viewportWidth}px;
+          width: ${exactViewportWidth}px;
           height: ${viewportHeight}px;
-          overflow: hidden;
           position: relative;
+          /* Native scrolling for pagination (programmatic snapping handles alignment) */
+          overflow-x: scroll;
+          overflow-y: hidden;
+          /* Note: scroll-snap doesn't work with CSS columns, we use programmatic snapping */
+          scroll-behavior: smooth;
+          -webkit-overflow-scrolling: touch;
+          /* Hide scrollbar but keep functionality */
+          scrollbar-width: none;
+          -ms-overflow-style: none;
+        }
+        #viewport-wrapper::-webkit-scrollbar {
+          display: none;
         }
         #content-container {
-          /* Fixed dimensions - content overflows horizontally into columns */
-          width: ${viewportWidth}px;
+          /* Fixed height, width auto-expands with columns */
           height: ${viewportHeight}px;
-          /* Column layout - columns expand rightward beyond container width */
+          /* Column layout - columns expand rightward */
           column-width: ${columnWidth}px;
           column-gap: ${columnGap}px;
           column-fill: auto;
@@ -2575,15 +3053,15 @@ export class EpubRenderer {
           text-align: ${textAlign};
           word-wrap: break-word;
           overflow-wrap: break-word;
-          /* Allow horizontal overflow for columns, viewport-wrapper clips */
-          overflow: visible;
-          /* GPU acceleration and performance optimizations */
-          will-change: transform;
-          transform: translate3d(0, 0, 0);
+          /* Allow content to expand horizontally */
+          width: max-content;
+          min-width: 100%;
+          /* GPU acceleration */
+          will-change: scroll-position;
           backface-visibility: hidden;
           -webkit-backface-visibility: hidden;
-          /* Contain layout to prevent reflow propagation */
-          contain: layout style;
+          /* NOTE: Do NOT use 'contain: layout' here - it blocks column overflow
+             from propagating to the viewport-wrapper scroll container */
         }
         img {
           max-width: ${columnWidth}px;
@@ -2608,6 +3086,17 @@ export class EpubRenderer {
           /* Empty placeholder - just maintains layout space */
           display: block;
           background: transparent;
+        }
+        /* Link target blinking animation */
+        @keyframes epub-link-target-blink {
+          0%, 100% { background-color: transparent; }
+          50% { background-color: var(--interactive-accent, #7b6cd9); opacity: 0.4; }
+        }
+        .epub-link-target {
+          animation: epub-link-target-blink 0.5s ease-in-out 3;
+          border-radius: 2px;
+          box-decoration-break: clone;
+          -webkit-box-decoration-break: clone;
         }
       `;
     } else {
@@ -2682,6 +3171,17 @@ export class EpubRenderer {
         @keyframes epub-spin {
           to { transform: rotate(360deg); }
         }
+        /* Link target blinking animation */
+        @keyframes epub-link-target-blink {
+          0%, 100% { background-color: transparent; }
+          50% { background-color: var(--interactive-accent, #7b6cd9); opacity: 0.4; }
+        }
+        .epub-link-target {
+          animation: epub-link-target-blink 0.5s ease-in-out 3;
+          border-radius: 2px;
+          box-decoration-break: clone;
+          -webkit-box-decoration-break: clone;
+        }
       `;
     }
   }
@@ -2712,13 +3212,20 @@ export class EpubRenderer {
    * Handle page change in paginated mode
    */
   private handlePageChange(page: { current: number; total: number }): void {
+    console.log('[Renderer] handlePageChange', {
+      currentPage: page.current,
+      totalPages: page.total,
+      currentSpineIndex: this.currentSpineIndex,
+      isModeSwitching: this.isModeSwitching,
+    });
+
     // Re-anchor highlights after CSS transition completes (0.3s)
-    // getClientRects() returns values based on current animated position,
-    // so we need to wait for the transition to finish
     if (this.reanchorTimeout) {
+      console.log('[Renderer] handlePageChange: clearing pending reanchor timeout');
       window.clearTimeout(this.reanchorTimeout);
     }
     this.reanchorTimeout = window.setTimeout(() => {
+      console.log('[Renderer] handlePageChange: reanchor timeout fired (350ms)');
       this.reanchorHighlights();
     }, 350); // Wait for 0.3s transition + buffer
 
@@ -2736,10 +3243,14 @@ export class EpubRenderer {
   private checkAndPreloadChapters(page: { current: number; total: number }): void {
     if (this.config.mode !== 'paginated' || !this.book) return;
 
-    // Don't block if already loading - queue the request
-    if (this.isLoadingChapters) {
-      // Schedule a retry after current load completes
-      setTimeout(() => this.checkAndPreloadChapters(page), 100);
+    // Don't preload during loading operations, active navigation, or cooldown
+    if (this.isLoadingChapters || this.isNavigatingToChapter || Date.now() < this.navigationCooldownUntil) {
+      return; // Don't queue retries - let the next page change trigger preloading
+    }
+
+    // CRITICAL: Don't preload/unload during active gesture - causes scroll position drift
+    if (this.paginator?.isGestureActive()) {
+      console.log('[EpubRenderer:Preload] Skipping - gesture active');
       return;
     }
 
@@ -2749,13 +3260,29 @@ export class EpubRenderer {
     const container = doc.getElementById('content-container');
     if (!container) return;
 
+    // Max loaded chapters to prevent memory issues
+    const MAX_LOADED_CHAPTERS = 15;
+    if (this.loadedChapters.size >= MAX_LOADED_CHAPTERS) {
+      // Already have enough chapters loaded, unload distant ones instead
+      this.unloadDistantChapters();
+      return;
+    }
+
+    // Don't preload if we just started loading - let initial display settle
+    if (this.loadedChapters.size < 3) {
+      return;
+    }
+
     // Calculate current position
-    const pageWidth = container.clientWidth + this.config.columnGap;
+    // Use paginator's page width for consistent calculations
+    const pageWidth = this.paginator?.getPageWidth() || (container.clientWidth + this.config.columnGap);
+    if (pageWidth <= 0) return; // Invalid dimensions, skip
+
     const currentOffset = page.current * pageWidth;
     const scrollWidth = container.scrollWidth;
 
-    // Pages remaining forward
-    const pagesRemainingForward = Math.floor((scrollWidth - currentOffset - pageWidth) / pageWidth);
+    // Pages remaining forward - ensure non-negative calculation
+    const pagesRemainingForward = Math.max(0, Math.floor((scrollWidth - currentOffset - pageWidth) / pageWidth));
 
     // Preload threshold - start loading when within 5 pages of edge
     const PRELOAD_THRESHOLD = 5;
@@ -2763,8 +3290,8 @@ export class EpubRenderer {
 
     const totalChapters = this.book.spine.length;
 
-    // Forward preloading
-    if (pagesRemainingForward < PRELOAD_THRESHOLD && this.loadedChapters.size > 0) {
+    // Forward preloading - only if we have valid positive pages remaining
+    if (pagesRemainingForward >= 0 && pagesRemainingForward < PRELOAD_THRESHOLD && this.loadedChapters.size > 0) {
       const maxLoadedChapter = Math.max(...this.loadedChapters);
 
       if (maxLoadedChapter < totalChapters - 1) {
@@ -2776,13 +3303,47 @@ export class EpubRenderer {
 
     // Backward preloading (less aggressive)
     const pagesFromStart = page.current;
-    if (pagesFromStart < PRELOAD_THRESHOLD && this.loadedChapters.size > 0) {
+    if (pagesFromStart >= 0 && pagesFromStart < PRELOAD_THRESHOLD && this.loadedChapters.size > 0) {
       const minLoadedChapter = Math.min(...this.loadedChapters);
 
       if (minLoadedChapter > 0) {
         console.log(`[EpubRenderer:Preload] ${pagesFromStart} pages behind, preloading from chapter ${Math.max(0, minLoadedChapter - PRELOAD_COUNT)}`);
         this.preloadChaptersBehind(minLoadedChapter - 1, PRELOAD_COUNT);
       }
+    }
+  }
+
+  /**
+   * Unload chapters that are far from current position
+   */
+  private unloadDistantChapters(): void {
+    if (this.loadedChapters.size === 0) return;
+
+    // CRITICAL: Don't unload during active gesture - causes scroll position drift
+    if (this.paginator?.isGestureActive()) {
+      console.log('[EpubRenderer:Windowing] Skipping unload - gesture active');
+      return;
+    }
+
+    const KEEP_WINDOW = 7; // Keep 7 chapters around current position
+    const currentChapter = this.currentSpineIndex;
+
+    // Find chapters to unload (outside the keep window)
+    const chaptersToUnload: number[] = [];
+    for (const chapterIndex of this.loadedChapters) {
+      const distance = Math.abs(chapterIndex - currentChapter);
+      if (distance > KEEP_WINDOW) {
+        chaptersToUnload.push(chapterIndex);
+      }
+    }
+
+    // Unload distant chapters
+    for (const chapterIndex of chaptersToUnload) {
+      this.unloadChapterContent(chapterIndex);
+    }
+
+    if (chaptersToUnload.length > 0) {
+      console.log(`[EpubRenderer:Windowing] Unloaded ${chaptersToUnload.length} distant chapters, keeping ${this.loadedChapters.size}`);
     }
   }
 
@@ -2818,7 +3379,8 @@ export class EpubRenderer {
 
       // Only recalculate if no gesture/momentum is active
       if (this.paginator && !this.paginator.isGestureActive()) {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+        // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+        await new Promise((resolve) => setTimeout(resolve, 50));
         this.paginator.handleResize();
       }
     } finally {
@@ -2863,7 +3425,8 @@ export class EpubRenderer {
       // Only recalculate if no gesture/momentum is active
       // Don't interrupt the user's scroll animation
       if (this.paginator && !this.paginator.isGestureActive()) {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+        // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+        await new Promise((resolve) => setTimeout(resolve, 50));
         this.paginator.handleResize();
       }
     } finally {
@@ -2979,6 +3542,14 @@ export class EpubRenderer {
       pageInChapter = totalPagesInChapter;
     }
 
+    // Calculate progression within chapter (0-1) for reliable mode switching
+    const progressionInChapter = totalPagesInChapter > 0
+      ? (pageInChapter - 1) / totalPagesInChapter
+      : 0;
+
+    // Capture text context for fuzzy position matching (Readium Locator model)
+    const textContext = this.getVisibleTextContext();
+
     this.currentLocation = {
       spineIndex: this.currentSpineIndex,
       href: spineItem.href,
@@ -2990,6 +3561,8 @@ export class EpubRenderer {
       totalPagesInBook,
       totalChapters,
       scrollY: this.scroller?.getScrollY(),
+      progressionInChapter,
+      text: textContext,
     };
 
     this.emit('relocated', this.currentLocation);
@@ -2997,12 +3570,166 @@ export class EpubRenderer {
 
   /**
    * Generate CFI for current position
+   * Uses the first visible text node to create a precise CFI with element path and character offset
    */
   private generateCfi(): string {
-    // Simple CFI generation - spine reference only
-    // Full CFI would include element path and character offset
+    const doc = this.iframe?.contentDocument;
+    if (!doc) {
+      // Fallback to spine-only CFI
+      const spinePosition = (this.currentSpineIndex + 1) * 2;
+      return `epubcfi(/6/${spinePosition}!)`;
+    }
+
+    // Try to generate a full CFI from the first visible text
+    const viewportRect = this.getViewportRect();
+    if (viewportRect) {
+      const { generateCfiFromVisibleText } = require('./cfi-utils');
+      const cfi = generateCfiFromVisibleText(doc, this.currentSpineIndex, viewportRect);
+      if (cfi) {
+        return cfi;
+      }
+    }
+
+    // Fallback to spine-only CFI
     const spinePosition = (this.currentSpineIndex + 1) * 2;
     return `epubcfi(/6/${spinePosition}!)`;
+  }
+
+  /**
+   * Get the current viewport rectangle for visibility calculations
+   */
+  private getViewportRect(): { left: number; top: number; width: number; height: number } | null {
+    if (!this.iframe?.contentDocument) return null;
+
+    if (this.config.mode === 'paginated' && this.paginator) {
+      const scrollContainer = (this.paginator as any).getScrollContainer?.() as HTMLElement | null;
+      if (scrollContainer) {
+        const rect = scrollContainer.getBoundingClientRect();
+        return {
+          left: scrollContainer.scrollLeft,
+          top: 0,
+          width: rect.width,
+          height: rect.height,
+        };
+      }
+    }
+
+    // Default viewport
+    return {
+      left: 0,
+      top: this.iframe.contentDocument.scrollingElement?.scrollTop || 0,
+      width: this.iframe.clientWidth,
+      height: this.iframe.clientHeight,
+    };
+  }
+
+  /**
+   * Get visible text context for fuzzy position matching (Readium Locator model)
+   * Returns the first visible text with surrounding context
+   */
+  private getVisibleTextContext(): { highlight: string; before?: string; after?: string } | undefined {
+    const doc = this.iframe?.contentDocument;
+    if (!doc) return undefined;
+
+    const viewportRect = this.getViewportRect();
+    if (!viewportRect) return undefined;
+
+    try {
+      // Walk through text nodes to find the first visible one
+      const walker = doc.createTreeWalker(
+        doc.body || doc.documentElement,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: (node) => {
+            if (!node.textContent || node.textContent.trim().length === 0) {
+              return NodeFilter.FILTER_REJECT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+          },
+        }
+      );
+
+      let visibleText = '';
+      let beforeText = '';
+      let afterText = '';
+      let foundVisible = false;
+      let charCount = 0;
+
+      // Collect text content to build context
+      const textNodes: { node: Node; text: string }[] = [];
+      let node: Node | null;
+      while ((node = walker.nextNode())) {
+        textNodes.push({ node, text: node.textContent || '' });
+      }
+
+      // Find the first visible text node
+      for (let i = 0; i < textNodes.length; i++) {
+        const { node, text } = textNodes[i];
+        const range = doc.createRange();
+        range.selectNodeContents(node);
+        const rects = range.getClientRects();
+
+        for (let r = 0; r < rects.length; r++) {
+          const rect = rects[r];
+          // Check if this rect is within the viewport
+          if (
+            rect.right > viewportRect.left &&
+            rect.left < viewportRect.left + viewportRect.width &&
+            rect.bottom > viewportRect.top &&
+            rect.top < viewportRect.top + viewportRect.height
+          ) {
+            foundVisible = true;
+
+            // Collect ~100 chars of visible text
+            visibleText = text.slice(0, 100);
+
+            // Get context before (from previous nodes)
+            let beforeChars = 32;
+            for (let j = i - 1; j >= 0 && beforeChars > 0; j--) {
+              const prevText = textNodes[j].text;
+              if (beforeChars <= prevText.length) {
+                beforeText = prevText.slice(-beforeChars) + beforeText;
+                break;
+              } else {
+                beforeText = prevText + beforeText;
+                beforeChars -= prevText.length;
+              }
+            }
+
+            // Get context after (from following nodes)
+            let afterChars = 32;
+            afterText = text.slice(100, 100 + afterChars);
+            afterChars -= afterText.length;
+            for (let j = i + 1; j < textNodes.length && afterChars > 0; j++) {
+              const nextText = textNodes[j].text;
+              if (afterChars <= nextText.length) {
+                afterText = afterText + nextText.slice(0, afterChars);
+                break;
+              } else {
+                afterText = afterText + nextText;
+                afterChars -= nextText.length;
+              }
+            }
+
+            break;
+          }
+        }
+        if (foundVisible) break;
+      }
+
+      if (!foundVisible || !visibleText.trim()) {
+        return undefined;
+      }
+
+      return {
+        highlight: visibleText.trim(),
+        before: beforeText.trim() || undefined,
+        after: afterText.trim() || undefined,
+      };
+    } catch (error) {
+      console.debug('[Renderer] getVisibleTextContext error:', error);
+      return undefined;
+    }
   }
 
   /**

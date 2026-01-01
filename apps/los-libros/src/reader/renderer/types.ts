@@ -144,6 +144,7 @@ export const DEFAULT_RENDERER_CONFIG: RendererConfig = {
 
 /**
  * Reading location with multiple selectors for robust positioning
+ * Follows the Readium Locator model for reliable position restoration
  */
 export interface ReadingLocation {
   /** EPUB CFI (canonical fragment identifier) */
@@ -166,6 +167,25 @@ export interface ReadingLocation {
   totalChapters?: number;
   /** Scroll position (for scrolled mode) */
   scrollY?: number;
+
+  /**
+   * Text context for fuzzy position matching (Readium Locator model)
+   * Used as fallback when CFI fails (e.g., after content edits or reflow)
+   */
+  text?: {
+    /** First ~100 chars of visible text at this position */
+    highlight: string;
+    /** ~32 chars before the visible text for disambiguation */
+    before?: string;
+    /** ~32 chars after the visible text for disambiguation */
+    after?: string;
+  };
+
+  /**
+   * Progression within the current chapter (0-1)
+   * More stable than book-wide percentage for mode switching
+   */
+  progressionInChapter?: number;
 }
 
 /**
@@ -367,6 +387,148 @@ export interface RendererEvents {
 export type RendererEventListener<K extends keyof RendererEvents> = (
   data: RendererEvents[K]
 ) => void;
+
+// ============================================================================
+// PDF Types
+// ============================================================================
+
+/**
+ * Parsed PDF document from server
+ */
+export interface ParsedPdf {
+  id: string;
+  metadata: PdfMetadata;
+  toc: TocEntry[];
+  pageCount: number;
+  pageLabels?: string[];
+  hasTextLayer: boolean;
+  orientation: 'portrait' | 'landscape' | 'mixed';
+}
+
+/**
+ * PDF metadata
+ */
+export interface PdfMetadata {
+  title: string;
+  author?: string;
+  subject?: string;
+  keywords: string[];
+  creator?: string;
+  producer?: string;
+  creationDate?: string;
+  modificationDate?: string;
+}
+
+/**
+ * PDF text layer for a page
+ */
+export interface PdfTextLayer {
+  page: number;
+  width: number;
+  height: number;
+  items: PdfTextItem[];
+}
+
+/** Alias for PdfTextLayer to avoid conflicts with class exports */
+export type PdfTextLayerData = PdfTextLayer;
+
+/**
+ * Text item on a PDF page
+ */
+export interface PdfTextItem {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  charPositions?: PdfCharPosition[];
+}
+
+/**
+ * Character position for precise text selection
+ */
+export interface PdfCharPosition {
+  char: string;
+  x: number;
+  width: number;
+}
+
+/**
+ * PDF page dimensions
+ */
+export interface PdfPageDimensions {
+  width: number;
+  height: number;
+}
+
+/**
+ * PDF search result
+ */
+export interface PdfSearchResult {
+  page: number;
+  text: string;
+  prefix?: string;
+  suffix?: string;
+  position?: { x: number; y: number };
+}
+
+/**
+ * PDF selector for annotations
+ */
+export interface PdfSelector {
+  /** Page number (1-indexed) */
+  page: number;
+  /** For text selections */
+  textQuote?: {
+    exact: string;
+    prefix?: string;
+    suffix?: string;
+  };
+  /** For region selections (scanned PDFs) */
+  rect?: PdfRect;
+  /** Text position (character offsets in page text) */
+  position?: {
+    start: number;
+    end: number;
+  };
+}
+
+/**
+ * Normalized rectangle on PDF page (0-1 coordinates)
+ */
+export interface PdfRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Normalized position on PDF page (0-1 coordinates)
+ */
+export interface PdfPosition {
+  x: number;
+  y: number;
+}
+
+/**
+ * PDF render request options
+ */
+export interface PdfRenderOptions {
+  scale?: number;
+  rotation?: number;
+  format?: 'png' | 'jpeg' | 'webp';
+}
+
+/**
+ * Region selection event (for scanned PDFs)
+ */
+export interface RegionSelectionEvent {
+  page: number;
+  rect: PdfRect;
+  position: { x: number; y: number };
+}
 
 // ============================================================================
 // Server API Types

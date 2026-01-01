@@ -48,8 +48,8 @@ export class Scroller {
     if (!doc) return;
 
     // Wait for content to render
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     // Calculate dimensions
     this.calculateDimensions();

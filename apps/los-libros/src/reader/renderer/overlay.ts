@@ -401,6 +401,14 @@ export class HighlightOverlay {
   }
 
   /**
+   * Show or hide the overlay
+   * Used to hide during page turn animations to prevent visual drift
+   */
+  setVisible(visible: boolean): void {
+    this.svg.style.visibility = visible ? 'visible' : 'hidden';
+  }
+
+  /**
    * Stop observing content transforms
    */
   stopObservingTransform(): void {
@@ -408,6 +416,8 @@ export class HighlightOverlay {
     this.transformObserver = null;
     this.stopAnimationSync();
     this.contentContainer = null;
+    // Clear any existing transform - highlights now use viewport coordinates
+    this.highlightGroup.style.transform = '';
   }
 
   /**

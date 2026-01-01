@@ -2,15 +2,11 @@
   /**
    * Highlights Tab Component
    *
-   * Displays book highlights grouped by chapter.
+   * Displays book highlights grouped by chapter using Obsidian's tree-item pattern.
    */
   import { createEventDispatcher } from 'svelte';
   import type { Highlight, HighlightColor } from '../../library/types';
-  import {
-    ChevronDown,
-    ChevronRight,
-    Trash2,
-  } from 'lucide-svelte';
+  import { Trash2 } from 'lucide-svelte';
 
   export let highlights: Highlight[] = [];
 
@@ -35,7 +31,15 @@
   function groupByChapter(items: Highlight[]): Map<string, Highlight[]> {
     const grouped = new Map<string, Highlight[]>();
     for (const item of items) {
-      const chapter = item.chapter || 'Unknown Chapter';
+      // Use chapter name, or fall back to page percentage, or "Beginning"
+      let chapter = item.chapter;
+      if (!chapter || chapter.trim() === '') {
+        if (item.pagePercent && item.pagePercent > 0) {
+          chapter = `Page ${Math.round(item.pagePercent)}%`;
+        } else {
+          chapter = 'Beginning';
+        }
+      }
       if (!grouped.has(chapter)) {
         grouped.set(chapter, []);
       }
@@ -53,7 +57,7 @@
     expandedChapters = expandedChapters;
   }
 
-  function getHighlightColorStyle(color: HighlightColor): string {
+  function getHighlightColor(color: HighlightColor): string {
     const colors: Record<HighlightColor, string> = {
       yellow: '#fef3c7',
       green: '#d1fae5',
@@ -61,7 +65,7 @@
       pink: '#fce7f3',
       purple: '#ede9fe',
     };
-    return `border-left-color: ${colors[color]};`;
+    return colors[color];
   }
 
   function truncateText(text: string, maxLength: number): string {
@@ -79,57 +83,64 @@
 
 <div class="highlights-tab">
   {#if highlights.length === 0}
-    <div class="empty-state">
-      <p>No highlights yet</p>
-      <p class="hint">Select text while reading to create highlights</p>
+    <div class="search-empty-state">
+      <div class="search-empty-state-message">No highlights yet</div>
+      <div class="search-empty-state-hint">Select text while reading to create highlights</div>
     </div>
   {:else}
-    {#each [...highlightsByChapter] as [chapter, chapterHighlights] (chapter)}
-      <div class="chapter-group">
-        <button
-          class="chapter-header"
-          on:click={() => toggleChapter(chapter)}
-        >
-          {#if expandedChapters.has(chapter)}
-            <ChevronDown size={14} />
-          {:else}
-            <ChevronRight size={14} />
-          {/if}
-          <span class="chapter-name">{chapter}</span>
-          <span class="count">{chapterHighlights.length}</span>
-        </button>
-
-        {#if expandedChapters.has(chapter)}
-          <div class="items">
-            {#each chapterHighlights as highlight (highlight.id)}
-              <div
-                class="item highlight-item"
-                style={getHighlightColorStyle(highlight.color)}
-                role="button"
-                tabindex="0"
-                on:click={() => dispatch('navigate', { cfi: highlight.cfi, text: highlight.text })}
-                on:keydown={(e) => e.key === 'Enter' && dispatch('navigate', { cfi: highlight.cfi, text: highlight.text })}
-              >
-                <div class="item-text">"{truncateText(highlight.text, 120)}"</div>
-                {#if highlight.annotation}
-                  <div class="item-note">{truncateText(highlight.annotation, 80)}</div>
-                {/if}
-                <div class="item-footer">
-                  <span class="item-date">{formatDate(highlight.createdAt)}</span>
-                  <button
-                    class="delete-btn"
-                    on:click|stopPropagation={() => dispatch('delete', { id: highlight.id })}
-                    title="Delete"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-              </div>
-            {/each}
+    <div class="search-results-children">
+      {#each [...highlightsByChapter] as [chapter, chapterHighlights] (chapter)}
+        <div class="tree-item search-result" class:is-collapsed={!expandedChapters.has(chapter)}>
+          <div
+            class="tree-item-self search-result-file-title is-clickable"
+            on:click={() => toggleChapter(chapter)}
+            on:keydown={(e) => e.key === 'Enter' && toggleChapter(chapter)}
+            role="button"
+            tabindex="0"
+          >
+            <div class="tree-item-icon collapse-icon">
+              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon right-triangle"><path d="M3 8L12 17L21 8"></path></svg>
+            </div>
+            <div class="tree-item-inner">{chapter}</div>
+            <div class="tree-item-flair-outer">
+              <span class="tree-item-flair">{chapterHighlights.length}</span>
+            </div>
           </div>
-        {/if}
-      </div>
-    {/each}
+
+          {#if expandedChapters.has(chapter)}
+            <div class="search-result-file-matches">
+              {#each chapterHighlights as highlight (highlight.id)}
+                <div
+                  class="search-result-file-match tappable los-libros-highlight-match"
+                  style="border-left: 3px solid {getHighlightColor(highlight.color)};"
+                  role="button"
+                  tabindex="0"
+                  on:click={() => dispatch('navigate', { cfi: highlight.cfi, text: highlight.text })}
+                  on:keydown={(e) => e.key === 'Enter' && dispatch('navigate', { cfi: highlight.cfi, text: highlight.text })}
+                >
+                  <div class="los-libros-highlight-text">
+                    "{truncateText(highlight.text, 120)}"
+                  </div>
+                  {#if highlight.annotation}
+                    <div class="los-libros-highlight-note">{truncateText(highlight.annotation, 80)}</div>
+                  {/if}
+                  <div class="los-libros-highlight-footer">
+                    <span class="los-libros-highlight-date">{formatDate(highlight.createdAt)}</span>
+                    <button
+                      class="los-libros-delete-btn clickable-icon"
+                      on:click|stopPropagation={() => dispatch('delete', { id: highlight.id })}
+                      title="Delete"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </div>
   {/if}
 </div>
 
@@ -137,125 +148,100 @@
   .highlights-tab {
     display: flex;
     flex-direction: column;
-    gap: 4px;
   }
 
-  .empty-state {
+  /* Empty state - matches Obsidian search empty state */
+  .search-empty-state {
     text-align: center;
     padding: 32px 16px;
     color: var(--text-muted);
   }
 
-  .empty-state .hint {
-    font-size: 0.8rem;
-    margin-top: 8px;
+  .search-empty-state-message {
+    font-size: var(--font-ui-medium);
+    margin-bottom: 4px;
+  }
+
+  .search-empty-state-hint {
+    font-size: var(--font-ui-smaller);
     opacity: 0.7;
   }
 
-  .chapter-group {
-    margin-bottom: 4px;
+  /* Container styling */
+  .search-results-children {
+    padding: 8px 16px;
   }
 
-  .chapter-header {
+  /* Card list container - override Obsidian defaults */
+  .search-result-file-matches {
     display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 6px 8px;
-    background: var(--background-secondary);
-    border: none;
-    border-radius: var(--radius-s);
-    cursor: pointer;
-    text-align: left;
-    font-size: 0.8rem;
-    color: var(--text-normal);
+    flex-direction: column;
+    gap: 4px;
+    padding: 0;
+    margin: 0 !important;
   }
 
-  .chapter-header:hover {
-    background: var(--background-modifier-hover);
-  }
-
-  .chapter-name {
-    flex: 1;
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .count {
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    background: var(--background-primary);
-    padding: 1px 5px;
-    border-radius: 6px;
-  }
-
-  .items {
-    padding-left: 8px;
-    margin-top: 4px;
-  }
-
-  .item {
-    padding: 8px 10px;
+  /* Tree item spacing - match Obsidian search results */
+  .tree-item.search-result {
     margin-bottom: 4px;
-    background: var(--background-secondary);
-    border-radius: var(--radius-s);
-    border-left: 3px solid transparent;
-    cursor: pointer;
-    transition: all 0.1s ease;
   }
 
-  .item:hover {
-    background: var(--background-modifier-hover);
+  /* Tree item collapse icon rotation */
+  .tree-item.is-collapsed .collapse-icon {
+    transform: rotate(-90deg);
   }
 
-  .highlight-item {
-    border-left-width: 4px;
+  .collapse-icon {
+    transition: transform 100ms ease-in-out;
   }
 
-  .item-text {
-    font-style: italic;
-    font-size: 0.8rem;
+  /* Highlight card styling - override Obsidian defaults */
+  .los-libros-highlight-match {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    padding: 10px 12px !important;
+    border-radius: 8px;
+    margin: 0;
+  }
+
+  .los-libros-highlight-text {
+    font-size: var(--font-ui-small);
     line-height: 1.4;
     color: var(--text-normal);
+    margin: 0;
   }
 
-  .item-note {
-    font-size: 0.75rem;
+  .los-libros-highlight-note {
+    font-size: var(--font-ui-smaller);
     color: var(--text-muted);
-    margin-top: 4px;
-    padding-left: 8px;
+    margin: 0;
+    padding-left: 6px;
     border-left: 2px solid var(--background-modifier-border);
   }
 
-  .item-footer {
+  .los-libros-highlight-footer {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-top: 6px;
+    margin: 0;
   }
 
-  .item-date {
-    font-size: 0.7rem;
+  .los-libros-highlight-date {
+    font-size: var(--font-ui-smaller);
     color: var(--text-muted);
   }
 
-  .delete-btn {
-    padding: 2px;
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    color: var(--text-muted);
+  .los-libros-delete-btn {
     opacity: 0;
     transition: opacity 0.1s;
   }
 
-  .item:hover .delete-btn {
+  .los-libros-highlight-match:hover .los-libros-delete-btn {
     opacity: 1;
   }
 
-  .delete-btn:hover {
+  .los-libros-delete-btn:hover {
     color: var(--text-error);
   }
 </style>

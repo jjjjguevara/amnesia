@@ -92,9 +92,52 @@ export type {
 
   // API
   ApiResponse,
+
+  // PDF types
+  ParsedPdf,
+  PdfMetadata,
+  PdfTextLayerData,
+  PdfTextItem,
+  PdfCharPosition,
+  PdfPageDimensions,
+  PdfSearchResult,
+  PdfSelector,
+  PdfRect,
+  PdfPosition,
+  PdfRenderOptions,
+  RegionSelectionEvent,
 } from './types';
 
 export { DEFAULT_RENDERER_CONFIG } from './types';
+
+// Document Renderer Interface (unified EPUB/PDF)
+export type {
+  DocumentFormat,
+  DocumentMetadata,
+  ParsedDocument,
+  DocumentLocation,
+  DocumentNavigationTarget,
+  DocumentDisplayMode,
+  DocumentPageLayout,
+  DocumentRendererConfig,
+  DocumentSelector,
+  EpubSelector,
+  DocumentSelectionEvent,
+  DocumentSearchOptions,
+  DocumentSearchResult,
+  DocumentRendererEvents,
+  DocumentRendererEventListener,
+  RenderedDocumentHighlight,
+  DocumentRenderer,
+} from './document-renderer';
+
+export {
+  detectDocumentFormat,
+  isPdfLocation,
+  isPdfSelector,
+  createPdfLocator,
+  parsePdfLocator,
+} from './document-renderer';
 
 // API Client
 export { ApiClient, ApiError, createApiClient, getApiClient } from './api-client';
@@ -115,6 +158,8 @@ export type { ScrollCallback } from './scroller';
 // Highlights
 export { HighlightOverlay } from './overlay';
 export type { HighlightClickCallback } from './overlay';
+export { InlineHighlightManager } from './inline-highlights';
+export type { InlineHighlight, InlineHighlightClickCallback } from './inline-highlights';
 
 // Selection
 export { SelectionHandler } from './selection';
@@ -136,3 +181,46 @@ export { WasmBookProvider } from './wasm-provider';
 export { HybridBookProvider, createHybridProvider } from './hybrid-provider';
 export type { HybridProviderConfig, ProviderMode } from './hybrid-provider';
 export { ProviderAdapter, createProviderAdapter } from './provider-adapter';
+
+// PDF Renderer
+export {
+  PdfRenderer,
+  PdfCanvasLayer,
+  PdfTextLayer,
+  PdfAnnotationLayer,
+  PdfRegionSelection,
+  PdfPaginator,
+  PdfScroller,
+  // PDF.js fallback providers
+  PdfJsProvider,
+  getPdfJsProvider,
+  resetPdfJsProvider,
+  HybridPdfProvider,
+  createHybridPdfProvider,
+} from './pdf';
+export type {
+  PdfRendererConfig,
+  PdfContentProvider,
+  CanvasLayerConfig,
+  TextLayerConfig,
+  TextSelection,
+  PdfHighlightClickCallback,
+  PdfHighlight,
+  AnnotationLayerConfig,
+  RegionSelectionData,
+  RegionSelectionCallback,
+  RegionSelectionConfig,
+  PdfPageLayout,
+  PdfPageInfo,
+  PdfPageChangeCallback,
+  PdfPaginatorConfig,
+  PdfScrollInfo,
+  PdfScrollCallback,
+  PageRenderCallback,
+  PdfScrollerConfig,
+  // PDF.js provider types
+  PdfJsProviderStatus,
+  HybridPdfProviderConfig,
+  HybridPdfProviderStatus,
+  PdfProviderMode,
+} from './pdf';

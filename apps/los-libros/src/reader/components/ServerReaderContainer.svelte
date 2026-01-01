@@ -18,6 +18,8 @@
   import ProgressSlider from './ProgressSlider.svelte';
   import NotebookSidebar from './NotebookSidebar.svelte';
   import { sidebarStore, type SidebarTab } from '../../sidebar/sidebar.store';
+  import { BOOK_SIDEBAR_VIEW_TYPE } from '../../sidebar/sidebar-view';
+  import { getSearchIndex, clearSearchIndex } from '../search-index';
   import type { Bookmark, ReadingNote } from '../../bookmarks/bookmark-types';
   import {
     type ReaderSettings,
@@ -76,6 +78,95 @@
     type ContentProvider,
   } from '../renderer';
 
+  // Import the new Shadow DOM renderer (V2)
+  import { ShadowDOMRenderer } from '../shadow-dom-renderer';
+  import { USE_SHADOW_DOM_RENDERER } from '../renderer-adapter';
+
+  /**
+   * Resolve chapter name from spine item using multiple matching strategies.
+   * Falls back to cleaned-up filename or page percentage if no ToC match found.
+   */
+  function resolveChapterName(
+    spineItem: { href: string } | undefined,
+    toc: TocEntry[],
+    pagePercent?: number
+  ): string {
+    if (!spineItem) return '';
+
+    const spineHref = spineItem.href;
+    let entry: TocEntry | undefined;
+
+    // Helper to search ToC recursively (for nested chapters)
+    function findInToc(entries: TocEntry[], matcher: (e: TocEntry) => boolean): TocEntry | undefined {
+      for (const e of entries) {
+        if (matcher(e)) return e;
+        if (e.children?.length) {
+          const found = findInToc(e.children, matcher);
+          if (found) return found;
+        }
+      }
+      return undefined;
+    }
+
+    // Strategy 1: Exact match
+    entry = findInToc(toc, t => t.href === spineHref);
+
+    // Strategy 2: Spine ends with ToC href (ToC may have relative path)
+    if (!entry) {
+      entry = findInToc(toc, t => spineHref.endsWith(t.href));
+    }
+
+    // Strategy 3: ToC ends with spine href (spine may have relative path)
+    if (!entry) {
+      entry = findInToc(toc, t => t.href.endsWith(spineHref));
+    }
+
+    // Strategy 4: Filename match (ignore directories and anchors)
+    if (!entry) {
+      const spineFilename = spineHref.split('/').pop()?.split('#')[0];
+      if (spineFilename) {
+        entry = findInToc(toc, t => {
+          const tocFilename = t.href.split('/').pop()?.split('#')[0];
+          return tocFilename === spineFilename;
+        });
+      }
+    }
+
+    // Strategy 5: Partial path match (either contains the other)
+    if (!entry) {
+      entry = findInToc(toc, t =>
+        spineHref.includes(t.href.replace(/#.*$/, '')) ||
+        t.href.replace(/#.*$/, '').includes(spineHref)
+      );
+    }
+
+    if (entry) {
+      return entry.label;
+    }
+
+    // Fallback 1: Clean up the filename as chapter name
+    const filename = spineHref.split('/').pop() || '';
+    const cleanedName = filename
+      .replace(/\.(x?html?|xml)$/i, '')  // Remove extension
+      .replace(/[-_]/g, ' ')             // Replace dashes/underscores with spaces
+      .replace(/([a-z])([A-Z])/g, '$1 $2') // Split camelCase
+      .replace(/^\d+\s*/, '')            // Remove leading numbers
+      .replace(/^(ch(apter)?|pt|part|section)\s*/i, '') // Remove common prefixes
+      .trim();
+
+    if (cleanedName && cleanedName.length > 2) {
+      // Capitalize first letter
+      return cleanedName.charAt(0).toUpperCase() + cleanedName.slice(1);
+    }
+
+    // Fallback 2: Use page percentage
+    if (typeof pagePercent === 'number' && pagePercent > 0) {
+      return `Page ${Math.round(pagePercent)}%`;
+    }
+
+    return '';
+  }
+
   export let plugin: LosLibrosPlugin;
   export let bookPath: string;
   export let bookTitle: string = '';
@@ -99,65 +190,137 @@
 
   /**
    * Navigate to a highlight by CFI then precise text location.
-   * Supports both paginated and scrolled reading modes.
+   * Uses ShadowDOMRenderer's navigateToHighlight for Shadow DOM architecture,
+   * falls back to iframe-based navigation for legacy renderer.
    */
   export async function navigateToHighlight(cfi: string, text: string): Promise<void> {
-    // Small yield to ensure DOM is settled after book load
-    await new Promise(r => requestAnimationFrame(r));
-
-    const iframe = renderer?.getIframe?.();
-    const doc = iframe?.contentDocument;
-    const searchText = text.slice(0, 50);
-    const mode = renderer?.getMode?.() || 'paginated';
-
-    // Scroll mode: Use chapter-scoped search to avoid false matches
-    if (mode === 'scrolled') {
-      if (doc && iframe) {
-        // Get the chapter element from CFI to scope the search
-        const spineIndex = getSpineIndexFromCfi(cfi);
-        const chapterElement = spineIndex !== null ? getChapterElement(doc, spineIndex) : null;
-
-        // Search within the specific chapter only
-        const range = findTextRange(doc, searchText, chapterElement);
-        if (range) {
-          const rect = range.getBoundingClientRect();
-          const viewportHeight = iframe.clientHeight || 600;
-          const MARGIN = 50;
-
-          // Check vertical visibility for scroll mode
-          if (rect.top >= -MARGIN && rect.bottom <= viewportHeight + MARGIN) {
-            return; // Already visible
-          }
-          // Text found but not visible - scroll directly to it
-          navigateToTextRangeScrolled(range, doc);
-          return;
-        }
-      }
-      // Text not found in chapter - chapter might not be loaded, use CFI navigation
-      renderer?.display({ type: 'cfi', cfi });
-      waitForTextAndScrollNavigate(text, 0, cfi);
+    // Check if renderer is ShadowDOMRenderer (has navigateToHighlight method)
+    const shadowRenderer = renderer as unknown as ShadowDOMRenderer;
+    if (typeof shadowRenderer.navigateToHighlight === 'function') {
+      await shadowRenderer.navigateToHighlight(cfi, text);
       return;
     }
 
-    // Paginated mode: Try text search first (faster if already on correct page)
-    if (doc && iframe) {
-      const range = findTextRange(doc, searchText);
+    // Legacy fallback: Check if text is already visible before any navigation
+    const iframe = renderer?.getIframe?.();
+    const doc = iframe?.contentDocument;
+    if (doc) {
+      // Use more text for accurate matching (100 chars instead of 30)
+      const searchText = text.slice(0, 100);
+      const spineIndex = getSpineIndexFromCfi(cfi);
+      const chapterElement = spineIndex !== null ? getChapterElement(doc, spineIndex) : null;
+      const range = findTextRange(doc, searchText, chapterElement);
+
       if (range) {
         const rect = range.getBoundingClientRect();
-        const viewportWidth = iframe.clientWidth || 800;
         const MARGIN = 50;
-        if (rect.left >= -MARGIN && rect.right <= viewportWidth + MARGIN) {
-          return; // Already visible
+        const mode = renderer?.getMode?.() || 'paginated';
+
+        if (mode === 'paginated') {
+          const viewportWidth = iframe.clientWidth || 800;
+          if (rect.left >= -MARGIN && rect.right <= viewportWidth + MARGIN) {
+            // Already visible - do nothing at all
+            console.log('[navigateToHighlight] Already visible, skipping navigation');
+            return;
+          }
+        } else {
+          const viewportHeight = iframe.clientHeight || 600;
+          if (rect.top >= -MARGIN && rect.bottom <= viewportHeight + MARGIN) {
+            // Already visible - do nothing at all
+            console.log('[navigateToHighlight] Already visible, skipping navigation');
+            return;
+          }
         }
-        // Navigate in paginated mode
-        navigateToTextRange(range, iframe);
-        return;
       }
     }
 
-    // Text not found - use CFI to load the correct chapter
-    renderer?.display({ type: 'cfi', cfi });
-    waitForTextAndNavigate(text, 0);
+    // Only navigate if not visible
+    await navigateToHighlightText(text, cfi);
+  }
+
+  /**
+   * Navigate to a ToC entry or internal link by href.
+   * Delegates to ShadowDOMRenderer for proper navigation with pulse animation.
+   */
+  export function navigateToHref(href: string): void {
+    if (!renderer) return;
+
+    // Check if renderer is ShadowDOMRenderer (has navigateToHref method)
+    const shadowRenderer = renderer as unknown as ShadowDOMRenderer;
+    if (typeof shadowRenderer.navigateToHref === 'function') {
+      shadowRenderer.navigateToHref(href);
+    }
+  }
+
+  /**
+   * Navigate to a specific chapter by spine index.
+   */
+  export function navigateToChapter(spineIndex: number): void {
+    if (!renderer || !book) return;
+    if (spineIndex >= 0 && spineIndex < book.spine.length) {
+      renderer.display({ type: 'spine', spineIndex });
+    }
+  }
+
+  /**
+   * Navigate to a chapter and then find specific text within it.
+   * Used for search result navigation.
+   */
+  export async function navigateToChapterAndText(spineIndex: number, text: string): Promise<void> {
+    if (!renderer || !book) return;
+    if (spineIndex < 0 || spineIndex >= book.spine.length) return;
+
+    // Navigate to the chapter first
+    await renderer.display({ type: 'spine', spineIndex });
+
+    // Wait for content to load and then find the text
+    const searchText = text.slice(0, 50);
+    let attempts = 0;
+    const maxAttempts = 10;
+
+    const tryFindText = async (): Promise<void> => {
+      const iframe = renderer?.getIframe?.();
+      const doc = iframe?.contentDocument;
+      const mode = renderer?.getMode?.() || 'paginated';
+
+      if (doc && iframe) {
+        const range = findTextRange(doc, searchText);
+        if (range) {
+          if (mode === 'scrolled') {
+            navigateToTextRangeScrolled(range, doc);
+          } else {
+            navigateToTextRange(range, iframe);
+          }
+
+          // Add highlight blink effect to the found text
+          try {
+            const mark = doc.createElement('mark');
+            mark.className = 'epub-link-target';
+            mark.style.cssText = 'background: var(--text-highlight-bg); padding: 0 2px;';
+            range.surroundContents(mark);
+            setTimeout(() => {
+              mark.classList.remove('epub-link-target');
+              const parent = mark.parentNode;
+              if (parent) {
+                parent.replaceChild(doc.createTextNode(mark.textContent || ''), mark);
+              }
+            }, 1500);
+          } catch {
+            // Range may span multiple elements, ignore
+          }
+          return;
+        }
+      }
+
+      attempts++;
+      if (attempts < maxAttempts) {
+        await new Promise(r => setTimeout(r, 150));
+        await tryFindText();
+      }
+    };
+
+    await new Promise(r => requestAnimationFrame(r));
+    await tryFindText();
   }
 
   /**
@@ -216,8 +379,32 @@
   }
 
   /**
-   * Navigate directly to a text range that's already been found.
+   * Get the current transform offset from the content container.
+   * Returns the X offset (positive value) from translate3d(-Xpx, 0, 0).
    */
+  function getTransformOffset(doc: Document): number {
+    const container = doc.getElementById('content-container');
+    if (!container) return 0;
+
+    const transform = container.style.transform;
+    const match = transform.match(/translate3d\((-?\d+(?:\.\d+)?)px/);
+    if (!match) return 0;
+
+    // Transform is negative (e.g., -1208), return as positive offset
+    return Math.abs(parseFloat(match[1]));
+  }
+
+  /**
+   * Calculate the logical position of an element from its visual position and current transform.
+   * This is stable regardless of chapter windowing because:
+   * - visualPosition is where the element appears on screen
+   * - transformOffset is how much the container has been shifted
+   * - logicalPosition = visualPosition + transformOffset
+   */
+  function calculateLogicalPosition(visualLeft: number, transformOffset: number): number {
+    return visualLeft + transformOffset;
+  }
+
   function navigateToTextRange(range: Range, iframe: HTMLIFrameElement): void {
     const doc = iframe.contentDocument;
     if (!doc) return;
@@ -228,9 +415,7 @@
     const paginator = renderer?.getPaginator?.();
     if (!paginator) return;
 
-    const columnWidth = paginator.getColumnWidth();
-    const gap = paginator.getGap();
-    const pageWidth = columnWidth + gap;
+    const pageWidth = paginator.getPageWidth();
     if (pageWidth <= 0) return;
 
     // Check if already visible
@@ -241,132 +426,201 @@
       return;
     }
 
-    // Calculate target page from current position
-    const container = doc.getElementById('content-container');
-    const transform = container?.style.transform || '';
-    const match = transform.match(/translate3d\((-?\d+(?:\.\d+)?)px/);
-    const currentOffset = match ? Math.abs(parseFloat(match[1])) : 0;
-    const docPosition = currentOffset + rect.left;
-    const targetPage = Math.max(0, Math.floor(docPosition / pageWidth));
+    // Calculate logical position from visual position and current transform
+    // This approach is stable regardless of chapter windowing
+    const transformOffset = getTransformOffset(doc);
+    const logicalPosition = calculateLogicalPosition(rect.left, transformOffset);
+    const page = Math.floor(logicalPosition / pageWidth);
 
-    console.warn('[navigateToHighlight] Direct nav: ' + JSON.stringify({
-      rectLeft: Math.round(rect.left),
-      currentOffset: Math.round(currentOffset),
-      targetPage
+    console.warn('[navigateToHighlight] goToPage: ' + JSON.stringify({
+      visualLeft: rect.left.toFixed(0),
+      transformOffset,
+      logicalPosition: logicalPosition.toFixed(0),
+      pageWidth,
+      page
     }));
 
-    paginator.goToPage(targetPage);
+    // Use paginator.goToPage() with instant=true for highlight navigation
+    paginator.goToPage(page, true);
+
+    // Refresh highlights after navigation
+    setTimeout(() => refreshHighlightOverlay(), 50);
   }
 
-  // Track last transform to detect stabilization
-  let lastTransformCheck = '';
-  let transformStableCount = 0;
+  // Navigation state for highlight navigation
+  let highlightNavigationInProgress = false;
 
   /**
-   * Wait for content to load and transform to stabilize, find text, navigate.
+   * Navigate to highlight text.
+   * Improved approach: Ensure chapter is loaded, wait for DOM ready, use full text search.
    */
-  function waitForTextAndNavigate(text: string, attempt: number): void {
-    const MAX_ATTEMPTS = 40; // 2 seconds max wait
-
-    if (attempt >= MAX_ATTEMPTS) {
-      console.warn('[navigateToHighlight] Gave up after', attempt, 'attempts');
-      return;
-    }
-
-    const iframe = renderer?.getIframe?.();
-    const doc = iframe?.contentDocument;
-    if (!doc) {
-      setTimeout(() => waitForTextAndNavigate(text, attempt + 1), 50);
-      return;
-    }
-
-    // Wait for transform to stabilize after CFI navigation
-    const container = doc.getElementById('content-container');
-    const currentTransform = container?.style.transform || '';
-
-    if (attempt < 3 || currentTransform !== lastTransformCheck) {
-      // Transform still changing, wait for it to stabilize
-      lastTransformCheck = currentTransform;
-      transformStableCount = 0;
-      setTimeout(() => waitForTextAndNavigate(text, attempt + 1), 50);
-      return;
-    }
-
-    transformStableCount++;
-    if (transformStableCount < 2) {
-      // Need 2 consecutive stable readings
-      setTimeout(() => waitForTextAndNavigate(text, attempt + 1), 50);
-      return;
-    }
-
-    // Transform is stable, now search for text
-    const searchText = text.slice(0, 50);
-    const range = findTextRange(doc, searchText);
-    if (!range) {
-      setTimeout(() => waitForTextAndNavigate(text, attempt + 1), 50);
-      return;
-    }
-
-    const rect = range.getBoundingClientRect();
-    if (rect.height === 0 || rect.width === 0) {
-      setTimeout(() => waitForTextAndNavigate(text, attempt + 1), 50);
-      return;
-    }
-
-    const mode = renderer?.getMode?.() || 'paginated';
+  async function navigateToHighlightText(text: string, cfi: string): Promise<void> {
     const MARGIN = 50;
+    const MAX_RETRIES = 10;
+    const RETRY_DELAY = 100;
+    highlightNavigationInProgress = true;
 
-    if (mode === 'scrolled') {
-      // Scroll mode: check vertical visibility
-      const viewportHeight = iframe.clientHeight || 600;
-      if (rect.top >= -MARGIN && rect.bottom <= viewportHeight + MARGIN) {
-        console.warn('[navigateToHighlight] Text visible after CFI nav (scroll mode)');
-        lastTransformCheck = '';
-        transformStableCount = 0;
+    try {
+      const spineIndex = getSpineIndexFromCfi(cfi);
+
+      // Step 1: CFI navigation to load the chapter
+      await renderer?.display({ type: 'cfi', cfi }, { instant: true });
+
+      // Step 2: Wait for chapter DOM to be ready
+      const iframe = renderer?.getIframe?.();
+      const doc = iframe?.contentDocument;
+      if (!doc) return;
+
+      // Wait for chapter element to exist and have content
+      let chapterElement: Element | null = null;
+      for (let i = 0; i < MAX_RETRIES; i++) {
+        chapterElement = spineIndex !== null ? getChapterElement(doc, spineIndex) : doc.body;
+        if (chapterElement && chapterElement.textContent && chapterElement.textContent.length > 100) {
+          break;
+        }
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
+      }
+
+      if (!chapterElement) {
+        console.warn('[navigateToHighlight] Chapter element not ready after retries');
         return;
       }
-      // Navigate in scroll mode
-      navigateToTextRangeScrolled(range, doc);
-      lastTransformCheck = '';
-      transformStableCount = 0;
-      return;
+
+      // Step 3: Find the text with retry logic
+      // Use up to 100 characters for more accurate matching
+      const searchText = text.slice(0, 100);
+      let range: Range | null = null;
+
+      for (let i = 0; i < MAX_RETRIES; i++) {
+        range = findTextRange(doc, searchText, chapterElement);
+        if (range) break;
+
+        // Try with shorter text as fallback
+        if (i === MAX_RETRIES / 2) {
+          range = findTextRange(doc, text.slice(0, 50), chapterElement);
+          if (range) break;
+        }
+
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
+      }
+
+      if (!range) {
+        console.warn('[navigateToHighlight] Text not found after retries');
+        return;
+      }
+
+      const mode = renderer?.getMode?.() || 'paginated';
+
+      // Step 4: Navigate based on mode
+      if (mode === 'scrolled') {
+        const rect = range.getBoundingClientRect();
+        const viewportHeight = iframe.clientHeight || 600;
+        if (rect.top < -MARGIN || rect.bottom > viewportHeight + MARGIN) {
+          navigateToTextRangeScrolled(range, doc);
+        }
+      } else {
+        // Paginated mode - use scroll-based navigation now
+        const paginator = renderer?.getPaginator?.();
+        if (!paginator) return;
+
+        const rect = range.getBoundingClientRect();
+        const viewportWidth = iframe.clientWidth || 800;
+
+        // Check if already visible
+        if (rect.left >= -MARGIN && rect.right <= viewportWidth + MARGIN) {
+          refreshHighlightOverlay();
+          return;
+        }
+
+        // Get scroll container for accurate position calculation
+        const scrollContainer = (paginator as any).getScrollContainer?.() as HTMLElement | null;
+        if (!scrollContainer) return;
+
+        const pageWidth = paginator.getPageWidth();
+        const currentScroll = scrollContainer.scrollLeft;
+        const maxScroll = scrollContainer.scrollWidth - scrollContainer.clientWidth;
+
+        // Calculate target scroll position to bring text into view
+        const scrollOffset = rect.left - MARGIN;
+        const rawTargetScroll = currentScroll + scrollOffset; // Uncapped
+        const targetScroll = Math.min(rawTargetScroll, maxScroll); // Capped for actual navigation
+
+        // Snap to page boundary
+        const targetPage = Math.round(targetScroll / pageWidth);
+        const pageInfo = paginator.getCurrentPage();
+        const clampedPage = Math.max(0, Math.min(targetPage, pageInfo.total - 1));
+
+        // Check if text is beyond scrollable region (use raw uncapped value)
+        if (rawTargetScroll > maxScroll) {
+          // Re-load chapters with the target chapter at the START of the window
+          // This gives more scroll room for content within the chapter
+          if (spineIndex !== null && renderer && (renderer as any).loadChaptersStartingFrom) {
+            await (renderer as any).loadChaptersStartingFrom(spineIndex);
+            // Wait for layout to settle
+            await new Promise(r => setTimeout(r, 200));
+
+            // Re-find the chapter element after re-windowing
+            const newChapterElement = getChapterElement(doc, spineIndex);
+            if (newChapterElement) {
+              // Re-find the text
+              const newRange = findTextRange(doc, text.slice(0, 100), newChapterElement);
+              if (newRange) {
+                const newRect = newRange.getBoundingClientRect();
+                const newCurrentScroll = scrollContainer.scrollLeft;
+                const newScrollOffset = newRect.left - MARGIN;
+                const newTargetScroll = newCurrentScroll + newScrollOffset;
+                const newPageWidth = paginator.getPageWidth();
+                const newPage = Math.round(newTargetScroll / newPageWidth);
+                const newPageInfo = paginator.getCurrentPage();
+                const finalPage = Math.max(0, Math.min(newPage, newPageInfo.total - 1));
+                // Instant navigation for highlight click - no animation
+                paginator.goToPage(finalPage, true);
+              } else {
+                paginator.goToPage(clampedPage, true);
+              }
+            } else {
+              paginator.goToPage(clampedPage, true);
+            }
+          } else {
+            // Fallback: just go to last available page
+            paginator.goToPage(clampedPage, true);
+          }
+        } else if (clampedPage !== pageInfo.current) {
+          // Instant navigation for highlight click - no animation
+          paginator.goToPage(clampedPage, true);
+        }
+      }
+
+      // Short wait for layout to settle (no animation, so no 350ms wait needed)
+      await new Promise(r => setTimeout(r, 50));
+      refreshHighlightOverlay();
+
+    } catch (e) {
+      console.error('[navigateToHighlight] Error:', e);
+    } finally {
+      highlightNavigationInProgress = false;
     }
+  }
 
-    // Paginated mode
-    const paginator = renderer?.getPaginator?.();
-    if (!paginator) return;
-
-    const columnWidth = paginator.getColumnWidth();
-    const gap = paginator.getGap();
-    const pageWidth = columnWidth + gap;
-    if (pageWidth <= 0) return;
-
-    // Check if already visible
-    const viewportWidth = iframe.clientWidth || 800;
-    if (rect.left >= -MARGIN && rect.right <= viewportWidth + MARGIN) {
-      console.warn('[navigateToHighlight] Text visible after CFI nav');
-      lastTransformCheck = '';
-      transformStableCount = 0;
-      return;
+  /**
+   * Legacy function for backward compatibility - redirects to new approach
+   */
+  function waitForTextAndNavigate(text: string, attempt: number, cfi?: string): void {
+    if (cfi) {
+      navigateToHighlightText(text, cfi);
+    } else {
+      console.warn('[navigateToHighlight] No CFI provided, cannot navigate');
     }
+  }
 
-    // Calculate target page
-    const match = currentTransform.match(/translate3d\((-?\d+(?:\.\d+)?)px/);
-    const currentOffset = match ? Math.abs(parseFloat(match[1])) : 0;
-    const docPosition = currentOffset + rect.left;
-    const targetPage = Math.max(0, Math.floor(docPosition / pageWidth));
-
-    console.warn('[navigateToHighlight] Navigating: ' + JSON.stringify({
-      rectLeft: Math.round(rect.left),
-      currentOffset: Math.round(currentOffset),
-      targetPage
-    }));
-
-    paginator.goToPage(targetPage);
-
-    // Reset tracking for next call
-    lastTransformCheck = '';
-    transformStableCount = 0;
+  /**
+   * Refresh highlight overlay after navigation completes.
+   * Triggers re-anchoring of highlights to their text ranges.
+   */
+  function refreshHighlightOverlay(): void {
+    if (renderer && bookHighlights.length > 0) {
+      renderer.setStoredHighlights(bookHighlights);
+    }
   }
 
   /**
@@ -439,23 +693,63 @@
   }
 
   /**
-   * Find a text string in the document (or within a specific root element) and return a Range
+   * Find a text string in the document (or within a specific root element) and return a Range.
+   * Handles text that spans multiple nodes (e.g., with footnote markers in <sup> elements).
    */
   function findTextRange(doc: Document, searchText: string, root?: Element | null): Range | null {
     const searchRoot = root || doc.body;
+
+    // First, find the position in the combined textContent
+    const fullText = searchRoot.textContent || '';
+    const textIndex = fullText.indexOf(searchText);
+
+    if (textIndex === -1) {
+      return null;
+    }
+
+    // Now walk text nodes to find the actual node positions
     const walker = doc.createTreeWalker(searchRoot, NodeFilter.SHOW_TEXT, null);
+    const range = doc.createRange();
+
+    let charCount = 0;
+    let foundStart = false;
+    let foundEnd = false;
+    const startOffset = textIndex;
+    const endOffset = textIndex + searchText.length;
 
     let node: Text | null;
     while ((node = walker.nextNode() as Text)) {
-      const nodeText = node.textContent || '';
-      const index = nodeText.indexOf(searchText);
-      if (index !== -1) {
-        const range = doc.createRange();
-        range.setStart(node, index);
-        range.setEnd(node, Math.min(index + searchText.length, nodeText.length));
-        return range;
+      const nodeLength = node.textContent?.length || 0;
+      const nodeEnd = charCount + nodeLength;
+
+      // Find start position
+      if (!foundStart && startOffset >= charCount && startOffset < nodeEnd) {
+        try {
+          range.setStart(node, startOffset - charCount);
+          foundStart = true;
+        } catch (e) {
+          return null;
+        }
       }
+
+      // Find end position
+      if (!foundEnd && endOffset >= charCount && endOffset <= nodeEnd) {
+        try {
+          range.setEnd(node, endOffset - charCount);
+          foundEnd = true;
+          break;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      charCount = nodeEnd;
     }
+
+    if (foundStart && foundEnd) {
+      return range;
+    }
+
     return null;
   }
 
@@ -487,7 +781,6 @@
   let error: string | null = null;
   let progress = 0;
   let currentChapter = '';
-  let showToc = false;
   let showSettings = false;
   let showBottomNav = true;
   let isFullScreen = false;
@@ -558,6 +851,88 @@
           }
         }
       });
+    }
+  }
+
+  /**
+   * Update the sidebar with the book's ToC
+   */
+  function updateSidebarToc(): void {
+    if (!toc || !plugin) return;
+
+    // Find the sidebar view and update its ToC
+    const leaves = plugin.app.workspace.getLeavesOfType('los-libros-book-sidebar');
+    for (const leaf of leaves) {
+      const view = leaf.view as any;
+      if (view.setToc) {
+        view.setToc(toc);
+      }
+    }
+  }
+
+  /**
+   * Build the search index for the current book in the background.
+   * Updates sidebar with progress.
+   */
+  async function buildSearchIndex(): Promise<void> {
+    console.log('[Reader] buildSearchIndex called', { hasBook: !!book, hasProvider: !!providerAdapter });
+    if (!book || !providerAdapter) {
+      console.log('[Reader] buildSearchIndex early return - missing book or provider');
+      return;
+    }
+
+    const searchIndex = getSearchIndex();
+    console.log('[Reader] searchIndex.building:', searchIndex.building);
+    if (searchIndex.building) return;
+
+    const spineLength = book.spine.length;
+
+    // Find sidebar to update progress
+    const getSidebarView = (): any => {
+      const leaves = plugin.app.workspace.getLeavesOfType('los-libros-book-sidebar');
+      for (const leaf of leaves) {
+        return leaf.view as any;
+      }
+      return null;
+    };
+
+    console.log('[Reader] Starting search index build for', spineLength, 'chapters');
+    try {
+      await searchIndex.build(
+        async (spineIndex: number) => {
+          const spineItem = book!.spine[spineIndex];
+          const content = await providerAdapter!.getChapter(bookId, spineItem.href);
+
+          // Resolve chapter name
+          const chapterName = resolveChapterName(spineItem, toc);
+
+          return {
+            html: content.html,
+            chapter: chapterName || `Chapter ${spineIndex + 1}`,
+            href: spineItem.href,
+          };
+        },
+        spineLength,
+        (current, total) => {
+          // Update sidebar with progress
+          if (current === 1 || current % 10 === 0 || current === total) {
+            console.log(`[Reader] Search index progress: ${current}/${total}`);
+          }
+          const sidebar = getSidebarView();
+          if (sidebar?.updateSearchIndexState) {
+            sidebar.updateSearchIndexState(false, current, total);
+          }
+        }
+      );
+
+      console.log('[Reader] Search index build complete');
+      // Index ready - update sidebar
+      const sidebar = getSidebarView();
+      if (sidebar?.updateSearchIndexState) {
+        sidebar.updateSearchIndexState(true, spineLength, spineLength);
+      }
+    } catch (e) {
+      console.error('[Reader] Failed to build search index:', e);
     }
   }
 
@@ -650,7 +1025,20 @@
         }
       }
 
-      // Create renderer with config
+      // Get highlightBookId EARLY - needed for per-book settings BEFORE renderer creation
+      // This prevents loading chapters in wrong mode then switching (which reloads all chapters)
+      highlightBookId = loadedBook.metadata.bookId || '';
+      console.log('[ServerReader] Got highlightBookId early:', highlightBookId);
+
+      // Load per-book settings BEFORE creating renderer
+      // This ensures the correct mode is used from the start, avoiding expensive mode switches
+      if (highlightBookId && plugin.bookSettingsStore) {
+        const savedSettings = plugin.bookSettingsStore.getReaderSettings(highlightBookId, readerSettings);
+        readerSettings = savedSettings;
+        console.log('[ServerReader] Loaded per-book settings BEFORE renderer:', { mode: readerSettings.flow });
+      }
+
+      // Create renderer with config (now using correct per-book settings)
       const rendererConfig: Partial<RendererConfig> = {
         mode: readerSettings.flow === 'paginated' ? 'paginated' : 'scrolled',
         fontSize: readerSettings.fontSize,
@@ -661,13 +1049,20 @@
         margin: getMarginValue(readerSettings.margins),
       };
 
-      renderer = new EpubRenderer(rendererContainer, providerAdapter!, rendererConfig);
+      // Create renderer - use new Shadow DOM renderer if feature flag is enabled
+      if (USE_SHADOW_DOM_RENDERER) {
+        console.log('[ServerReader] Using new Shadow DOM Renderer (V2)');
+        renderer = new ShadowDOMRenderer(rendererContainer, providerAdapter!, rendererConfig) as unknown as EpubRenderer;
+      } else {
+        renderer = new EpubRenderer(rendererContainer, providerAdapter!, rendererConfig);
+      }
 
       // Set up event handlers
       renderer.on('relocated', handleRelocated);
       renderer.on('rendered', handleRendered);
       renderer.on('selected', handleSelected);
       renderer.on('highlightClicked', handleHighlightClicked);
+      renderer.on('linkClicked', handleLinkClicked);
       renderer.on('error', handleError);
       renderer.on('loading', (isLoading) => { loading = isLoading; });
 
@@ -677,6 +1072,21 @@
       book = await providerAdapter!.uploadBook(loadedBook.arrayBuffer, filename);
       bookId = book.id;
       toc = book.toc;
+
+      // Set title from book metadata if not already set from vault/calibre
+      if (!bookTitle && book.metadata?.title) {
+        bookTitle = book.metadata.title;
+        dispatch('titleResolved', { title: bookTitle });
+        console.log('[ServerReader] Title set from book metadata:', bookTitle);
+      }
+
+      // Update highlightBookId to use book's actual ID for correct highlight lookup
+      // The book's internal ID (from EPUB metadata) may differ from the file path
+      const bookMetadataId = book.metadata?.id || book.metadata?.identifier || book.id;
+      if (bookMetadataId && bookMetadataId !== highlightBookId) {
+        console.log('[ServerReader] Updating highlightBookId from', highlightBookId, 'to', bookMetadataId);
+        highlightBookId = bookMetadataId;
+      }
 
       // Load book in renderer
       await renderer.load(bookId);
@@ -695,9 +1105,7 @@
         console.log('[Reader] Sync manager disabled - using offline WASM mode');
       }
 
-      // Get highlightBookId early - needed for per-book settings
-      // Use loadedBook.metadata.bookId which is set correctly by book-loader for both vault and Calibre books
-      highlightBookId = loadedBook.metadata.bookId || '';
+      // highlightBookId was already set early (before renderer creation)
       console.log('[ServerReader] Book loaded', {
         highlightBookId,
         isCalibreBook,
@@ -709,46 +1117,40 @@
       // Update sidebar store with current book info so sidebar knows which book is open
       sidebarStore.setActiveBook(highlightBookId || null, bookPath, bookTitle);
 
-      // Load per-book settings FIRST (BEFORE display())
-      // This ensures the correct mode is set before navigating to saved position
-      if (highlightBookId && plugin.bookSettingsStore) {
-        const savedSettings = plugin.bookSettingsStore.getReaderSettings(highlightBookId, readerSettings);
-        readerSettings = savedSettings;
-        // Apply loaded settings to renderer BEFORE display
-        if (renderer) {
-          console.log('[ServerReader] Applying per-book settings:', { mode: readerSettings.flow });
-          await renderer.updateConfig({
-            mode: readerSettings.flow === 'paginated' ? 'paginated' : 'scrolled',
-            fontSize: readerSettings.fontSize,
-            fontFamily: readerSettings.fontFamily,
-            lineHeight: readerSettings.lineHeight,
-            textAlign: readerSettings.textAlign,
-            theme: readerSettings.theme as ThemePreset,
-            columns: readerSettings.columns as 'single' | 'dual' | 'auto',
-            margin: getMarginValue(readerSettings.margins),
-          });
-        }
-      }
+      // Per-book settings were already loaded BEFORE renderer creation (no mode switch needed)
 
       // Load saved position
       let savedCfi: string | undefined;
       if (isCalibreBook && calibreBook) {
-        const notePath = getCalibreBookNotePath(calibreBook, plugin.settings.calibreBookNotesFolder);
-        const noteFile = plugin.app.vault.getAbstractFileByPath(notePath + '.md');
-        if (noteFile) {
-          const cache = plugin.app.metadataCache.getFileCache(noteFile as any);
-          savedCfi = cache?.frontmatter?.currentCfi as string | undefined;
-          progress = (cache?.frontmatter?.progress as number) || 0;
+        // Load from plugin data where saveProgress stores it
+        const pluginData = await plugin.loadData() as Record<string, any> | null;
+        const calibreProgress = pluginData?.calibreProgress?.[calibreBook.uuid];
+        if (calibreProgress) {
+          savedCfi = calibreProgress.currentCfi;
+          progress = calibreProgress.progress || 0;
         }
+        console.log('[ServerReader] Calibre book position:', { uuid: calibreBook.uuid, savedCfi, progress });
       } else {
         const vaultBook = vaultBooks.find(b => b.localPath === bookPath);
         savedCfi = vaultBook?.currentCfi;
         progress = vaultBook?.progress || 0;
+        console.log('[ServerReader] Vault book position:', {
+          bookPath,
+          foundBook: !!vaultBook,
+          savedCfi,
+          progress,
+          vaultBooksCount: vaultBooks.length
+        });
       }
 
       // Display at saved position (use instant scroll for initial load)
-      // Mode is already set correctly via updateConfig above
-      if (savedCfi) {
+      // Use percentage for accurate position restoration (CFI only saves chapter, not position within)
+      console.log('[ServerReader] Displaying at position:', { savedCfi, progress });
+      if (progress > 0) {
+        // Use percentage-based navigation for accurate restoration
+        await renderer.display({ type: 'percentage', percentage: progress }, { instant: true });
+      } else if (savedCfi) {
+        // Fallback to CFI if no progress saved
         await renderer.display({ type: 'cfi', cfi: savedCfi }, { instant: true });
       } else {
         await renderer.display(undefined, { instant: true });
@@ -794,6 +1196,12 @@
       window.addEventListener('beforeunload', saveProgress);
 
       loading = false;
+
+      // Update sidebar with ToC
+      updateSidebarToc();
+
+      // Build search index in background (non-blocking)
+      buildSearchIndex();
     } catch (e) {
       console.error('Failed to load book:', e);
       error = e instanceof Error ? e.message : String(e);
@@ -803,6 +1211,9 @@
 
   onDestroy(() => {
     document.body.classList.remove('los-libros-fullscreen-mode');
+
+    // Clear search index
+    clearSearchIndex();
 
     // Save final progress
     saveProgress();
@@ -851,11 +1262,10 @@
     currentPage = location.pageInBook ?? location.pageInChapter ?? 0;
     totalPages = location.totalPagesInBook ?? location.totalPagesInChapter ?? 0;
 
-    // Find current chapter
+    // Find current chapter using robust matching
     if (book) {
       const spineItem = book.spine[location.spineIndex];
-      const tocEntry = toc.find(t => t.href === spineItem?.href || spineItem?.href.includes(t.href));
-      currentChapter = tocEntry?.label || '';
+      currentChapter = resolveChapterName(spineItem, toc, progress);
     }
 
     // Close highlight popup on scroll/navigation to prevent stale positioning
@@ -974,6 +1384,14 @@
     error = err.message;
   }
 
+  function handleLinkClicked(data: { href: string; external: boolean }) {
+    if (data.external) {
+      // Open external links in the default browser
+      window.open(data.href, '_blank', 'noopener,noreferrer');
+    }
+    // Internal links are handled by the renderer itself (navigation + pulse animation)
+  }
+
   // Navigation
   function prevPage() {
     renderer?.prev();
@@ -987,7 +1405,6 @@
 
   function goToChapter(entry: TocEntry) {
     renderer?.display({ type: 'href', href: entry.href });
-    showToc = false;
     if (readerSettings.hapticFeedback) HapticFeedback.light();
   }
 
@@ -1035,34 +1452,90 @@
     }, PROGRESS_SAVE_DELAY_MS);
   }
 
-  function handleSettingsChange(event: CustomEvent<{ settings: Partial<ReaderSettings> }>) {
-    const changes = event.detail.settings;
+  // Track if a significant layout change is in progress
+  let layoutChangeInProgress = false;
 
-    // Properly merge margins if they're being updated
-    if (changes.margins) {
-      readerSettings = {
-        ...readerSettings,
-        ...changes,
-        margins: { ...readerSettings.margins, ...changes.margins }
-      };
-    } else {
-      readerSettings = { ...readerSettings, ...changes };
+  async function handleSettingsChange(event: CustomEvent<{ settings: Partial<ReaderSettings> }>) {
+    const changes = event.detail.settings;
+    const previousFlow = readerSettings.flow;
+
+    // Check if this is a significant layout change that requires position preservation
+    const isModeChange = changes.flow !== undefined && changes.flow !== previousFlow;
+    const isLayoutChange = isModeChange ||
+      changes.fontSize !== undefined ||
+      changes.margins !== undefined ||
+      changes.columns !== undefined ||
+      changes.lineHeight !== undefined;
+
+    // Save current position before any layout changes
+    let savedCfi: string | undefined;
+    if (isLayoutChange && renderer) {
+      const location = renderer.getLocation();
+      savedCfi = location?.cfi;
+      console.log('[Settings] Saving position before layout change:', savedCfi);
     }
 
-    // Apply to renderer - include all configurable settings
-    // Note: Renderer currently only supports single margin value
-    // Using horizontal margin (left) for column padding
-    if (renderer) {
-      renderer.updateConfig({
-        mode: readerSettings.flow === 'paginated' ? 'paginated' : 'scrolled',
-        fontSize: readerSettings.fontSize,
-        fontFamily: readerSettings.fontFamily,
-        lineHeight: readerSettings.lineHeight,
-        textAlign: readerSettings.textAlign,
-        theme: readerSettings.theme,
-        columns: readerSettings.columns,
-        margin: getMarginValue(readerSettings.margins),
-      });
+    // Show loading indicator for mode changes
+    if (isModeChange) {
+      loading = true;
+      layoutChangeInProgress = true;
+    }
+
+    try {
+      // Properly merge margins if they're being updated
+      if (changes.margins) {
+        readerSettings = {
+          ...readerSettings,
+          ...changes,
+          margins: { ...readerSettings.margins, ...changes.margins }
+        };
+      } else {
+        readerSettings = { ...readerSettings, ...changes };
+      }
+
+      // Apply to renderer - include all configurable settings
+      // Note: Renderer currently only supports single margin value
+      // Using horizontal margin (left) for column padding
+      if (renderer) {
+        await renderer.updateConfig({
+          mode: readerSettings.flow === 'paginated' ? 'paginated' : 'scrolled',
+          fontSize: readerSettings.fontSize,
+          fontFamily: readerSettings.fontFamily,
+          lineHeight: readerSettings.lineHeight,
+          textAlign: readerSettings.textAlign,
+          theme: readerSettings.theme,
+          columns: readerSettings.columns,
+          margin: getMarginValue(readerSettings.margins),
+        });
+
+        // Restore position after layout changes
+        if (savedCfi) {
+          // Short wait for layout to settle before navigating (reduced for faster UX)
+          await new Promise(r => setTimeout(r, isModeChange ? 100 : 50));
+
+          try {
+            await renderer.display({ type: 'cfi', cfi: savedCfi }, { instant: true });
+            console.log('[Settings] Restored position to:', savedCfi);
+          } catch (e) {
+            console.warn('[Settings] Failed to restore position:', e);
+          }
+
+          // Refresh highlights after position restore (async, don't block)
+          if (bookHighlights.length > 0) {
+            requestAnimationFrame(() => {
+              renderer?.setStoredHighlights(bookHighlights);
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[Settings] Error during settings change:', e);
+    } finally {
+      // Always hide loading indicator, even if an error occurred
+      if (isModeChange) {
+        loading = false;
+        layoutChangeInProgress = false;
+      }
     }
 
     // Apply brightness filter to container
@@ -1241,6 +1714,8 @@
     const cfi = location.cfi;
     const progressVal = location.percentage;
 
+    console.log('[ServerReader] Saving progress:', { cfi, progress: progressVal, isCalibreBook });
+
     if (isCalibreBook && calibreBook) {
       // Save to plugin data for Calibre books
       plugin.loadData().then((data: Record<string, any>) => {
@@ -1252,12 +1727,14 @@
           updatedAt: new Date().toISOString(),
         };
         plugin.saveData(data);
+        console.log('[ServerReader] Saved Calibre progress:', { uuid: calibreBook!.uuid, cfi });
       });
     } else {
       // Save to library store for vault books
       const vaultBook = plugin.libraryStore.getValue().books.find(b => b.localPath === bookPath);
       if (vaultBook) {
         plugin.libraryService?.updateProgress(vaultBook.id, progressVal, cfi);
+        console.log('[ServerReader] Saved vault book progress:', { id: vaultBook.id, cfi });
       }
     }
   }
@@ -1363,7 +1840,6 @@
   // Legacy: Toggle in-reader notebook sidebar (kept for fallback)
   function toggleNotebook() {
     showNotebook = !showNotebook;
-    showToc = false;
     showSettings = false;
     showBookInfo = false;
     showMoreMenu = false;
@@ -1374,7 +1850,6 @@
   function openNotebookTab(tab: 'highlights' | 'bookmarks' | 'notes' | 'images') {
     notebookTab = tab;
     showNotebook = true;
-    showToc = false;
     showSettings = false;
     showBookInfo = false;
     showMoreMenu = false;
@@ -1504,7 +1979,6 @@
         event.shiftKey ? prevPage() : nextPage();
         break;
       case 'Escape':
-        showToc = false;
         showSettings = false;
         showNotebook = false;
         showHighlightPopup = false;
@@ -1512,15 +1986,13 @@
       case 't':
       case 'T':
         if (!event.metaKey && !event.ctrlKey) {
-          showToc = !showToc;
-          showSettings = false;
+          openBookSidebar('toc');
         }
         break;
       case 's':
       case 'S':
         if (!event.metaKey && !event.ctrlKey) {
           showSettings = !showSettings;
-          showToc = false;
         }
         break;
       case 'f':
@@ -1588,9 +2060,8 @@
     }
 
     // Close any open menus/panels
-    if (showSettings || showToc || showMoreMenu || showBookInfo || showNotebook) {
+    if (showSettings || showMoreMenu || showBookInfo || showNotebook) {
       showSettings = false;
-      showToc = false;
       showMoreMenu = false;
       showBookInfo = false;
       showNotebook = false;
@@ -1638,7 +2109,7 @@
   {#if loading}
     <div class="reader-loading-overlay">
       <div class="loading-spinner"></div>
-      <p>Loading book...</p>
+      <p>{layoutChangeInProgress ? 'Applying changes...' : 'Loading book...'}</p>
     </div>
   {:else if error}
     <div class="reader-error">
@@ -1655,7 +2126,7 @@
     <!-- Top Bar with Controls -->
     <div class="reader-topbar" class:hidden={!showBottomNav}>
       <div class="topbar-left">
-        <button class="icon-button" on:click|stopPropagation={() => { showToc = !showToc; showSettings = false; showMoreMenu = false; }} title="Table of Contents (T)">
+        <button class="icon-button" on:click|stopPropagation={() => openBookSidebar('toc')} title="Table of Contents (T)">
           <List size={20} />
         </button>
         <span class="chapter-title">{currentChapter || bookTitle}</span>
@@ -1681,10 +2152,10 @@
         <button class="icon-button" on:click|stopPropagation={() => openBookSidebar('highlights')} title="Notebook">
           <Highlighter size={20} />
         </button>
-        <button class="icon-button" on:click|stopPropagation={() => { showSettings = !showSettings; showToc = false; showMoreMenu = false; showNotebook = false; }} title="Settings (S)">
+        <button class="icon-button" on:click|stopPropagation={() => { showSettings = !showSettings; showMoreMenu = false; showNotebook = false; }} title="Settings (S)">
           <Settings size={20} />
         </button>
-        <button class="icon-button" on:click|stopPropagation={() => { showMoreMenu = !showMoreMenu; showToc = false; showSettings = false; showNotebook = false; }} title="More options">
+        <button class="icon-button" on:click|stopPropagation={() => { showMoreMenu = !showMoreMenu; showSettings = false; showNotebook = false; }} title="More options">
           <MoreVertical size={20} />
         </button>
       </div>
@@ -1767,37 +2238,15 @@
     </div>
 
     <!-- Sidebar click-away overlay -->
-    {#if showToc || showSettings || showBookInfo || showNotebook}
+    {#if showSettings || showBookInfo || showNotebook}
       <div
         class="sidebar-overlay"
-        on:click={() => { showToc = false; showSettings = false; showBookInfo = false; showNotebook = false; }}
-        on:keydown={(e) => e.key === 'Escape' && (showToc = false, showSettings = false, showBookInfo = false, showNotebook = false)}
+        on:click={() => { showSettings = false; showBookInfo = false; showNotebook = false; }}
+        on:keydown={(e) => e.key === 'Escape' && (showSettings = false, showBookInfo = false, showNotebook = false)}
         role="button"
         tabindex="-1"
         aria-label="Close sidebar"
       />
-    {/if}
-
-    <!-- TOC Sidebar -->
-    {#if showToc}
-      <div class="sidebar toc-sidebar" on:click|stopPropagation>
-        <div class="sidebar-header">
-          <h3>Contents</h3>
-          <button class="icon-button" on:click={() => showToc = false}>
-            <X size={20} />
-          </button>
-        </div>
-        <div class="toc-list">
-          {#each toc as entry}
-            <button
-              class="toc-item"
-              on:click={() => goToChapter(entry)}
-            >
-              {entry.label}
-            </button>
-          {/each}
-        </div>
-      </div>
     {/if}
 
     <!-- Settings Panel -->

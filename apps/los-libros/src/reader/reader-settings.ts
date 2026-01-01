@@ -216,7 +216,7 @@ export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   fontFamily: 'serif',
   lineHeight: 1.5,
   textAlign: 'justify',
-  margins: { top: 20, bottom: 20, left: 20, right: 20 },
+  margins: { top: 40, bottom: 40, left: 40, right: 40 },
   letterSpacing: 0,
   wordSpacing: 0,
 

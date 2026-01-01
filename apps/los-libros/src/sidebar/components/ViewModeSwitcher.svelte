@@ -13,11 +13,15 @@
     BookmarkIcon,
     StickyNote,
     Image,
+    List,
+    Search,
   } from 'lucide-svelte';
 
   export let highlightsCount = 0;
   export let bookmarksCount = 0;
   export let notesCount = 0;
+  export let tocCount = 0;
+  export let searchResultsCount = 0;
 
   // Expansion state
   let isExpanded = false;
@@ -33,6 +37,8 @@
 
   // View mode definitions
   const viewModes: { mode: SidebarTab; label: string; icon: typeof Highlighter }[] = [
+    { mode: 'search', label: 'Search', icon: Search },
+    { mode: 'toc', label: 'Contents', icon: List },
     { mode: 'highlights', label: 'Highlights', icon: Highlighter },
     { mode: 'bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
     { mode: 'notes', label: 'Notes', icon: StickyNote },
@@ -138,9 +144,10 @@
 
   $: currentMode = viewModes[currentIndex];
 
-  // Get badge count for a mode
+  // Get badge count for a mode (TOC excluded - too crowded)
   function getBadgeCount(mode: SidebarTab): number {
     switch (mode) {
+      case 'search': return searchResultsCount;
       case 'highlights': return highlightsCount;
       case 'bookmarks': return bookmarksCount;
       case 'notes': return notesCount;

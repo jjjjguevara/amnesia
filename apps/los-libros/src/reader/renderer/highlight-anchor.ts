@@ -26,38 +26,68 @@ interface TextQuoteSelector {
  */
 export class HighlightAnchor {
   private doc: Document;
+  private searchScope: Element | null = null;
 
   constructor(doc: Document) {
     this.doc = doc;
   }
 
   /**
+   * Set the search scope to a specific element (e.g., chapter container)
+   * This restricts text searches to within that element only
+   */
+  setSearchScope(element: Element | null): void {
+    this.searchScope = element;
+  }
+
+  /**
+   * Get the root element for searching (scope or body)
+   */
+  private getSearchRoot(): Element {
+    return this.searchScope || this.doc.body;
+  }
+
+  /**
    * Anchor a selector to a DOM Range
    * Strategy: CFI first → TextQuote fallback → Position last resort
+   *
+   * @param selector - The selector to anchor
+   * @param scopeElement - Optional element to restrict search to (e.g., chapter)
    */
-  anchor(selector: HighlightSelector): AnchorResult {
-    // 1. Try TextQuote first (most robust for reflow scenarios)
-    // CFI can break if content changes, but TextQuote with context is resilient
-    if (selector.fallback) {
-      const textResult = this.anchorByTextQuote(selector.fallback);
-      if (textResult.range) {
-        return textResult;
-      }
+  anchor(selector: HighlightSelector, scopeElement?: Element): AnchorResult {
+    // Temporarily set scope if provided
+    const previousScope = this.searchScope;
+    if (scopeElement) {
+      this.searchScope = scopeElement;
     }
 
-    // 2. Try position fallback (character offsets)
-    if (selector.position) {
-      const posResult = this.anchorByPosition(
-        selector.position.start,
-        selector.position.end
-      );
-      if (posResult.range) {
-        return posResult;
+    try {
+      // 1. Try TextQuote first (most robust for reflow scenarios)
+      // CFI can break if content changes, but TextQuote with context is resilient
+      if (selector.fallback) {
+        const textResult = this.anchorByTextQuote(selector.fallback);
+        if (textResult.range) {
+          return textResult;
+        }
       }
-    }
 
-    // 3. Could not anchor
-    return { range: null, status: 'orphaned', confidence: 0 };
+      // 2. Try position fallback (character offsets)
+      if (selector.position) {
+        const posResult = this.anchorByPosition(
+          selector.position.start,
+          selector.position.end
+        );
+        if (posResult.range) {
+          return posResult;
+        }
+      }
+
+      // 3. Could not anchor
+      return { range: null, status: 'orphaned', confidence: 0 };
+    } finally {
+      // Restore previous scope
+      this.searchScope = previousScope;
+    }
   }
 
   /**
@@ -65,7 +95,8 @@ export class HighlightAnchor {
    * This is the most robust method for surviving reflows
    */
   private anchorByTextQuote(selector: TextQuoteSelector): AnchorResult {
-    const textContent = this.doc.body.textContent || '';
+    const searchRoot = this.getSearchRoot();
+    const textContent = searchRoot.textContent || '';
     const { exact, prefix, suffix } = selector;
 
     // Strategy 1: Match with full context (highest confidence)
@@ -146,8 +177,9 @@ export class HighlightAnchor {
    */
   private createRangeFromCharOffset(start: number, end: number): Range | null {
     const range = this.doc.createRange();
+    const searchRoot = this.getSearchRoot();
     const walker = this.doc.createTreeWalker(
-      this.doc.body,
+      searchRoot,
       NodeFilter.SHOW_TEXT,
       null
     );

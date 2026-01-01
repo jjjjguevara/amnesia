@@ -430,9 +430,23 @@ export default class LosLibrosPlugin extends Plugin {
 		const leaves = workspace.getLeavesOfType(BOOK_SIDEBAR_VIEW_TYPE);
 
 		if (leaves.length > 0) {
-			leaf = leaves[0];
+			// Find existing leaves, prefer left sidebar
+			const leftLeaves = leaves.filter(l => l.getRoot() === workspace.leftSplit);
+			const rightLeaves = leaves.filter(l => l.getRoot() === workspace.rightSplit);
+
+			if (leftLeaves.length > 0) {
+				// Prefer left sidebar if one exists
+				leaf = leftLeaves[0];
+			} else if (rightLeaves.length > 0) {
+				// Use right sidebar if only right exists
+				leaf = rightLeaves[0];
+			} else {
+				// Use any existing leaf
+				leaf = leaves[0];
+			}
 		} else {
-			leaf = workspace.getRightLeaf(false);
+			// No existing sidebar - create on LEFT (preferred)
+			leaf = workspace.getLeftLeaf(false);
 			await leaf?.setViewState({ type: BOOK_SIDEBAR_VIEW_TYPE, active: true });
 		}
 

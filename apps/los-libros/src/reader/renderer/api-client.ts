@@ -18,6 +18,9 @@ import type {
   PullRequest,
   PullResponse,
   ApiResponse,
+  ParsedPdf,
+  PdfTextLayer,
+  PdfRenderOptions,
 } from './types';
 
 /**
@@ -384,6 +387,121 @@ export class ApiClient {
       body: JSON.stringify(request),
       headers: { 'Content-Type': 'application/json' },
     });
+  }
+
+  // ============================================================================
+  // PDF Operations
+  // ============================================================================
+
+  /**
+   * Upload a PDF file to the server
+   */
+  async uploadPdf(data: ArrayBuffer, filename?: string): Promise<ParsedPdf> {
+    const formData = new FormData();
+    const blob = new Blob([data], { type: 'application/pdf' });
+    const finalFilename = filename || 'document.pdf';
+
+    console.log('[ApiClient] Uploading PDF:', {
+      size: data.byteLength,
+      filename: finalFilename,
+    });
+
+    formData.append('file', blob, finalFilename);
+
+    const uploadResponse = await this.request<{ id: string; message: string }>('/api/v1/pdf', {
+      method: 'POST',
+      body: formData,
+    });
+
+    // Fetch full PDF metadata
+    return this.getPdf(uploadResponse.id);
+  }
+
+  /**
+   * Get PDF metadata and structure
+   */
+  async getPdf(pdfId: string): Promise<ParsedPdf> {
+    return this.request<ParsedPdf>(`/api/v1/pdf/${encodeURIComponent(pdfId)}`);
+  }
+
+  /**
+   * Delete a PDF from server
+   */
+  async deletePdf(pdfId: string): Promise<void> {
+    await this.request(`/api/v1/pdf/${encodeURIComponent(pdfId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  /**
+   * Get rendered page image
+   * @param pdfId PDF identifier
+   * @param page Page number (1-based)
+   * @param options Render options (scale, rotation, format)
+   */
+  async getPdfPage(
+    pdfId: string,
+    page: number,
+    options?: PdfRenderOptions
+  ): Promise<Blob> {
+    const params = new URLSearchParams();
+    if (options?.scale) params.set('scale', options.scale.toString());
+    if (options?.rotation) params.set('rotation', options.rotation.toString());
+    if (options?.format) params.set('format', options.format);
+
+    const url = `/api/v1/pdf/${encodeURIComponent(pdfId)}/pages/${page}?${params}`;
+    const response = await this.fetch(url, {});
+    return response.blob();
+  }
+
+  /**
+   * Get text layer for a page
+   * @param pdfId PDF identifier
+   * @param page Page number (1-based)
+   */
+  async getPdfTextLayer(pdfId: string, page: number): Promise<PdfTextLayer> {
+    return this.request<PdfTextLayer>(
+      `/api/v1/pdf/${encodeURIComponent(pdfId)}/pages/${page}/text`
+    );
+  }
+
+  /**
+   * Get page thumbnail (low-resolution)
+   * @param pdfId PDF identifier
+   * @param page Page number (1-based)
+   */
+  async getPdfThumbnail(pdfId: string, page: number): Promise<Blob> {
+    const url = `/api/v1/pdf/${encodeURIComponent(pdfId)}/pages/${page}/thumbnail`;
+    const response = await this.fetch(url, {});
+    return response.blob();
+  }
+
+  /**
+   * Search PDF content
+   * @param pdfId PDF identifier
+   * @param query Search query
+   * @param limit Maximum number of results
+   */
+  async searchPdf(
+    pdfId: string,
+    query: string,
+    limit?: number
+  ): Promise<Array<{
+    page: number;
+    text: string;
+    prefix?: string;
+    suffix?: string;
+  }>> {
+    const params = new URLSearchParams();
+    params.set('q', query);
+    if (limit) params.set('limit', limit.toString());
+
+    return this.request<Array<{
+      page: number;
+      text: string;
+      prefix?: string;
+      suffix?: string;
+    }>>(`/api/v1/pdf/${encodeURIComponent(pdfId)}/search?${params}`);
   }
 
   // ============================================================================

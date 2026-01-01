@@ -1,8 +1,18 @@
 /**
  * Paginator
  *
- * Handles CSS multi-column pagination for paginated reading mode.
- * Uses CSS columns for layout and scroll snapping for page turns.
+ * Handles CSS Scroll Snap pagination for paginated reading mode.
+ * Uses native browser scrolling with CSS columns for layout.
+ *
+ * Key change from previous implementation:
+ * - Previously: CSS columns + translate3d transforms for page turns
+ * - Now: CSS columns + native scroll with scroll-snap for page turns
+ *
+ * Benefits of CSS Scroll Snap:
+ * - All children (including CSS Custom Highlights) move atomically with content
+ * - Native browser scroll engine handles momentum and smooth scrolling
+ * - Consistent coordinates from getClientRects() during scroll
+ * - Hardware-accelerated by browser compositor
  */
 
 import type { RendererConfig, ColumnLayout } from './types';
@@ -15,9 +25,30 @@ export interface PageInfo {
 export type PageChangeCallback = (page: PageInfo) => void;
 
 /**
- * CSS Multi-column Paginator with live gesture support
+ * CSS Scroll Snap Paginator
  */
 export type StyleUpdateCallback = () => void;
+
+// Logging utility for debugging pagination issues
+const LOG_PREFIX = '[Paginator]';
+const DEBUG = true; // Set to false to disable verbose logging
+
+function log(message: string, data?: Record<string, unknown>): void {
+  if (!DEBUG) return;
+  if (data) {
+    console.log(`${LOG_PREFIX} ${message}`, data);
+  } else {
+    console.log(`${LOG_PREFIX} ${message}`);
+  }
+}
+
+function warn(message: string, data?: Record<string, unknown>): void {
+  if (data) {
+    console.warn(`${LOG_PREFIX} ${message}`, data);
+  } else {
+    console.warn(`${LOG_PREFIX} ${message}`);
+  }
+}
 
 export class Paginator {
   private iframe: HTMLIFrameElement;
@@ -30,35 +61,29 @@ export class Paginator {
   private totalPages = 1;
   private columnWidth = 0;
   private containerWidth = 0;
+  private exactViewportWidth = 0; // Exact width for column-aligned scrolling
   private initialized = false;
-
-  // Gesture state for live drag
-  private gestureOffset = 0;           // Accumulated drag offset
-  private gestureActive = false;        // Whether a gesture is in progress
-  private gestureEndTimeout: number | null = null;  // Timer for gesture end detection
-  private baseTransform = 0;            // Transform at start of gesture
-
-  // Velocity tracking for momentum
-  private velocityHistory: Array<{ delta: number; time: number }> = [];
-  private momentumAnimationId: number | null = null;
-  private currentTransform = 0;         // Current transform position during momentum
-
-  // Performance tracking
-  private lastFrameTime = 0;
-  private frameCount = 0;
-  private frameTimes: number[] = [];
 
   // First page handling (for cover display)
   private isFirstPage = true;
 
-  // Cached values to avoid reflow during gestures
-  private cachedScrollWidth = 0;
-  private cachedMaxOffset = 0;
+  // Scroll container reference (viewport-wrapper)
+  private scrollContainer: HTMLElement | null = null;
 
-  // Throttling for DOM updates
-  private lastDomUpdate = 0;
-  private pendingTransform = 0;
-  private rafId: number | null = null;
+  // Debounce for scroll events
+  private scrollDebounceTimer: number | null = null;
+  private isScrolling = false;
+
+  // Gesture tracking for trackpad/touch
+  private gestureActive = false;
+  private gestureStartX = 0;
+  private gestureStartScrollLeft = 0;
+  private velocityHistory: Array<{ delta: number; time: number }> = [];
+  private gestureEndTimeout: number | null = null;
+
+  // Logging state
+  private lastLoggedPage = -1;
+  private gestureLogCount = 0;
 
   constructor(
     iframe: HTMLIFrameElement,
@@ -84,31 +109,44 @@ export class Paginator {
    * @param initialPosition - 'start', 'end', or a specific page number
    */
   async initialize(initialPosition: 'start' | 'end' | number = 'start'): Promise<void> {
+    log('=== INITIALIZE START ===', { initialPosition });
+
     const doc = this.iframe.contentDocument;
-    if (!doc) return;
-
-    const container = doc.getElementById('content-container');
-
-    // CRITICAL: Reset transform BEFORE calculating dimensions
-    // This ensures fresh state and accurate measurements when switching chapters
-    // Without this, the old chapter's transform persists and causes content to disappear
-    if (container) {
-      container.style.transition = 'none';
-      container.style.transform = 'translate3d(0, 0, 0)';
+    if (!doc) {
+      warn('Initialize failed: no contentDocument');
+      return;
     }
 
+    // Get scroll container (viewport-wrapper)
+    this.scrollContainer = doc.getElementById('viewport-wrapper');
+    if (!this.scrollContainer) {
+      warn('Initialize failed: viewport-wrapper not found');
+      return;
+    }
+
+    log('Found scroll container', {
+      scrollWidth: this.scrollContainer.scrollWidth,
+      clientWidth: this.scrollContainer.clientWidth,
+      scrollLeft: this.scrollContainer.scrollLeft,
+    });
+
+    // Reset scroll position before calculating dimensions
+    this.scrollContainer.scrollLeft = 0;
+
     // Wait for content to render
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // NOTE: requestAnimationFrame may not fire reliably in iframes during initial load
+    // Use setTimeout as a more reliable alternative
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    log('Measuring dimensions...');
 
     // Calculate dimensions (this determines totalPages)
     this.calculateDimensions();
 
     // Set initial page based on position parameter
-    // This allows us to go directly to the target page without showing page 0 first
     if (initialPosition === 'end') {
       this.currentPage = Math.max(0, this.totalPages - 1);
-      this.isFirstPage = false; // Not on first page
+      this.isFirstPage = false;
     } else if (typeof initialPosition === 'number') {
       this.currentPage = Math.max(0, Math.min(initialPosition, this.totalPages - 1));
       this.isFirstPage = (this.currentPage === 0);
@@ -117,13 +155,139 @@ export class Paginator {
       this.isFirstPage = true;
     }
 
+    log('Initial page calculated', {
+      currentPage: this.currentPage,
+      totalPages: this.totalPages,
+      isFirstPage: this.isFirstPage,
+    });
+
+    // Set up scroll event listener
+    this.setupScrollListener();
+
     this.initialized = true;
 
-    // Set transform directly to target position without animation
-    // This prevents the jarring "reset from left to right" effect when navigating backwards
+    // Scroll to initial position without animation
     this.scrollToCurrentPage(false);
 
+    log('=== INITIALIZE COMPLETE ===', {
+      currentPage: this.currentPage,
+      totalPages: this.totalPages,
+      containerWidth: this.containerWidth,
+      columnWidth: this.columnWidth,
+    });
+
     this.notifyPageChange();
+  }
+
+  /**
+   * Set up scroll event listener to track page changes
+   */
+  private setupScrollListener(): void {
+    if (!this.scrollContainer) return;
+
+    log('Setting up scroll event listener');
+
+    this.scrollContainer.addEventListener('scroll', () => {
+      // Don't process scroll events during programmatic scrolling
+      if (this.isScrolling) {
+        return;
+      }
+
+      // Don't process scroll events during active gesture - gesture end handles snap
+      if (this.gestureActive) {
+        return;
+      }
+
+      // Debounce to detect when scrolling stops
+      if (this.scrollDebounceTimer) {
+        clearTimeout(this.scrollDebounceTimer);
+      }
+
+      this.scrollDebounceTimer = window.setTimeout(() => {
+        // Double-check gesture state when timeout fires (gesture might have started)
+        if (this.gestureActive) {
+          log('Scroll end timer fired but gesture now active - skipping');
+          return;
+        }
+        this.handleScrollEnd();
+      }, 100);
+    }, { passive: true });
+  }
+
+  /**
+   * Handle scroll end - snap to nearest page after user scroll
+   */
+  private handleScrollEnd(): void {
+    if (!this.scrollContainer) return;
+
+    // CRITICAL: Use exactViewportWidth for page width to match column layout
+    const pageWidth = this.getPageWidth();
+    const scrollLeft = this.scrollContainer.scrollLeft;
+    const expectedPosition = this.currentPage * pageWidth;
+
+    log('=== SCROLL END ===', {
+      scrollLeft: Math.round(scrollLeft),
+      pageWidth: Math.round(pageWidth),
+      expectedPosition: Math.round(expectedPosition),
+      currentPage: this.currentPage,
+      isScrolling: this.isScrolling,
+      gestureActive: this.gestureActive,
+    });
+
+    // Calculate which page we're on based on scroll position
+    const newPage = Math.round(scrollLeft / pageWidth);
+    const clampedPage = Math.max(0, Math.min(newPage, this.totalPages - 1));
+
+    // Always snap to page boundary (CSS scroll-snap doesn't work with CSS columns)
+    const targetScrollLeft = clampedPage * pageWidth;
+    const drift = Math.abs(scrollLeft - targetScrollLeft);
+    const needsSnap = drift > 2;
+
+    log('Scroll end calculation', {
+      calculatedPage: newPage,
+      clampedPage,
+      targetScrollLeft: Math.round(targetScrollLeft),
+      drift: Math.round(drift),
+      needsSnap,
+      pageChanged: clampedPage !== this.currentPage,
+    });
+
+    // Determine if there's a first-page mode transition
+    let needsLayoutChange = false;
+    if (clampedPage !== this.currentPage && this.config.columns === 'auto') {
+      const wasFirstPage = this.isFirstPage;
+      this.isFirstPage = (clampedPage === 0);
+      needsLayoutChange = wasFirstPage !== this.isFirstPage;
+      if (needsLayoutChange) {
+        log('First page mode transition in scroll end (deferred)', { wasFirstPage, isFirstPage: this.isFirstPage });
+      }
+    }
+
+    const pageChanged = clampedPage !== this.currentPage;
+    if (pageChanged) {
+      log(`Page change: ${this.currentPage} → ${clampedPage}`);
+      this.currentPage = clampedPage;
+    }
+
+    if (needsLayoutChange) {
+      // For layout changes, apply atomically then scroll instantly
+      log('Applying layout change - instant scroll to avoid drift');
+      this.onStyleUpdate?.();
+      this.calculateDimensions();
+      this.scrollToCurrentPage(false);
+      this.notifyPageChange();
+    } else {
+      if (pageChanged) {
+        this.notifyPageChange();
+      }
+      // Snap to exact page position if not aligned
+      if (needsSnap) {
+        log(`Snapping to page ${clampedPage}, drift was ${Math.round(drift)}px`);
+        this.scrollToCurrentPage(true);
+      } else {
+        log('No snap needed, already aligned');
+      }
+    }
   }
 
   /**
@@ -134,9 +298,12 @@ export class Paginator {
     if (!doc) return;
 
     const container = doc.getElementById('content-container');
-    if (!container) return;
+    if (!container || !this.scrollContainer) {
+      warn('calculateDimensions: missing container or scrollContainer');
+      return;
+    }
 
-    // Get viewport dimensions from iframe (what's visible)
+    // Get viewport dimensions from iframe
     const iframeRect = this.iframe.getBoundingClientRect();
     const viewportWidth = iframeRect.width - (this.config.margin * 2);
     const viewportHeight = iframeRect.height - (this.config.margin * 2);
@@ -146,32 +313,57 @@ export class Paginator {
     // Calculate column width based on settings
     const columns = this.getColumnCount();
     const totalGaps = (columns - 1) * this.config.columnGap;
+    // CRITICAL: Round to whole pixels to avoid browser rounding inconsistencies
+    // Fractional pixels cause drift between calculated pages and actual scroll positions
     this.columnWidth = Math.floor((viewportWidth - totalGaps) / columns);
 
-    // Clear transform to get accurate content measurement
-    // NOTE: We intentionally do NOT restore the old transform here.
-    // The caller (initialize or handleResize) is responsible for setting the correct transform
-    // via scrollToCurrentPage(). Restoring old transforms caused state desync bugs.
-    container.style.transition = 'none';
-    container.style.transform = 'none';
+    // CRITICAL: Calculate the exact viewport width that fits the columns perfectly
+    // This prevents drift between scroll positions and column boundaries
+    this.exactViewportWidth = this.columnWidth * columns + totalGaps;
 
     // Force reflow to get accurate measurements
     void container.offsetWidth;
 
-    // Measure the actual content width using scrollWidth
-    // Note: We removed 'width: max-content' from CSS because it gave incorrect values.
-    // Now scrollWidth correctly reflects the column-wrapped content width.
-    const actualContentWidth = container.scrollWidth;
+    // Measure the actual content width using scrollWidth of the scroll container
+    const scrollWidth = this.scrollContainer.scrollWidth;
+    const clientWidth = this.scrollContainer.clientWidth;
 
-    // Each "page" is viewport width (columns visible at once) + gap to next page
-    const pageWidth = viewportWidth + this.config.columnGap;
+    // Each "page" is exact viewport width + gap
+    // Must use exactViewportWidth to match the actual column layout
+    const pageWidth = this.exactViewportWidth + this.config.columnGap;
 
-    // Calculate total pages based on actual content width
-    if (actualContentWidth <= viewportWidth) {
+    // Calculate total pages based on scroll width
+    const prevTotalPages = this.totalPages;
+    if (scrollWidth <= viewportWidth) {
       this.totalPages = 1;
     } else {
-      this.totalPages = Math.max(1, Math.ceil(actualContentWidth / pageWidth));
+      this.totalPages = Math.max(1, Math.ceil(scrollWidth / pageWidth));
     }
+
+    // Get actual CSS computed values for debugging
+    const computedStyle = doc.defaultView?.getComputedStyle(container);
+    const actualColumnWidth = computedStyle?.columnWidth;
+    const actualColumnGap = computedStyle?.columnGap;
+
+    log('=== DIMENSIONS CALCULATED ===', {
+      iframeWidth: Math.round(iframeRect.width),
+      iframeHeight: Math.round(iframeRect.height),
+      margin: this.config.margin,
+      viewportWidth: Math.round(viewportWidth * 100) / 100,
+      viewportHeight: Math.round(viewportHeight),
+      columns,
+      columnWidth: Math.round(this.columnWidth * 100) / 100,
+      columnGap: this.config.columnGap,
+      scrollWidth,
+      clientWidth,
+      pageWidth: Math.round(pageWidth * 100) / 100,
+      totalPages: this.totalPages,
+      prevTotalPages,
+      isFirstPage: this.isFirstPage,
+      // CSS actual values (for debugging mismatch)
+      cssColumnWidth: actualColumnWidth,
+      cssColumnGap: actualColumnGap,
+    });
   }
 
   /**
@@ -202,22 +394,36 @@ export class Paginator {
    * @returns true if there was a next page, false if at end
    */
   nextPage(): boolean {
+    log('nextPage() called', {
+      initialized: this.initialized,
+      currentPage: this.currentPage,
+      totalPages: this.totalPages,
+      isScrolling: this.isScrolling,
+      gestureActive: this.gestureActive,
+    });
+
     if (!this.initialized) {
+      warn('nextPage: not initialized');
       return false;
     }
     if (this.currentPage < this.totalPages - 1) {
-      // Transition from first page to normal layout if in auto mode
-      if (this.isFirstPage && this.config.columns === 'auto') {
+      // Detect if layout will change (first page mode transition)
+      const needsLayoutChange = this.isFirstPage && this.config.columns === 'auto';
+
+      if (needsLayoutChange) {
+        log('Transitioning from first page mode');
         this.isFirstPage = false;
-        // Notify renderer to update CSS column styles
         this.onStyleUpdate?.();
-        // Recalculate dimensions for dual column layout
         this.calculateDimensions();
       }
+
       this.currentPage++;
-      this.scrollToCurrentPage();
+      log(`nextPage: going to page ${this.currentPage}`);
+      // Use instant scroll for layout changes to avoid drift during animation
+      this.scrollToCurrentPage(!needsLayoutChange);
       return true;
     }
+    log('nextPage: already at last page');
     return false;
   }
 
@@ -226,39 +432,73 @@ export class Paginator {
    * @returns true if there was a previous page, false if at start
    */
   prevPage(): boolean {
+    log('prevPage() called', {
+      currentPage: this.currentPage,
+      totalPages: this.totalPages,
+      isScrolling: this.isScrolling,
+      gestureActive: this.gestureActive,
+    });
+
     if (this.currentPage > 0) {
       this.currentPage--;
-      // Restore first page mode when going back to page 0 in auto mode
-      if (this.currentPage === 0 && this.config.columns === 'auto' && !this.isFirstPage) {
+
+      // Detect if layout will change (first page mode transition)
+      const needsLayoutChange = this.currentPage === 0 && this.config.columns === 'auto' && !this.isFirstPage;
+
+      if (needsLayoutChange) {
+        log('Restoring first page mode');
         this.isFirstPage = true;
-        // Notify renderer to update CSS column styles
         this.onStyleUpdate?.();
         this.calculateDimensions();
       }
-      this.scrollToCurrentPage();
+
+      log(`prevPage: going to page ${this.currentPage}`);
+      // Use instant scroll for layout changes to avoid drift during animation
+      this.scrollToCurrentPage(!needsLayoutChange);
       return true;
     }
+    log('prevPage: already at first page');
     return false;
   }
 
   /**
    * Go to a specific page
+   * @param pageNumber - Target page number
+   * @param instant - If true, skip animation (used for highlight navigation)
    */
-  goToPage(pageNumber: number): void {
+  goToPage(pageNumber: number, instant = false): void {
     const page = Math.max(0, Math.min(pageNumber, this.totalPages - 1));
-    if (page !== this.currentPage) {
+
+    log('goToPage() called', {
+      requestedPage: pageNumber,
+      clampedPage: page,
+      currentPage: this.currentPage,
+      totalPages: this.totalPages,
+      instant,
+      isScrolling: this.isScrolling,
+      gestureActive: this.gestureActive,
+    });
+
+    if (page !== this.currentPage || instant) {
       // Handle first page mode transitions in auto mode
+      let needsLayoutChange = false;
       if (this.config.columns === 'auto') {
         const wasFirstPage = this.isFirstPage;
         this.isFirstPage = (page === 0);
-        if (wasFirstPage !== this.isFirstPage) {
-          // Notify renderer to update CSS column styles
+        needsLayoutChange = wasFirstPage !== this.isFirstPage;
+        if (needsLayoutChange) {
+          log('First page mode changed in goToPage', { wasFirstPage, isFirstPage: this.isFirstPage });
           this.onStyleUpdate?.();
           this.calculateDimensions();
         }
       }
       this.currentPage = page;
-      this.scrollToCurrentPage();
+      // Force instant scroll if layout changed or caller requested instant
+      const shouldAnimate = !instant && !needsLayoutChange;
+      log(`goToPage: navigating to page ${page}, animate=${shouldAnimate}`);
+      this.scrollToCurrentPage(shouldAnimate);
+    } else {
+      log('goToPage: already on requested page');
     }
   }
 
@@ -301,6 +541,14 @@ export class Paginator {
   }
 
   /**
+   * Get the effective page width (exact viewport width + gap)
+   * This is the distance between pages, aligned to column boundaries
+   */
+  getPageWidth(): number {
+    return this.exactViewportWidth + this.config.columnGap;
+  }
+
+  /**
    * Get page progress (0-1)
    */
   getProgress(): number {
@@ -321,19 +569,22 @@ export class Paginator {
    */
   scrollToElement(elementId: string): boolean {
     const doc = this.iframe.contentDocument;
-    if (!doc) return false;
+    if (!doc || !this.scrollContainer) return false;
 
     const element = doc.getElementById(elementId);
     if (!element) return false;
 
-    // Calculate which page the element is on
+    // Get element position relative to content
     const rect = element.getBoundingClientRect();
-    const containerRect = doc.getElementById('content-container')?.getBoundingClientRect();
-    if (!containerRect) return false;
+    const scrollLeft = this.scrollContainer.scrollLeft;
+    const containerRect = this.scrollContainer.getBoundingClientRect();
 
-    const offsetX = rect.left - containerRect.left;
-    const pageWidth = this.containerWidth + this.config.columnGap;
-    const page = Math.floor(offsetX / pageWidth);
+    // Calculate the absolute position of the element
+    const elementLeft = scrollLeft + rect.left - containerRect.left;
+
+    // Calculate which page the element is on
+    const pageWidth = this.getPageWidth();
+    const page = Math.floor(elementLeft / pageWidth);
 
     this.goToPage(page);
     return true;
@@ -345,45 +596,27 @@ export class Paginator {
   handleResize(): void {
     if (!this.initialized) return;
 
-    // Cancel any active gesture or momentum animation before resize
-    // This prevents stale animation frames from running with outdated values
-    if (this.momentumAnimationId) {
-      cancelAnimationFrame(this.momentumAnimationId);
-      this.momentumAnimationId = null;
-    }
-    if (this.rafId) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = null;
+    // Cancel any pending operations
+    if (this.scrollDebounceTimer) {
+      clearTimeout(this.scrollDebounceTimer);
+      this.scrollDebounceTimer = null;
     }
     if (this.gestureEndTimeout) {
       clearTimeout(this.gestureEndTimeout);
       this.gestureEndTimeout = null;
     }
-    this.gestureActive = false;
-    this.gestureOffset = 0;
-    this.velocityHistory = [];
 
-    // Save absolute position before recalculating
-    // We want to preserve the ACTUAL position, not percentage
-    // because percentage changes when chapters load
+    // Save current page
     const previousPage = this.currentPage;
-    const previousTransform = this.currentTransform;
 
     // Recalculate dimensions
     this.calculateDimensions();
 
-    // Preserve absolute page position (clamped to new bounds)
-    // Don't use percentage - that causes jumps when chapters load
+    // Preserve page position (clamped to new bounds)
     this.currentPage = Math.min(previousPage, this.totalPages - 1);
 
-    // Restore transform if it was set (during momentum/gesture)
-    if (previousTransform > 0) {
-      const pageWidth = this.containerWidth + this.config.columnGap;
-      const maxOffset = Math.max(0, this.cachedScrollWidth - this.containerWidth);
-      this.currentTransform = Math.min(previousTransform, maxOffset);
-    }
-
-    this.scrollToCurrentPage(false); // No animation on resize
+    // Scroll to current page without animation
+    this.scrollToCurrentPage(false);
   }
 
   /**
@@ -397,27 +630,24 @@ export class Paginator {
   }
 
   // ============================================================================
-  // Gesture Handling - Live drag for smooth page turns with momentum
+  // Gesture Handling - For manual trackpad/touch page turning
   // ============================================================================
 
   /**
    * Handle gesture input (trackpad/touch drag)
-   * This provides live visual feedback as the user drags
+   * Uses programmatic scrolling since CSS Scroll Snap doesn't work with CSS columns.
+   *
    * @param deltaX - The change in X position (positive = drag right, negative = drag left)
    */
   handleGestureInput(deltaX: number): void {
-    if (!this.initialized) return;
-
-    const doc = this.iframe.contentDocument;
-    if (!doc) return;
-
-    const container = doc.getElementById('content-container');
-    if (!container) return;
-
-    // Cancel any ongoing momentum animation
-    if (this.momentumAnimationId) {
-      cancelAnimationFrame(this.momentumAnimationId);
-      this.momentumAnimationId = null;
+    if (!this.initialized || !this.scrollContainer) {
+      // Log more visibly when events are dropped due to not being ready
+      warn('handleGestureInput: DROPPED - paginator not ready', {
+        initialized: this.initialized,
+        hasScrollContainer: !!this.scrollContainer,
+        deltaX: Math.round(deltaX),
+      });
+      return;
     }
 
     const now = performance.now();
@@ -425,88 +655,84 @@ export class Paginator {
     // Start gesture if not already active
     if (!this.gestureActive) {
       this.gestureActive = true;
-      // Calculate the base transform from current page
-      const pageWidth = this.containerWidth + this.config.columnGap;
-      this.baseTransform = this.currentPage * pageWidth;
-      this.gestureOffset = 0;
+      this.gestureStartScrollLeft = this.scrollContainer.scrollLeft;
       this.velocityHistory = [];
-      // Cache scrollWidth to avoid reflow on every frame - this is critical for performance!
-      this.cachedScrollWidth = container.scrollWidth;
-      this.cachedMaxOffset = Math.max(0, this.cachedScrollWidth - this.containerWidth);
-      // Reset perf tracking
-      this.lastFrameTime = now;
-      this.frameCount = 0;
-      this.frameTimes = [];
-      this.lastDomUpdate = now;
-      console.log(`[Paginator:Perf] Gesture started, scrollWidth=${this.cachedScrollWidth}, maxOffset=${this.cachedMaxOffset}`);
-    }
+      this.gestureLogCount = 0;
 
-    // Track velocity - store recent deltas with timestamps
-    this.velocityHistory.push({ delta: deltaX, time: now });
-    // Keep only last 100ms of history for velocity calculation
-    this.velocityHistory = this.velocityHistory.filter(v => now - v.time < 100);
+      // Cancel any pending scroll animation
+      this.isScrolling = false;
 
-    // Accumulate the drag offset
-    this.gestureOffset += deltaX;
+      // Temporarily disable smooth scrolling for responsive drag
+      this.scrollContainer.style.scrollBehavior = 'auto';
 
-    // Calculate the live transform
-    let liveTransform = this.baseTransform - this.gestureOffset;
-
-    // Clamp to content bounds with rubber-band effect at edges
-    // Use cached maxOffset to avoid reflow!
-    if (liveTransform < 0) {
-      // Rubber-band at start - reduce the overshoot
-      liveTransform = liveTransform * 0.3;
-    } else if (liveTransform > this.cachedMaxOffset) {
-      // Rubber-band at end - reduce the overshoot
-      const overshoot = liveTransform - this.cachedMaxOffset;
-      liveTransform = this.cachedMaxOffset + overshoot * 0.3;
-    }
-
-    this.currentTransform = liveTransform;
-    this.pendingTransform = liveTransform;
-
-    // Batch DOM updates using requestAnimationFrame
-    // This prevents multiple DOM updates per frame when wheel events come faster than 60fps
-    if (!this.rafId) {
-      this.rafId = requestAnimationFrame(() => {
-        this.rafId = null;
-        const frameStart = performance.now();
-
-        // Track frame timing
-        if (this.lastDomUpdate > 0) {
-          const frameDelta = frameStart - this.lastDomUpdate;
-          this.frameTimes.push(frameDelta);
-          if (frameDelta > 20) {
-            console.warn(`[Paginator:Perf] Slow frame: ${frameDelta.toFixed(1)}ms (${(1000/frameDelta).toFixed(0)}fps)`);
-          }
-        }
-        this.lastDomUpdate = frameStart;
-        this.frameCount++;
-
-        // Apply the pending transform
-        container.style.transition = 'none';
-        container.style.transform = `translate3d(-${this.pendingTransform}px, 0, 0)`;
+      log('=== GESTURE START ===', {
+        startScrollLeft: Math.round(this.gestureStartScrollLeft),
+        currentPage: this.currentPage,
+        pageWidth: this.getPageWidth(),
+        isScrolling: this.isScrolling,
       });
     }
 
-    // Reset the gesture end timer
+    // Log every 5th gesture input to avoid spam
+    this.gestureLogCount++;
+    if (this.gestureLogCount % 5 === 1) {
+      log('Gesture input', {
+        deltaX: Math.round(deltaX * 100) / 100,
+        scrollLeft: Math.round(this.scrollContainer.scrollLeft),
+        gestureCount: this.gestureLogCount,
+      });
+    }
+
+    // Track velocity for momentum
+    this.velocityHistory.push({ delta: deltaX, time: now });
+    this.velocityHistory = this.velocityHistory.filter(v => now - v.time < 100);
+
+    // Apply scroll directly for live feedback
+    const prevScrollLeft = this.scrollContainer.scrollLeft;
+    const newScrollLeft = this.scrollContainer.scrollLeft - deltaX;
+    const maxScroll = this.scrollContainer.scrollWidth - this.scrollContainer.clientWidth;
+
+    // Clamp with rubber-band effect at edges
+    let appliedScrollLeft: number;
+    let rubberBand = '';
+    if (newScrollLeft < 0) {
+      appliedScrollLeft = newScrollLeft * 0.3;
+      rubberBand = 'left';
+    } else if (newScrollLeft > maxScroll) {
+      const overshoot = newScrollLeft - maxScroll;
+      appliedScrollLeft = maxScroll + overshoot * 0.3;
+      rubberBand = 'right';
+    } else {
+      appliedScrollLeft = newScrollLeft;
+    }
+
+    this.scrollContainer.scrollLeft = appliedScrollLeft;
+
+    // Log rubber-band effect
+    if (rubberBand && this.gestureLogCount % 5 === 1) {
+      log(`Rubber-band effect (${rubberBand})`, {
+        requestedScroll: Math.round(newScrollLeft),
+        appliedScroll: Math.round(appliedScrollLeft),
+        maxScroll: Math.round(maxScroll),
+      });
+    }
+
+    // Reset gesture end timer
     if (this.gestureEndTimeout) {
       clearTimeout(this.gestureEndTimeout);
     }
     this.gestureEndTimeout = window.setTimeout(() => {
       this.handleGestureEnd();
-    }, 100); // End gesture if no input for 100ms
+    }, 100);
   }
 
   /**
    * Calculate velocity from recent gesture history
-   * @returns velocity in pixels per millisecond
    */
   private calculateVelocity(): number {
     if (this.velocityHistory.length < 2) return 0;
 
-    const recent = this.velocityHistory.slice(-5); // Use last 5 samples
+    const recent = this.velocityHistory.slice(-5);
     if (recent.length < 2) return 0;
 
     const first = recent[0];
@@ -515,151 +741,126 @@ export class Paginator {
 
     if (timeDelta === 0) return 0;
 
-    // Sum all deltas
     const totalDelta = recent.reduce((sum, v) => sum + v.delta, 0);
-
-    // Return velocity in pixels per ms
     return totalDelta / timeDelta;
   }
 
   /**
-   * Explicitly end the gesture and apply momentum if needed
+   * Explicitly end the gesture and snap to nearest page
    */
   handleGestureEnd(): void {
-    if (!this.gestureActive) return;
-
-    // Cancel any pending RAF
-    if (this.rafId) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = null;
+    if (!this.gestureActive || !this.scrollContainer) {
+      log('handleGestureEnd: no active gesture or no container');
+      return;
     }
 
-    // Log performance summary
-    if (this.frameTimes.length > 0) {
-      const avgFrame = this.frameTimes.reduce((a, b) => a + b, 0) / this.frameTimes.length;
-      const maxFrame = Math.max(...this.frameTimes);
-      const minFrame = Math.min(...this.frameTimes);
-      const avgFps = 1000 / avgFrame;
-      console.log(`[Paginator:Perf] Gesture ended - ${this.frameCount} frames, avg: ${avgFrame.toFixed(1)}ms (${avgFps.toFixed(0)}fps), min: ${minFrame.toFixed(1)}ms, max: ${maxFrame.toFixed(1)}ms`);
-    }
+    // Re-enable smooth scrolling
+    this.scrollContainer.style.scrollBehavior = 'smooth';
+
+    // Calculate velocity for determining page direction
+    const velocity = this.calculateVelocity();
+    const pageWidth = this.getPageWidth();
+    const rawScrollLeft = this.scrollContainer.scrollLeft;
+    // Clamp negative scroll positions (from rubber-band effect) to 0
+    const currentScroll = Math.max(0, rawScrollLeft);
+
+    log('=== GESTURE END ===', {
+      rawScrollLeft: Math.round(rawScrollLeft),
+      currentScroll: Math.round(currentScroll),
+      pageWidth: Math.round(pageWidth),
+      velocity: Math.round(velocity * 1000) / 1000,
+      currentPage: this.currentPage,
+      gestureInputCount: this.gestureLogCount,
+      totalDrag: Math.round(currentScroll - this.gestureStartScrollLeft),
+    });
+
+    // Reset gesture state
+    this.gestureActive = false;
+    this.velocityHistory = [];
 
     if (this.gestureEndTimeout) {
       clearTimeout(this.gestureEndTimeout);
       this.gestureEndTimeout = null;
     }
 
-    const doc = this.iframe.contentDocument;
-    if (!doc) return;
+    // Snap to correct page based on position, drag distance, and velocity
+    let targetPage: number;
+    let snapReason: string;
 
-    const container = doc.getElementById('content-container');
-    if (!container) return;
+    // Calculate how far we've dragged from the starting position
+    const dragDistance = currentScroll - this.gestureStartScrollLeft;
+    const dragProgress = dragDistance / pageWidth; // How many pages we've dragged
 
-    // Calculate velocity for momentum
-    const velocity = this.calculateVelocity();
-    const pageWidth = this.containerWidth + this.config.columnGap;
-    console.log(`[Paginator:Perf] Velocity: ${velocity.toFixed(2)}px/ms, will ${Math.abs(velocity) > 0.5 ? 'apply momentum' : 'snap to page'}`);
+    // Lower velocity threshold for more responsive backwards scrolling
+    const velocityThreshold = 0.15;
+    // Drag threshold: if user dragged more than 20% of a page, respect intent
+    const dragThreshold = 0.20;
 
-    // Reset gesture state
-    this.gestureActive = false;
-    this.gestureOffset = 0;
-    this.baseTransform = 0;
-    this.velocityHistory = [];
-
-    // Check if we have significant velocity for momentum scrolling
-    const velocityThreshold = 0.5; // pixels per ms
     if (Math.abs(velocity) > velocityThreshold) {
-      // Apply momentum animation
-      this.applyMomentum(velocity, container);
-    } else {
-      // No significant velocity - snap to nearest page based on current position
-      this.snapToNearestPage(container);
-    }
-  }
-
-  /**
-   * Apply momentum animation with deceleration
-   */
-  private applyMomentum(initialVelocity: number, container: HTMLElement): void {
-    const friction = 0.95; // Deceleration factor (lower = more friction)
-    const minVelocity = 0.1; // Stop when velocity is below this
-    // Use cached maxOffset to avoid reflow during animation!
-    const maxOffset = this.cachedMaxOffset;
-
-    let velocity = initialVelocity;
-    let transform = this.currentTransform;
-    let momentumFrameCount = 0;
-    let lastMomentumFrame = performance.now();
-    const momentumFrameTimes: number[] = [];
-
-    const animate = () => {
-      const frameStart = performance.now();
-      const frameDelta = frameStart - lastMomentumFrame;
-      momentumFrameTimes.push(frameDelta);
-      lastMomentumFrame = frameStart;
-      momentumFrameCount++;
-
-      // Apply velocity to transform (velocity is in gesture direction, so subtract)
-      transform -= velocity;
-
-      // Apply friction
-      velocity *= friction;
-
-      // Bounce at edges
-      if (transform < 0) {
-        transform = 0;
-        velocity = -velocity * 0.3; // Bounce back with reduced energy
-      } else if (transform > maxOffset) {
-        transform = maxOffset;
-        velocity = -velocity * 0.3;
-      }
-
-      // Update transform
-      container.style.transition = 'none';
-      container.style.transform = `translate3d(-${transform}px, 0, 0)`;
-      this.currentTransform = transform;
-
-      // Continue animation if velocity is still significant
-      if (Math.abs(velocity) > minVelocity) {
-        this.momentumAnimationId = requestAnimationFrame(animate);
+      // Velocity-based direction (most responsive)
+      if (velocity < 0) {
+        // Swiping left (content moves right) = next page
+        targetPage = Math.ceil(currentScroll / pageWidth);
+        snapReason = `velocity (${velocity.toFixed(3)}) → next page (ceil)`;
       } else {
-        // Log momentum performance
-        if (momentumFrameTimes.length > 1) {
-          const avgFrame = momentumFrameTimes.slice(1).reduce((a, b) => a + b, 0) / (momentumFrameTimes.length - 1);
-          console.log(`[Paginator:Perf] Momentum ended - ${momentumFrameCount} frames, avg: ${avgFrame.toFixed(1)}ms (${(1000/avgFrame).toFixed(0)}fps)`);
-        }
-        // Momentum exhausted - snap to nearest page
-        this.momentumAnimationId = null;
-        this.snapToNearestPage(container);
+        // Swiping right (content moves left) = previous page
+        targetPage = Math.floor(currentScroll / pageWidth);
+        snapReason = `velocity (${velocity.toFixed(3)}) → prev page (floor)`;
       }
-    };
+    } else if (Math.abs(dragProgress) > dragThreshold) {
+      // Drag distance-based direction (respects user intent even with slow release)
+      if (dragProgress > 0) {
+        // Dragged right (towards higher pages)
+        targetPage = Math.ceil(currentScroll / pageWidth);
+        snapReason = `drag (${(dragProgress * 100).toFixed(0)}%) → next page (ceil)`;
+      } else {
+        // Dragged left (towards lower pages)
+        targetPage = Math.floor(currentScroll / pageWidth);
+        snapReason = `drag (${(dragProgress * 100).toFixed(0)}%) → prev page (floor)`;
+      }
+    } else {
+      // Very small drag and velocity - snap to nearest page
+      targetPage = Math.round(currentScroll / pageWidth);
+      snapReason = `minimal gesture (v=${velocity.toFixed(3)}, d=${(dragProgress * 100).toFixed(0)}%) → nearest (round)`;
+    }
 
-    this.momentumAnimationId = requestAnimationFrame(animate);
-  }
+    const unclampedTarget = targetPage;
+    // Clamp and navigate
+    targetPage = Math.max(0, Math.min(targetPage, this.totalPages - 1));
 
-  /**
-   * Snap to the nearest page based on current transform position
-   */
-  private snapToNearestPage(container: HTMLElement): void {
-    const pageWidth = this.containerWidth + this.config.columnGap;
-    // Use cached maxOffset - it's still valid from gesture start
-    const maxOffset = this.cachedMaxOffset;
+    log('Gesture snap decision', {
+      snapReason,
+      unclampedTarget,
+      clampedTarget: targetPage,
+      previousPage: this.currentPage,
+      pageChanged: targetPage !== this.currentPage,
+    });
 
-    // Calculate nearest page from current transform
-    let nearestPage = Math.round(this.currentTransform / pageWidth);
-    nearestPage = Math.max(0, Math.min(nearestPage, this.totalPages - 1));
+    // Determine if there's a first-page mode transition
+    let needsLayoutChange = false;
+    if (targetPage !== this.currentPage && this.config.columns === 'auto') {
+      const wasFirstPage = this.isFirstPage;
+      this.isFirstPage = (targetPage === 0);
+      needsLayoutChange = wasFirstPage !== this.isFirstPage;
+      if (needsLayoutChange) {
+        log('First page mode transition in gesture end (deferred)', { wasFirstPage, isFirstPage: this.isFirstPage });
+      }
+    }
 
-    // Update current page and animate to it
-    this.currentPage = nearestPage;
+    this.currentPage = targetPage;
 
-    // Calculate target transform
-    let targetTransform = nearestPage * pageWidth;
-    targetTransform = Math.min(targetTransform, maxOffset);
-
-    // Animate to target with GPU-accelerated transform
-    container.style.transition = 'transform 0.3s ease-out';
-    container.style.transform = `translate3d(-${targetTransform}px, 0, 0)`;
-
-    this.notifyPageChange();
+    if (needsLayoutChange) {
+      // For layout changes (single↔dual column), skip animation
+      // Apply style change immediately, recalculate, then scroll instantly
+      log('Applying deferred layout change - instant scroll to avoid drift');
+      this.onStyleUpdate?.();
+      this.calculateDimensions();
+      this.scrollToCurrentPage(false); // No animation
+    } else {
+      // Normal page change - smooth animation
+      log(`Snapping to page ${this.currentPage} with animation`);
+      this.scrollToCurrentPage(true);
+    }
   }
 
   /**
@@ -670,26 +871,18 @@ export class Paginator {
   }
 
   /**
-   * Cancel any active gesture or momentum without changing page
+   * Cancel any active gesture without changing page
    */
   cancelGesture(): void {
     if (this.gestureEndTimeout) {
       clearTimeout(this.gestureEndTimeout);
       this.gestureEndTimeout = null;
     }
-    if (this.momentumAnimationId) {
-      cancelAnimationFrame(this.momentumAnimationId);
-      this.momentumAnimationId = null;
-    }
-    if (this.rafId) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = null;
-    }
-    if (this.gestureActive) {
+
+    if (this.gestureActive && this.scrollContainer) {
       this.gestureActive = false;
-      this.gestureOffset = 0;
-      this.baseTransform = 0;
       this.velocityHistory = [];
+      this.scrollContainer.style.scrollBehavior = 'smooth';
       this.scrollToCurrentPage(true);
     }
   }
@@ -706,31 +899,86 @@ export class Paginator {
    */
   destroy(): void {
     this.cancelGesture();
+    if (this.scrollDebounceTimer) {
+      clearTimeout(this.scrollDebounceTimer);
+    }
     this.initialized = false;
   }
 
   /**
-   * Scroll container to current page
+   * Scroll to current page using native scroll
    */
   private scrollToCurrentPage(animate = true): void {
-    const doc = this.iframe.contentDocument;
-    if (!doc) return;
+    if (!this.scrollContainer) {
+      warn('scrollToCurrentPage: no scrollContainer');
+      return;
+    }
 
-    const container = doc.getElementById('content-container');
-    if (!container) return;
+    const pageWidth = this.getPageWidth();
+    const targetScrollLeft = this.currentPage * pageWidth;
+    const currentScrollLeft = this.scrollContainer.scrollLeft;
 
-    // Use viewport width (containerWidth) + gap for page translation
-    const pageWidth = this.containerWidth + this.config.columnGap;
-    let scrollLeft = this.currentPage * pageWidth;
+    // Clamp to valid scroll range
+    const maxScroll = this.scrollContainer.scrollWidth - this.scrollContainer.clientWidth;
+    const clampedScrollLeft = Math.max(0, Math.min(targetScrollLeft, maxScroll));
 
-    // SAFETY: Clamp transform to content bounds to prevent content from disappearing
-    // This guards against state desync where currentPage * pageWidth exceeds actual content
-    const maxOffset = Math.max(0, container.scrollWidth - this.containerWidth);
-    scrollLeft = Math.min(scrollLeft, maxOffset);
+    const scrollDistance = Math.abs(clampedScrollLeft - currentScrollLeft);
 
-    // Use transform for smoother page turns
-    container.style.transition = animate ? 'transform 0.3s ease-out' : 'none';
-    container.style.transform = `translate3d(-${scrollLeft}px, 0, 0)`;
+    log('=== SCROLL TO PAGE ===', {
+      currentPage: this.currentPage,
+      pageWidth: Math.round(pageWidth),
+      targetScrollLeft: Math.round(targetScrollLeft),
+      clampedScrollLeft: Math.round(clampedScrollLeft),
+      currentScrollLeft: Math.round(currentScrollLeft),
+      scrollDistance: Math.round(scrollDistance),
+      maxScroll: Math.round(maxScroll),
+      animate,
+      wasScrolling: this.isScrolling,
+    });
+
+    // Mark that we're doing programmatic scroll
+    this.isScrolling = true;
+
+    if (animate) {
+      // Use smooth scrolling (CSS scroll-behavior handles animation)
+      this.scrollContainer.style.scrollBehavior = 'smooth';
+      this.scrollContainer.scrollTo({ left: clampedScrollLeft, behavior: 'smooth' });
+
+      log('Started smooth scroll animation, will reset isScrolling in 350ms');
+
+      // Reset flag after animation completes (300ms typical duration)
+      setTimeout(() => {
+        this.isScrolling = false;
+        if (this.scrollContainer) {
+          this.scrollContainer.style.scrollBehavior = 'smooth';
+          log('Smooth scroll complete', {
+            finalScrollLeft: Math.round(this.scrollContainer.scrollLeft),
+            expectedScrollLeft: Math.round(clampedScrollLeft),
+            drift: Math.round(Math.abs(this.scrollContainer.scrollLeft - clampedScrollLeft)),
+          });
+        }
+      }, 350);
+    } else {
+      // Instant scroll without animation
+      this.scrollContainer.style.scrollBehavior = 'auto';
+      this.scrollContainer.scrollLeft = clampedScrollLeft;
+
+      log('Instant scroll applied', {
+        appliedScrollLeft: Math.round(this.scrollContainer.scrollLeft),
+      });
+
+      // Reset after next frame
+      // NOTE: Use setTimeout instead of RAF - RAF may not fire in iframes
+      setTimeout(() => {
+        this.isScrolling = false;
+        if (this.scrollContainer) {
+          this.scrollContainer.style.scrollBehavior = 'smooth';
+          log('Instant scroll frame complete', {
+            finalScrollLeft: Math.round(this.scrollContainer.scrollLeft),
+          });
+        }
+      }, 16);
+    }
 
     this.notifyPageChange();
   }
@@ -746,11 +994,18 @@ export class Paginator {
   }
 
   /**
-   * Get the content container element (for transform sync)
+   * Get the content container element
    */
   getContentContainer(): HTMLElement | null {
     const doc = this.iframe.contentDocument;
     if (!doc) return null;
     return doc.getElementById('content-container');
+  }
+
+  /**
+   * Get the scroll container element (viewport-wrapper)
+   */
+  getScrollContainer(): HTMLElement | null {
+    return this.scrollContainer;
   }
 }

@@ -6,7 +6,7 @@
  */
 import { writable, derived, get } from 'svelte/store';
 
-export type SidebarTab = 'highlights' | 'bookmarks' | 'notes' | 'images';
+export type SidebarTab = 'highlights' | 'bookmarks' | 'notes' | 'images' | 'toc' | 'search';
 
 interface SidebarState {
   activeTab: SidebarTab;

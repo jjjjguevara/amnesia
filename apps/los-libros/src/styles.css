@@ -10,7 +10,7 @@
   /* Reader Chrome */
   --los-libros-toolbar-bg: var(--background-primary);
   --los-libros-toolbar-border: var(--background-modifier-border);
-  --los-libros-sidebar-bg: var(--background-secondary);
+  --los-libros-sidebar-bg: transparent;
   --los-libros-sidebar-width: 300px;
 
   /* Progress Bar */
@@ -69,6 +69,11 @@
   --los-libros-popup-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
   --los-libros-palette-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
   --los-libros-card-hover-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* Override default view-content padding for sidebar */
+.view-content.los-libros-book-sidebar {
+  padding: 8px 0 0 !important;
 }
 
 /* @settings
@@ -564,6 +569,24 @@ settings:
   50% { opacity: 0.5; }
 }
 
+/* Link target blinking animation - highlights navigation targets */
+@keyframes los-libros-target-blink {
+  0%, 100% {
+    background-color: transparent;
+  }
+  50% {
+    background-color: var(--interactive-accent);
+    opacity: 0.4;
+  }
+}
+
+.epub-link-target {
+  animation: los-libros-target-blink 0.5s ease-in-out 3;
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
 /* =========================================================================
    Calibre Sync Progress UI (Settings Tab)
    ========================================================================= */
@@ -772,4 +795,33 @@ body.los-libros-fullscreen-mode .workspace-leaf-content {
 /* Quick color palette in fullscreen */
 .los-libros-reader.fullscreen .los-libros-quick-palette {
   z-index: 10002;
+}
+
+/* ============================================
+   SIDEBAR BOOK TITLE SLIDE-OUT
+   ============================================ */
+
+/* Book title container - fills remaining space */
+.book-sidebar .book-title-inline {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  transition: flex 150ms ease-out, opacity 150ms ease-out, max-width 150ms ease-out;
+  max-width: 100%;
+}
+
+.book-sidebar .book-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* When ViewModeSwitcher is hovered/expanded, slide book title out of view */
+.book-sidebar .sidebar-header:has(.view-mode-switcher:hover) .book-title-inline,
+.book-sidebar .sidebar-header:has(.view-mode-switcher:focus-within) .book-title-inline {
+  flex: 0 0 0;
+  max-width: 0;
+  opacity: 0;
 }

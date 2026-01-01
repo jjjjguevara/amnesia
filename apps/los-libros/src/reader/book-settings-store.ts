@@ -12,6 +12,7 @@ import { DEFAULT_READER_SETTINGS } from './reader-settings';
  * Subset of reader settings that are stored per-book
  */
 export interface PerBookSettings {
+  // EPUB settings
   fontSize: number;
   fontFamily: string;
   lineHeight: number;
@@ -23,6 +24,12 @@ export interface PerBookSettings {
   margins: number; // Simplified - UI uses single margin value
   brightness: number;
   pageAnimation?: 'none' | 'slide' | 'curl';
+
+  // PDF-specific settings
+  pdfScale?: number; // Zoom level (1.0 = 100%)
+  pdfRotation?: 0 | 90 | 180 | 270;
+  pdfPageLayout?: 'single' | 'dual' | 'book-spread';
+  pdfRegionSelectionEnabled?: boolean; // For scanned PDFs
 }
 
 /**
@@ -51,9 +58,10 @@ export function extractPerBookSettings(settings: ReaderSettings): PerBookSetting
   // Handle margins - could be object or number depending on how settings were set
   const marginsValue = typeof settings.margins === 'number'
     ? settings.margins
-    : (settings.margins as any)?.top ?? 20;
+    : (settings.margins as any)?.top ?? 40;
 
   return {
+    // EPUB settings
     fontSize: settings.fontSize,
     fontFamily: settings.fontFamily,
     lineHeight: settings.lineHeight,
@@ -65,6 +73,11 @@ export function extractPerBookSettings(settings: ReaderSettings): PerBookSetting
     margins: marginsValue,
     brightness: settings.brightness,
     pageAnimation: settings.pageAnimation,
+    // PDF settings (with defaults)
+    pdfScale: (settings as any).pdfScale ?? 1.5,
+    pdfRotation: (settings as any).pdfRotation ?? 0,
+    pdfPageLayout: (settings as any).pdfPageLayout ?? 'single',
+    pdfRegionSelectionEnabled: (settings as any).pdfRegionSelectionEnabled ?? false,
   };
 }
 

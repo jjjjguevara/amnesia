@@ -32,8 +32,8 @@ export class ReaderView extends ItemView {
     }
     if (this.bookPath && typeof this.bookPath === 'string') {
       const filename = this.bookPath.split('/').pop() ?? 'Reader';
-      // Remove .epub extension
-      return filename.replace(/\.epub$/i, '');
+      // Remove .epub or .pdf extension
+      return filename.replace(/\.(epub|pdf)$/i, '');
     }
     return 'Reader';
   }
@@ -46,7 +46,7 @@ export class ReaderView extends ItemView {
    * Check if this view can handle the given file extension
    */
   canAcceptExtension(extension: string): boolean {
-    return extension === 'epub';
+    return extension === 'epub' || extension === 'pdf';
   }
 
   /**
@@ -218,6 +218,36 @@ export class ReaderView extends ItemView {
   navigateToHighlight(cfi: string, text: string): void {
     if (this.component) {
       (this.component as any).navigateToHighlight(cfi, text);
+    }
+  }
+
+  /**
+   * Navigate to an href (internal link or ToC entry)
+   * Called by the sidebar for ToC navigation
+   */
+  navigateToHref(href: string): void {
+    if (this.component) {
+      (this.component as any).navigateToHref(href);
+    }
+  }
+
+  /**
+   * Navigate to a specific chapter by spine index
+   * Called by the sidebar for image navigation
+   */
+  navigateToChapter(spineIndex: number): void {
+    if (this.component) {
+      (this.component as any).navigateToChapter(spineIndex);
+    }
+  }
+
+  /**
+   * Navigate to a chapter and then find specific text
+   * Called by the sidebar for search result navigation
+   */
+  navigateToChapterAndText(spineIndex: number, text: string): void {
+    if (this.component) {
+      (this.component as any).navigateToChapterAndText(spineIndex, text);
     }
   }
 
