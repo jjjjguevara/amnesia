@@ -118,6 +118,17 @@ los-libros/
 - **Liquid Templates** — Customizable note generation
 - **Doc Doctor Integration** — Shared highlights system
 
+### Paginated EPUB Rendering
+
+The plugin uses a sophisticated multi-column CSS layout system for paginated reading:
+
+- **Shadow DOM Isolation** — Each book renders in an isolated Shadow DOM to prevent CSS conflicts
+- **Per-Chapter Columns** — Each chapter is a CSS multi-column container, enabling virtualization
+- **Content-Based Measurement** — Column counts are determined by actual content positions, not container width
+- **Chapter Windowing** — Only 5-7 chapters loaded at a time (±2-3 from current position)
+- **Transform-Based Navigation** — Horizontal scrolling via CSS `translate3d` for 60fps animations
+- **Accurate Column Calculation** — Uses `N * columnWidth + (N-1) * gap` formula for precise alignment
+
 ## Public API
 
 Los Libros exposes a fully-typed public API for external plugins, Templater scripts, and automation workflows.

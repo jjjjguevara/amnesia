@@ -693,44 +693,45 @@ export class ShadowDOMRenderer {
   }
 
   private async reanchorHighlights(): Promise<void> {
-    // TEMPORARILY DISABLED: Debugging freeze issue
-    // TODO: Re-enable after fixing the root cause
-    console.log('[reanchorHighlights] DISABLED - skipping highlight reanchoring');
-    return;
-
-    /* DISABLED FOR DEBUGGING
     if (!this.view || !this.cssHighlights || this.storedHighlights.length === 0) {
       return;
     }
 
     const container = this.view.getContentContainer();
-    const CHUNK_SIZE = 5; // Process 5 highlights at a time to avoid blocking UI
+    const TIMEOUT_MS = 50; // Max 50ms per highlight to prevent freeze
+    let anchored = 0;
+    let skipped = 0;
 
-    for (let i = 0; i < this.storedHighlights.length; i += CHUNK_SIZE) {
-      const chunk = this.storedHighlights.slice(i, i + CHUNK_SIZE);
+    // Process highlights one at a time with timeout protection
+    for (let i = 0; i < this.storedHighlights.length; i++) {
+      const highlight = this.storedHighlights[i];
+      if (!highlight.cfi) {
+        skipped++;
+        continue;
+      }
 
-      for (const highlight of chunk) {
-        if (!highlight.cfi) continue;
+      // Get the href from the spine index
+      const spineItem = this.book?.spine[highlight.spineIndex];
+      const href = spineItem?.href || '';
 
-        // Get the href from the spine index
-        const spineItem = this.book?.spine[highlight.spineIndex];
-        const href = spineItem?.href || '';
+      // Create locator from highlight - NO text matching to avoid fuzzy search
+      const locator: Locator = {
+        href,
+        locations: {
+          progression: 0,
+          cfi: highlight.cfi,
+          position: highlight.spineIndex,
+        },
+        // IMPORTANT: Don't include text - this triggers expensive fuzzy matching
+        // text: highlight.text ? { highlight: highlight.text } : undefined,
+      };
 
-        // Create locator from highlight
-        const locator: Locator = {
-          href,
-          locations: {
-            progression: 0,
-            cfi: highlight.cfi,
-            position: highlight.spineIndex,
-          },
-          text: highlight.text
-            ? { highlight: highlight.text }
-            : undefined,
-        };
-
-        // Anchor to DOM
-        const result = await anchorToDOM(locator, container);
+      try {
+        // Anchor with timeout protection
+        const result = await Promise.race([
+          anchorToDOM(locator, container),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), TIMEOUT_MS))
+        ]);
 
         if (result) {
           this.cssHighlights.add(
@@ -738,15 +739,21 @@ export class ShadowDOMRenderer {
             result.range,
             highlight.color as HighlightColor
           );
+          anchored++;
+        } else {
+          skipped++;
         }
+      } catch {
+        skipped++;
       }
 
-      // Yield to main thread between chunks to prevent UI freeze
-      if (i + CHUNK_SIZE < this.storedHighlights.length) {
+      // Yield to main thread every 3 highlights
+      if (i > 0 && i % 3 === 0) {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
-    */
+
+    console.log(`[reanchorHighlights] Done: ${anchored} anchored, ${skipped} skipped`);
   }
 
   addHighlight(id: string, range: Range, color: HighlightColor): void {
