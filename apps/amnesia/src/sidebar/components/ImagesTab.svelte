@@ -707,14 +707,17 @@
   /* Cards Grid - Bases style */
   .images-cards-grid {
     display: grid;
+    /* Cards have minimum size but grow to fill row (like Bases) */
     grid-template-columns: repeat(auto-fill, minmax(var(--card-size), 1fr));
     gap: 8px;
     align-content: start;
   }
 
   .images-card {
-    display: flex;
-    flex-direction: column;
+    position: relative;
+    display: block; /* Block for proper aspect-ratio support */
+    width: 100%; /* Fill grid cell */
+    height: auto; /* Let aspect-ratio control height */
     padding: 0;
     border: none;
     border-radius: 6px;
@@ -722,6 +725,8 @@
     cursor: pointer;
     background: var(--background-secondary);
     transition: transform 0.15s ease, box-shadow 0.15s ease;
+    /* Apply aspect-ratio to the entire card for proper height control */
+    aspect-ratio: var(--aspect-ratio);
   }
 
   .images-card:hover {
@@ -735,11 +740,10 @@
   }
 
   .images-card-cover {
-    width: 100%;
-    aspect-ratio: var(--aspect-ratio);
+    position: absolute;
+    inset: 0;
     overflow: hidden;
     background: var(--background-modifier-border);
-    flex-shrink: 0; /* Prevent cover from shrinking in flex container */
   }
 
   .images-card-cover img {
@@ -750,18 +754,23 @@
   }
 
   .images-card-label {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
     padding: 6px 8px;
-    background: var(--background-primary);
-    border-top: 1px solid var(--background-modifier-border);
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+    /* Ensure text is readable over any image */
   }
 
   .images-card-title {
     font-size: var(--font-ui-smaller);
-    color: var(--text-normal);
+    color: white;
     display: block;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
   }
 
   /* List Layout */

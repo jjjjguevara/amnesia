@@ -1096,7 +1096,7 @@
 
       // Get WASM path for offline mode (in Obsidian plugin folder)
       const pluginDir = (plugin.manifest as any).dir || '.obsidian/plugins/amnesia';
-      const wasmPath = `${pluginDir}/wasm/epub_processor_bg.wasm`;
+      const wasmPath = `${pluginDir}/epub_processor_bg.wasm`;
 
       // Load WASM file from vault
       let wasmSource: ArrayBuffer | undefined;
