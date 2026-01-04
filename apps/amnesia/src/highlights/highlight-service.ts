@@ -361,4 +361,397 @@ export class HighlightService {
   setNoteGenerator(noteGenerator: NoteGenerator): void {
     this.noteGenerator = noteGenerator;
   }
+
+  // ==========================================================================
+  // Advanced Query API
+  // ==========================================================================
+
+  /**
+   * Query options for filtering and sorting highlights
+   */
+  queryHighlights(options: HighlightQueryOptions): Highlight[] {
+    let results: Highlight[] = [];
+
+    // Get source highlights
+    if (options.bookId) {
+      results = [...(this.store.getValue().highlights[options.bookId] || [])];
+    } else {
+      // All books
+      for (const highlights of Object.values(this.store.getValue().highlights)) {
+        results.push(...highlights);
+      }
+    }
+
+    // Filter by color
+    if (options.color) {
+      const colors = Array.isArray(options.color) ? options.color : [options.color];
+      results = results.filter(h => colors.includes(h.color));
+    }
+
+    // Filter by has annotation
+    if (options.hasAnnotation !== undefined) {
+      results = results.filter(h =>
+        options.hasAnnotation ? !!h.annotation : !h.annotation
+      );
+    }
+
+    // Filter by chapter
+    if (options.chapter) {
+      results = results.filter(h =>
+        h.chapter?.toLowerCase().includes(options.chapter!.toLowerCase())
+      );
+    }
+
+    // Filter by date range
+    if (options.dateRange) {
+      const { start, end } = options.dateRange;
+      results = results.filter(h => {
+        const created = new Date(h.createdAt);
+        return (!start || created >= start) && (!end || created <= end);
+      });
+    }
+
+    // Filter by text search
+    if (options.textSearch) {
+      const q = options.textSearch.toLowerCase();
+      results = results.filter(h =>
+        h.text.toLowerCase().includes(q) ||
+        h.annotation?.toLowerCase().includes(q)
+      );
+    }
+
+    // Sort
+    if (options.sortBy) {
+      const order = options.sortOrder === 'desc' ? -1 : 1;
+
+      results.sort((a, b) => {
+        switch (options.sortBy) {
+          case 'date':
+            return order * (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+          case 'position':
+            return order * ((a.pagePercent || 0) - (b.pagePercent || 0));
+          case 'color':
+            return order * a.color.localeCompare(b.color);
+          case 'chapter':
+            return order * (a.chapter || '').localeCompare(b.chapter || '');
+          default:
+            return 0;
+        }
+      });
+    }
+
+    // Pagination
+    if (options.offset !== undefined || options.limit !== undefined) {
+      const offset = options.offset || 0;
+      const limit = options.limit || results.length;
+      results = results.slice(offset, offset + limit);
+    }
+
+    return results;
+  }
+
+  /**
+   * Get highlights by color
+   */
+  getHighlightsByColor(bookId: string, color: HighlightColor): Highlight[] {
+    return this.queryHighlights({ bookId, color });
+  }
+
+  /**
+   * Get highlights by chapter
+   */
+  getHighlightsByChapter(bookId: string, chapter: string): Highlight[] {
+    return this.queryHighlights({ bookId, chapter });
+  }
+
+  /**
+   * Get highlights by date range
+   */
+  getHighlightsByDateRange(
+    start: Date,
+    end: Date,
+    bookId?: string
+  ): Highlight[] {
+    return this.queryHighlights({ bookId, dateRange: { start, end } });
+  }
+
+  /**
+   * Get recent highlights (sorted by creation date, descending)
+   */
+  getRecentHighlights(limit: number, bookId?: string): Highlight[] {
+    return this.queryHighlights({
+      bookId,
+      sortBy: 'date',
+      sortOrder: 'desc',
+      limit,
+    });
+  }
+
+  /**
+   * Get highlights with annotations
+   */
+  getAnnotatedHighlights(bookId?: string): Highlight[] {
+    return this.queryHighlights({ bookId, hasAnnotation: true });
+  }
+
+  /**
+   * Get highlight statistics
+   */
+  getHighlightStats(bookId?: string): HighlightStats {
+    const highlights = bookId
+      ? this.getHighlights(bookId)
+      : Object.values(this.store.getValue().highlights).flat();
+
+    const countByColor: Record<HighlightColor, number> = {
+      yellow: 0,
+      green: 0,
+      blue: 0,
+      pink: 0,
+      purple: 0,
+      orange: 0,
+    };
+
+    const countByChapter: Record<string, number> = {};
+    const countByBook: Record<string, number> = {};
+    let annotatedCount = 0;
+
+    for (const h of highlights) {
+      // Count by color
+      countByColor[h.color] = (countByColor[h.color] || 0) + 1;
+
+      // Count by chapter
+      const chapter = h.chapter || 'Unknown';
+      countByChapter[chapter] = (countByChapter[chapter] || 0) + 1;
+
+      // Count by book
+      countByBook[h.bookId] = (countByBook[h.bookId] || 0) + 1;
+
+      // Count annotated
+      if (h.annotation) {
+        annotatedCount++;
+      }
+    }
+
+    // Recent activity (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const recentActivity: Array<{ date: string; count: number }> = [];
+    const activityMap = new Map<string, number>();
+
+    for (const h of highlights) {
+      const created = new Date(h.createdAt);
+      if (created >= thirtyDaysAgo) {
+        const dateStr = created.toISOString().split('T')[0];
+        activityMap.set(dateStr, (activityMap.get(dateStr) || 0) + 1);
+      }
+    }
+
+    for (const [date, count] of activityMap) {
+      recentActivity.push({ date, count });
+    }
+    recentActivity.sort((a, b) => a.date.localeCompare(b.date));
+
+    return {
+      totalCount: highlights.length,
+      annotatedCount,
+      countByColor,
+      countByChapter,
+      countByBook,
+      recentActivity,
+    };
+  }
+
+  /**
+   * Export highlights to various formats
+   */
+  exportHighlights(
+    bookId: string,
+    format: 'markdown' | 'json' | 'csv',
+    options?: { includeAnnotations?: boolean; groupByChapter?: boolean }
+  ): string {
+    const highlights = this.getHighlights(bookId);
+    const includeAnnotations = options?.includeAnnotations ?? true;
+    const groupByChapter = options?.groupByChapter ?? false;
+
+    switch (format) {
+      case 'json':
+        return JSON.stringify(highlights, null, 2);
+
+      case 'csv': {
+        const headers = ['Text', 'Color', 'Chapter', 'Created', 'Annotation'];
+        const rows = highlights.map(h => [
+          `"${h.text.replace(/"/g, '""')}"`,
+          h.color,
+          h.chapter || '',
+          new Date(h.createdAt).toISOString(),
+          includeAnnotations ? `"${(h.annotation || '').replace(/"/g, '""')}"` : '',
+        ]);
+        return [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+      }
+
+      case 'markdown':
+      default: {
+        if (groupByChapter) {
+          const byChapter = new Map<string, Highlight[]>();
+          for (const h of highlights) {
+            const chapter = h.chapter || 'Unknown Chapter';
+            if (!byChapter.has(chapter)) {
+              byChapter.set(chapter, []);
+            }
+            byChapter.get(chapter)!.push(h);
+          }
+
+          let md = '';
+          for (const [chapter, chapterHighlights] of byChapter) {
+            md += `## ${chapter}\n\n`;
+            for (const h of chapterHighlights) {
+              md += `> ${h.text}\n`;
+              if (includeAnnotations && h.annotation) {
+                md += `\n**Note:** ${h.annotation}\n`;
+              }
+              md += `\n*— ${h.color} highlight*\n\n`;
+            }
+          }
+          return md;
+        } else {
+          let md = '';
+          for (const h of highlights) {
+            md += `> ${h.text}\n`;
+            if (includeAnnotations && h.annotation) {
+              md += `\n**Note:** ${h.annotation}\n`;
+            }
+            md += `\n*— ${h.chapter || 'Unknown'} | ${h.color}*\n\n---\n\n`;
+          }
+          return md;
+        }
+      }
+    }
+  }
+
+  /**
+   * Export all highlights
+   */
+  exportAllHighlights(format: 'markdown' | 'json' | 'csv'): string {
+    const allHighlights = Object.values(this.store.getValue().highlights).flat();
+
+    switch (format) {
+      case 'json':
+        return JSON.stringify(allHighlights, null, 2);
+
+      case 'csv': {
+        const headers = ['BookId', 'Text', 'Color', 'Chapter', 'Created', 'Annotation'];
+        const rows = allHighlights.map(h => [
+          h.bookId,
+          `"${h.text.replace(/"/g, '""')}"`,
+          h.color,
+          h.chapter || '',
+          new Date(h.createdAt).toISOString(),
+          `"${(h.annotation || '').replace(/"/g, '""')}"`,
+        ]);
+        return [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+      }
+
+      case 'markdown':
+      default: {
+        let md = '# All Highlights\n\n';
+        for (const h of allHighlights) {
+          md += `> ${h.text}\n`;
+          if (h.annotation) {
+            md += `\n**Note:** ${h.annotation}\n`;
+          }
+          md += `\n*— ${h.chapter || 'Unknown'} | ${h.color} | Book: ${h.bookId}*\n\n---\n\n`;
+        }
+        return md;
+      }
+    }
+  }
+
+  /**
+   * Batch update multiple highlights
+   */
+  async batchUpdateHighlights(
+    updates: Array<{ bookId: string; highlightId: string; changes: Partial<Highlight> }>
+  ): Promise<Highlight[]> {
+    const results: Highlight[] = [];
+
+    for (const update of updates) {
+      const highlight = await this.updateHighlight(
+        update.bookId,
+        update.highlightId,
+        update.changes as Highlight
+      );
+      if (highlight) {
+        results.push(highlight);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Batch delete multiple highlights
+   */
+  async batchDeleteHighlights(
+    items: Array<{ bookId: string; highlightId: string }>
+  ): Promise<number> {
+    let deleted = 0;
+
+    for (const item of items) {
+      const success = await this.deleteHighlight(item.bookId, item.highlightId);
+      if (success) {
+        deleted++;
+      }
+    }
+
+    return deleted;
+  }
+}
+
+// ==========================================================================
+// Types
+// ==========================================================================
+
+/**
+ * Options for querying highlights
+ */
+export interface HighlightQueryOptions {
+  /** Filter by book ID */
+  bookId?: string;
+  /** Filter by color (single or multiple) */
+  color?: HighlightColor | HighlightColor[];
+  /** Filter by whether highlight has an annotation */
+  hasAnnotation?: boolean;
+  /** Filter by chapter (partial match) */
+  chapter?: string;
+  /** Filter by creation date range */
+  dateRange?: { start?: Date; end?: Date };
+  /** Text search in highlight text and annotations */
+  textSearch?: string;
+  /** Sort by field */
+  sortBy?: 'date' | 'position' | 'color' | 'chapter';
+  /** Sort order */
+  sortOrder?: 'asc' | 'desc';
+  /** Pagination: number of items to skip */
+  offset?: number;
+  /** Pagination: maximum number of items to return */
+  limit?: number;
+}
+
+/**
+ * Highlight statistics
+ */
+export interface HighlightStats {
+  /** Total number of highlights */
+  totalCount: number;
+  /** Number of highlights with annotations */
+  annotatedCount: number;
+  /** Count by color */
+  countByColor: Record<HighlightColor, number>;
+  /** Count by chapter */
+  countByChapter: Record<string, number>;
+  /** Count by book */
+  countByBook: Record<string, number>;
+  /** Recent activity (last 30 days) */
+  recentActivity: Array<{ date: string; count: number }>;
 }

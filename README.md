@@ -1,6 +1,6 @@
 # Amnesia
 
-> **Version 0.2.0**
+> **Version 0.3.0**
 
 **Amnesia** is a self-hosted ebook reader ecosystem for Obsidian, consisting of a Rust-based server and an Obsidian plugin. Part of the **DD** (Doc Doctor) + **LL** (Amnesia) suite.
 
@@ -8,13 +8,13 @@
 
 - **EPUB & PDF support** — Full rendering for both formats with text selection
 - **File-first architecture** — S3-compatible storage (MinIO, Cloudflare R2) as source of truth
-- **Calibre-compatible** — Uses Calibre's folder structure, no migration needed
+- **Calibre bidirectional sync** — Full metadata sync with Calibre Content Server (read/write)
 - **Local-first with optional sync** — Works 100% offline
 - **Shared highlights system** — Integration with Doc Doctor
-- **BookFusion-style templates** — Liquid templating for customization
+- **Liquid/Nunjucks templates** — Advanced templating for note generation
 - **iPad optimized** — Performance-tuned for Obsidian mobile
 - **OCR for scanned PDFs** — Tesseract and Ollama vision model support
-- **Public API** — Fully typed API for plugin interoperability and automation
+- **Public API** — Fully typed API with advanced query and aggregation methods
 
 ## Project Structure
 
@@ -152,9 +152,10 @@ const api = window.Amnesia;
 | Domain | State Store | Commands |
 |--------|-------------|----------|
 | **Reader** | Location, pagination, config | `goTo()`, `next()`, `prev()`, `updateConfig()` |
-| **Library** | Books, loading state | `getBook()`, `search()`, `filterByStatus()`, `updateProgress()` |
+| **Library** | Books, loading state | `getBook()`, `search()`, `queryBooks()`, `getLibraryStats()` |
 | **Highlights** | Highlights by book | `create()`, `update()`, `delete()`, `getHighlights()` |
 | **Bookmarks** | Bookmarks by book | `create()`, `update()`, `delete()`, `getBookmarks()` |
+| **Calibre** | Connection state | `connect()`, `setFields()`, `syncLibrary()`, `syncActiveNote()` |
 
 ### Example Usage
 
@@ -416,10 +417,12 @@ Configure in Obsidian Settings → Amnesia:
 - [x] **Phase 4:** OCR integration (Tesseract, Ollama)
 - [x] **Phase 5:** PDF.js offline fallback
 - [x] **Phase 6:** Public API v1.0 (events, hooks, UI extensions, security)
+- [x] **Phase 7:** Calibre bidirectional sync (metadata read/write, conflict detection)
+- [x] **Phase 8:** Advanced query API (filtering, aggregation, statistics)
 
 ### In Progress
 
-- [ ] **Phase 7:** Intelligence layer (Smart Connections, LLM)
+- [ ] **Phase 9:** Intelligence layer (Smart Connections, LLM)
 
 ### Planned API Expansions
 
@@ -433,7 +436,6 @@ The following integrations are designed but not yet implemented. See [`expansion
 | QuickAdd Macros | Medium | Capture macros for highlights and notes |
 | Reading Statistics | Medium | Analytics, streaks, and reading goals |
 | Collections & Tags | Medium | Organize books into collections |
-| Calibre Sync | Low | Full metadata synchronization |
 | OPDS Browser | Low | Browse and download from OPDS catalogs |
 | PDF Annotations | Low | Import/export PDF native annotations |
 

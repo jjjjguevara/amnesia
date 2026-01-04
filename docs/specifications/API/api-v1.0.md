@@ -1,8 +1,8 @@
-# Los Libros Public API v1.0 Specification
+# Amnesia Public API v1.0 Specification
 
 ## 1. Overview & Philosophy
 
-Los Libros exposes a comprehensive public API following the **Headless Engine Paradigm**:
+Amnesia exposes a comprehensive public API following the **Headless Engine Paradigm**:
 
 - **Core Engine**: Singleton services (LibraryService, HighlightService) with zero DOM dependency
 - **Reactive State**: All state exposed as Svelte `readable()` stores for framework-agnostic reactivity
@@ -24,7 +24,7 @@ Los Libros exposes a comprehensive public API following the **Headless Engine Pa
 ┌─────────────────────────────────────────────────────────────────┐
 │                      External Plugins                            │
 ├─────────────────────────────────────────────────────────────────┤
-│                    Los Libros Public API                         │
+│                      Amnesia Public API                          │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
 │  │  State   │  │ Commands │  │  Events  │  │    UI    │         │
 │  │ (Svelte) │  │  (Async) │  │ (Typed)  │  │(Registry)│         │
@@ -48,13 +48,13 @@ Los Libros exposes a comprehensive public API following the **Headless Engine Pa
 
 ```typescript
 // In your plugin's onload()
-const losLibrosPlugin = this.app.plugins.plugins['los-libros'];
-if (!losLibrosPlugin) {
-  console.error('Los Libros not installed');
+const amnesiaPlugin = this.app.plugins.plugins['amnesia'];
+if (!amnesiaPlugin) {
+  console.error('Amnesia not installed');
   return;
 }
 
-const api = losLibrosPlugin.api as LosLibrosAPI;
+const api = amnesiaPlugin.api as AmnesiaAPI;
 console.log('API version:', api.version);
 ```
 
@@ -62,7 +62,7 @@ console.log('API version:', api.version);
 
 ```typescript
 // Direct global access
-const api = window.LosLibros;
+const api = window.Amnesia;
 
 // Get current book
 import { get } from 'svelte/store';
@@ -77,7 +77,7 @@ return currentBook?.title || 'No active book';
 
 ```typescript
 // Request specific capabilities
-const api = await window.LosLibros.connect('my-plugin-id', [
+const api = await window.Amnesia.connect('my-plugin-id', [
   'read-state',
   'write-annotations'
 ]);
@@ -98,7 +98,7 @@ try {
 Following the ExcalidrawAutomate pattern, always reset before scripts:
 
 ```typescript
-const api = window.LosLibros;
+const api = window.Amnesia;
 api.reset(); // Reset to defaults
 
 // Now run your automation
@@ -327,6 +327,126 @@ Scan a vault folder for EPUB/PDF files.
 
 **Returns**: `Promise<ScanResult>` with `books` and `errors`
 
+#### Advanced Query Methods (v0.3.0+)
+
+##### `queryBooks(options): Book[]`
+
+Query books with flexible filtering, sorting, and pagination.
+
+**Parameters**:
+- `options: BookQueryOptions` - Query configuration:
+  - `author?: string` - Filter by author (partial match, case-insensitive)
+  - `tag?: string` - Filter by tag (exact match)
+  - `tags?: string[]` - Filter by multiple tags (all must match)
+  - `series?: string` - Filter by series name
+  - `status?: ReadingStatus | ReadingStatus[]` - Filter by reading status
+  - `language?: string` - Filter by language
+  - `publisher?: string` - Filter by publisher
+  - `addedAfter?: Date | string` - Filter by date added
+  - `addedBefore?: Date | string` - Filter by date added
+  - `readAfter?: Date | string` - Filter by last read date
+  - `readBefore?: Date | string` - Filter by last read date
+  - `minProgress?: number` - Minimum progress (0-100)
+  - `maxProgress?: number` - Maximum progress (0-100)
+  - `textSearch?: string` - Text search in title/author/description
+  - `sortBy?: 'title' | 'author' | 'dateAdded' | 'lastRead' | 'progress' | 'series'`
+  - `sortOrder?: 'asc' | 'desc'`
+  - `offset?: number` - Pagination offset
+  - `limit?: number` - Pagination limit
+
+**Examples**:
+
+```typescript
+// Get unfinished books by a specific author
+const books = api.commands.library.queryBooks({
+  author: 'Brandon Sanderson',
+  status: 'reading',
+  sortBy: 'progress',
+  sortOrder: 'desc'
+});
+
+// Find books read in the last 30 days
+const recentlyRead = api.commands.library.queryBooks({
+  readAfter: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+  sortBy: 'lastRead',
+  sortOrder: 'desc'
+});
+
+// Paginated search with text filter
+const searchResults = api.commands.library.queryBooks({
+  textSearch: 'fantasy',
+  limit: 20,
+  offset: 0
+});
+```
+
+##### `getBooksByAuthor(author): Book[]`
+
+Get books by a specific author (partial match).
+
+##### `getBooksWithTag(tag): Book[]`
+
+Get books with a specific tag.
+
+##### `getBooksInSeries(series): Book[]`
+
+Get all books in a series, sorted by series index.
+
+##### `getBooksByLanguage(language): Book[]`
+
+Get books by language code.
+
+##### `getBooksModifiedSince(since): Book[]`
+
+Get books modified (read or added) since a date.
+
+#### Aggregation Methods (v0.3.0+)
+
+##### `getAuthors(): string[]`
+
+Get all unique authors in the library (sorted alphabetically).
+
+##### `getTags(): string[]`
+
+Get all unique tags in the library (sorted alphabetically).
+
+##### `getSeries(): Array<{ name: string; bookCount: number }>`
+
+Get all unique series with book counts.
+
+##### `getLanguages(): string[]`
+
+Get all unique languages in the library.
+
+##### `getLibraryStats(): LibraryStats`
+
+Get comprehensive library statistics.
+
+**Returns**:
+```typescript
+interface LibraryStats {
+  totalBooks: number;
+  byStatus: Record<ReadingStatus, number>;
+  byLanguage: Record<string, number>;
+  bySeries: Record<string, number>;
+  averageProgress: number;
+  recentlyAdded: number;   // Last 7 days
+  recentlyRead: number;    // Last 7 days
+  completedThisMonth: number;
+  uniqueAuthors: number;
+  uniqueTags: number;
+}
+```
+
+**Example**:
+
+```typescript
+const stats = api.commands.library.getLibraryStats();
+console.log(`Library: ${stats.totalBooks} books by ${stats.uniqueAuthors} authors`);
+console.log(`Currently reading: ${stats.byStatus.reading}`);
+console.log(`Average progress: ${Math.round(stats.averageProgress)}%`);
+```
+
 ---
 
 ### 3.3 Highlights API
@@ -418,21 +538,143 @@ Get highlight count for a book.
 
 ---
 
-## 4. Stub APIs (v1.0 Placeholders)
+## 4. Extended APIs
 
-These APIs have minimal interfaces in v1.0 and will be fully implemented in future versions.
+### 4.1 Calibre Content Server API (v0.3.0+)
 
-### 4.1 Calibre API (`api.calibre`)
+Full bidirectional sync with Calibre Content Server for metadata and reading progress.
+
+#### Connection
 
 ```typescript
-interface CalibreAPI {
-  scan(): Promise<void>;      // Scan Calibre library
-  sync(): Promise<void>;      // Sync reading progress
-  getBooks(): Book[];         // Get all Calibre books
+// Connect to Content Server (from plugin settings or manually)
+await api.calibre.connect('http://localhost:8080', 'MyLibrary');
+
+// Check connection status
+const isConnected = api.calibre.isConnected();
+```
+
+#### Read Operations
+
+##### `getBooks(): Promise<CalibreBook[]>`
+
+Get all books from Calibre library with metadata.
+
+##### `getBookMetadata(bookId: number): Promise<CalibreMetadata>`
+
+Get detailed metadata for a specific book.
+
+**Returns**:
+```typescript
+interface CalibreMetadata {
+  id: number;
+  title: string;
+  authors: string[];
+  rating: number;        // 0-10 scale
+  tags: string[];
+  series?: string;
+  series_index?: number;
+  pubdate?: string;
+  publisher?: string;
+  identifiers: Record<string, string>;
+  comments?: string;
+  languages: string[];
+  last_modified: string;
+  // ... and more
 }
 ```
 
-### 4.2 OPDS API (`api.opds`)
+##### `getBookCover(bookId: number): Promise<string>`
+
+Get book cover as base64 data URL.
+
+##### `searchBooks(query: string): Promise<CalibreBook[]>`
+
+Search books in Calibre library.
+
+#### Write Operations (requires `--enable-local-write` on server)
+
+##### `setFields(bookId, changes): Promise<SetFieldsResult>`
+
+Update metadata fields on a Calibre book.
+
+**Parameters**:
+- `bookId: number` - Calibre book ID
+- `changes: Record<string, unknown>` - Fields to update
+
+**Supported Fields**:
+- `rating: number` (0-10 scale, use `rating * 2` to convert from 5-star)
+- `tags: string[]`
+- `series: string`
+- `series_index: number`
+- `publisher: string`
+- `comments: string`
+- `#custom_column: value` (custom columns with `#` prefix)
+
+**Example**:
+
+```typescript
+// Update rating (convert 5-star to 10-point)
+await api.calibre.setFields(966, {
+  rating: 8,  // 4 stars * 2
+  tags: ['fantasy', 'epic', 'favorites']
+});
+
+// Update series information
+await api.calibre.setFields(123, {
+  series: 'The Stormlight Archive',
+  series_index: 1
+});
+```
+
+**Returns**:
+```typescript
+interface SetFieldsResult {
+  success: boolean;
+  error?: string;
+  updatedMetadata?: Record<string, unknown>;
+}
+```
+
+#### Sync Commands
+
+##### `syncLibrary(): Promise<SyncResult>`
+
+Full bidirectional sync between Obsidian notes and Calibre metadata.
+
+##### `syncActiveNote(): Promise<void>`
+
+Sync only the currently active note (faster for single-book updates).
+
+**Usage**: Command palette → "Calibre: Sync Active Note Only"
+
+#### Rating Conversion
+
+Calibre uses a 0-10 rating scale while Obsidian typically uses 1-5 stars:
+
+```typescript
+// Obsidian → Calibre
+const calibreRating = obsidianRating * 2;
+
+// Calibre → Obsidian
+const obsidianRating = Math.round(calibreRating / 2);
+```
+
+#### Server Setup
+
+```bash
+# Start Calibre Content Server with write access
+calibre-server --enable-local-write ~/Books
+
+# With verbose logging
+calibre-server --log /dev/stdout --access-log /dev/stdout --enable-local-write ~/Books
+```
+
+## 5. Stub APIs (v1.0 Placeholders)
+
+These APIs have minimal interfaces in v1.0 and will be fully implemented in future versions.
+
+### 5.1 OPDS API (`api.opds`)
 
 ```typescript
 interface OPDSAPI {
@@ -441,7 +683,7 @@ interface OPDSAPI {
 }
 ```
 
-### 4.3 Bookmarks API (`api.bookmarks`)
+### 5.2 Bookmarks API (`api.bookmarks`)
 
 ```typescript
 interface BookmarkAPI {
@@ -451,7 +693,7 @@ interface BookmarkAPI {
 }
 ```
 
-### 4.4 Navigation API (`api.navigation`)
+### 5.3 Navigation API (`api.navigation`)
 
 ```typescript
 interface NavigationAPI {
@@ -460,7 +702,7 @@ interface NavigationAPI {
 }
 ```
 
-### 4.5 Templates API (`api.templates`)
+### 5.4 Templates API (`api.templates`)
 
 ```typescript
 interface TemplateAPI {
@@ -471,11 +713,11 @@ interface TemplateAPI {
 
 ---
 
-## 5. State Management Patterns
+## 6. State Management Patterns
 
-### 5.1 Redux-to-Svelte Bridge
+### 6.1 Redux-to-Svelte Bridge
 
-Los Libros uses a custom bridge to expose Redux state as Svelte reactive stores.
+Amnesia uses a custom bridge to expose Redux state as Svelte reactive stores.
 
 **Internal Implementation**:
 
@@ -499,7 +741,7 @@ function createReactiveSelector<T>(
 }
 ```
 
-### 5.2 Command-Based Mutations
+### 6.2 Command-Based Mutations
 
 All state changes go through command methods that dispatch Redux actions:
 
@@ -533,13 +775,13 @@ class HighlightCommandsImpl {
 
 ---
 
-## 6. Examples
+## 7. Examples
 
 ### Example 1: Auto-Save Progress Script
 
 ```typescript
 // Templater script to save current position
-const api = window.LosLibros;
+const api = window.Amnesia;
 import { get } from 'svelte/store';
 
 const reader = get(api.state.reader);
@@ -568,7 +810,7 @@ return 'No active book';
 // Export all highlights to a Markdown file
 class HighlightExporter extends Plugin {
   async onload() {
-    const api = this.app.plugins.plugins['los-libros']?.api;
+    const api = this.app.plugins.plugins['amnesia']?.api;
     if (!api) return;
 
     this.addCommand({
@@ -608,7 +850,7 @@ class HighlightExporter extends Plugin {
 
 ```typescript
 // Track reading sessions with event listeners
-const api = window.LosLibros;
+const api = window.Amnesia;
 
 let sessionStart: Date | null = null;
 let pagesRead = 0;
@@ -646,7 +888,7 @@ this.register(() => disposable.dispose());
 
 ```typescript
 // Add AI summary button to reader toolbar
-const api = this.app.plugins.plugins['los-libros']?.api;
+const api = this.app.plugins.plugins['amnesia']?.api;
 
 const disposable = api.ui.toolbar.register({
   id: 'ai-summarize',
@@ -670,7 +912,27 @@ this.register(() => disposable.dispose());
 
 ---
 
-## 7. Version History
+## 8. Version History
+
+### v0.3.0 (January 2026)
+
+- **Calibre Content Server API**: Full bidirectional sync with read/write operations
+  - `setFields()` for updating Calibre metadata from Obsidian
+  - Single-note sync command for faster updates
+  - Rating conversion (5-star ↔ 10-point scale)
+- **Advanced Query API**: Flexible book filtering with `queryBooks()`
+  - Filter by author, tags, series, language, dates, progress
+  - Sorting and pagination support
+- **Aggregation Methods**: Library statistics and metadata aggregation
+  - `getAuthors()`, `getTags()`, `getSeries()`, `getLanguages()`
+  - `getLibraryStats()` for comprehensive statistics
+- **Conflict Detection**: Bidirectional sync with conflict resolution
+
+### v0.2.2 (January 2026)
+
+- Restructured settings UI with 5 tabs (Library, Reading, Sync, Notes, Advanced)
+- Liquid template integration for note generation
+- Metadata mapping settings
 
 ### v1.0.0 (Initial Release)
 
@@ -680,49 +942,51 @@ this.register(() => disposable.dispose());
 - Hook middleware with cancellation
 - Capability-based security
 - UI extension points (toolbar, sidebar, context menu)
-- Stub APIs: Calibre, OPDS, Bookmarks, Navigation, Templates
+- Stub APIs: OPDS, Bookmarks, Navigation, Templates
 
 ### Future Roadmap
 
 | Version | Features |
 |---------|----------|
-| v1.1.0 | Full Bookmarks API, Reading Notes |
-| v1.2.0 | Full Navigation API (TOC, search) |
-| v1.3.0 | Full Templates API |
-| v2.0.0 | Full Calibre API, OPDS API |
-| v2.1.0 | Dataview integration helpers |
-| v2.2.0 | Templater helper namespace |
+| v0.4.0 | Full Bookmarks API, Reading Notes |
+| v0.5.0 | Full Navigation API (TOC, search) |
+| v0.6.0 | Full Templates API |
+| v1.0.0 | Full OPDS API, stable release |
+| v1.1.0 | Dataview integration helpers |
+| v1.2.0 | Templater helper namespace |
 
 ---
 
-## 8. Type Reference
+## 9. Type Reference
 
 See the complete TypeScript definitions in:
-- [`types/LosLibrosAPI.d.ts`](./types/LosLibrosAPI.d.ts)
+- [`types/AmnesiaAPI.d.ts`](./types/AmnesiaAPI.d.ts)
 
 Import types in your plugin:
 
 ```typescript
 import type {
-  LosLibrosAPI,
+  AmnesiaAPI,
   Book,
   Highlight,
   Locator,
   ReaderState,
+  BookQueryOptions,
+  LibraryStats,
   Disposable
-} from 'los-libros/api';
+} from 'amnesia/api';
 ```
 
 ---
 
-## 9. Contributing
+## 10. Contributing
 
-The Los Libros API is open for contributions. See the main repository for:
+The Amnesia API is open for contributions. See the main repository for:
 - Issue tracking
 - Pull request guidelines
 - Development setup
 
 ---
 
-*Los Libros API Specification v1.0.0*
+*Amnesia API Specification v0.3.0*
 *Last updated: January 2026*

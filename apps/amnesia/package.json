@@ -1,6 +1,6 @@
 {
   "name": "amnesia",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Ebook reader for Obsidian with OPDS support and Doc Doctor integration",
   "main": "main.js",
   "scripts": {
@@ -27,6 +27,8 @@
     "fast-xml-parser": "^4.3.0",
     "liquidjs": "^10.10.0",
     "minisearch": "^7.2.0",
+    "nunjucks": "^3.2.4",
+    "p-queue": "^8.0.1",
     "pdfjs-dist": "^4.0.0",
     "sql.js": "^1.10.0",
     "uuid": "^9.0.0"
@@ -34,6 +36,7 @@
   "devDependencies": {
     "@tsconfig/svelte": "5.0.2",
     "@types/node": "16.11.6",
+    "@types/nunjucks": "^3.2.6",
     "@types/uuid": "^9.0.0",
     "builtin-modules": "3.3.0",
     "esbuild": "0.17.3",

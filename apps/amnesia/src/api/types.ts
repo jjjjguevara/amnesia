@@ -63,6 +63,62 @@ export interface BookMetadata {
   subjects?: string[];
   series?: string;
   seriesIndex?: number;
+  tags?: string[];
+}
+
+/**
+ * Query options for filtering books
+ */
+export interface BookQueryOptions {
+  /** Filter by author (partial match, case-insensitive) */
+  author?: string;
+  /** Filter by tag (exact match) */
+  tag?: string;
+  /** Filter by multiple tags (all must match) */
+  tags?: string[];
+  /** Filter by series name */
+  series?: string;
+  /** Filter by reading status */
+  status?: ReadingStatus | ReadingStatus[];
+  /** Filter by language */
+  language?: string;
+  /** Filter by publisher */
+  publisher?: string;
+  /** Filter by date added range */
+  addedAfter?: Date | string;
+  addedBefore?: Date | string;
+  /** Filter by last read range */
+  readAfter?: Date | string;
+  readBefore?: Date | string;
+  /** Filter by progress range */
+  minProgress?: number;
+  maxProgress?: number;
+  /** Text search in title/author/description */
+  textSearch?: string;
+  /** Sort field */
+  sortBy?: 'title' | 'author' | 'dateAdded' | 'lastRead' | 'progress' | 'series';
+  /** Sort order */
+  sortOrder?: 'asc' | 'desc';
+  /** Pagination offset */
+  offset?: number;
+  /** Pagination limit */
+  limit?: number;
+}
+
+/**
+ * Library statistics
+ */
+export interface LibraryStats {
+  totalBooks: number;
+  byStatus: Record<ReadingStatus, number>;
+  byLanguage: Record<string, number>;
+  bySeries: Record<string, number>;
+  averageProgress: number;
+  recentlyAdded: number; // Last 7 days
+  recentlyRead: number; // Last 7 days
+  completedThisMonth: number;
+  uniqueAuthors: number;
+  uniqueTags: number;
 }
 
 /**
@@ -438,6 +494,32 @@ export interface LibraryCommands {
   filterByStatus(status: ReadingStatus): Book[];
   updateProgress(bookId: string, progress: number, cfi?: string): Promise<void>;
   scan(folder?: string): Promise<ScanResult>;
+
+  // Advanced Query Methods
+  /** Query books with flexible filtering, sorting, and pagination */
+  queryBooks(options: BookQueryOptions): Book[];
+  /** Get books by a specific author (partial match) */
+  getBooksByAuthor(author: string): Book[];
+  /** Get books with a specific tag */
+  getBooksWithTag(tag: string): Book[];
+  /** Get books in a series */
+  getBooksInSeries(series: string): Book[];
+  /** Get books by language */
+  getBooksByLanguage(language: string): Book[];
+  /** Get books modified since a date */
+  getBooksModifiedSince(since: Date | string): Book[];
+
+  // Aggregation Methods
+  /** Get all unique authors in the library */
+  getAuthors(): string[];
+  /** Get all unique tags in the library */
+  getTags(): string[];
+  /** Get all unique series in the library */
+  getSeries(): Array<{ name: string; bookCount: number }>;
+  /** Get all unique languages in the library */
+  getLanguages(): string[];
+  /** Get library statistics */
+  getLibraryStats(): LibraryStats;
 }
 
 /**

@@ -396,5 +396,6 @@ mcp__obsidian-devtools__obsidian_capture_screenshot({ format: 'png' })
 
 | Version | Change |
 |---------|--------|
+| 0.3.0 (2026-01-04) | Calibre bidirectional sync (read/write API), advanced query API, library statistics, single-note sync command |
 | 0.2.2 (2026-01-03) | Restructured settings UI: 5 tabs (Library, Reading, Sync, Notes, Advanced), integrated Liquid templates for note generation, added metadata mapping settings |
 | 0.2.1 (2026-01-02) | Fixed column count over-estimation (4x → accurate), fixed vertical margins |

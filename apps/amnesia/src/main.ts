@@ -24,6 +24,7 @@ import { CalibreService } from './calibre/calibre-service';
 import { BookNoteGenerator, HighlightGenerator, IndexGenerator } from './generators';
 import { OPDSSyncService } from './opds/opds-sync';
 import { Migrator, BackupService, LinkUpdater } from './migration';
+import { RegenerateConfirmModal, addRegenerateModalStyles } from './modals/RegenerateConfirmModal';
 import { BookSettingsStore, createBookSettingsStore } from './reader/book-settings-store';
 
 // Public API
@@ -39,6 +40,15 @@ import { OPDSFeedClient, type OPDSClientConfig } from './api/opds-feed-client';
 
 // Unified Sync Architecture
 import { UnifiedSyncEngine, type SyncConfig, type SyncProgress as UnifiedSyncProgress } from './sync';
+import { CalibreBidirectionalSync, createCalibreBidirectionalSync } from './sync/metadata';
+
+// Reader ↔ Vault Sync
+import {
+	ReaderVaultSyncOrchestrator,
+	createReaderVaultSync,
+	type ReaderVaultSyncSettings,
+	DEFAULT_READER_VAULT_SYNC_SETTINGS,
+} from './sync/reader-vault-sync';
 
 export default class AmnesiaPlugin extends Plugin {
 	settings: LibrosSettings;
@@ -74,6 +84,13 @@ export default class AmnesiaPlugin extends Plugin {
 	// Unified Sync Architecture
 	syncEngine: UnifiedSyncEngine | null = null;
 	private syncEngineUnsubscribes: (() => void)[] = [];
+
+	// Calibre Bidirectional Metadata Sync
+	calibreMetadataSync: CalibreBidirectionalSync | null = null;
+
+	// Reader ↔ Vault Sync
+	readerVaultSync: ReaderVaultSyncOrchestrator | null = null;
+	private readerVaultSyncUnsubscribes: (() => void)[] = [];
 
 	// Public API
 	api: AmnesiaAPIImpl;
@@ -191,6 +208,15 @@ export default class AmnesiaPlugin extends Plugin {
 		this.calibreStoreUnsubscribe = this.calibreService.getStore().subscribe(() => {
 			this.updateStatusBar();
 		});
+
+		// Initialize Calibre Bidirectional Metadata Sync
+		this.calibreMetadataSync = createCalibreBidirectionalSync(
+			this.app,
+			this.calibreService,
+			undefined, // Use default schema mapping
+		);
+		// Set field aliases from settings
+		this.calibreMetadataSync.setFieldAliases(this.settings.fieldAliases);
 
 		// ==========================================================================
 		// Initialize File System Architecture Services
@@ -479,6 +505,122 @@ export default class AmnesiaPlugin extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'calibre-metadata-sync',
+			name: 'Calibre: Sync Metadata (Bidirectional)',
+			callback: async () => {
+				if (!this.settings.calibreEnabled) {
+					new Notice('Calibre integration is not enabled');
+					return;
+				}
+				if (!this.calibreMetadataSync) {
+					new Notice('Metadata sync is not initialized');
+					return;
+				}
+				new Notice('Starting metadata sync...');
+				try {
+					const result = await this.calibreMetadataSync.fullBidirectionalSync();
+					new Notice(
+						`Metadata sync complete: ${result.succeeded} succeeded, ${result.failed} failed, ${result.conflicts.manualRequired} conflicts`
+					);
+					if (result.conflicts.manualRequired > 0) {
+						console.log('[MetadataSync] Conflicts require manual resolution:', result.results.filter(r => r.conflicts.length > 0));
+					}
+				} catch (error) {
+					console.error('[MetadataSync] Error:', error);
+					new Notice(`Metadata sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+				}
+			}
+		});
+
+		// Sync only the active note
+		this.addCommand({
+			id: 'calibre-sync-active-note',
+			name: 'Calibre: Sync Active Note Only',
+			checkCallback: (checking: boolean) => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (!activeFile) return false;
+
+				// Check if file has calibreId in frontmatter
+				const cache = this.app.metadataCache.getFileCache(activeFile);
+				const calibreId = cache?.frontmatter?.calibreId || cache?.frontmatter?.calibre_id;
+				if (!calibreId) return false;
+
+				if (!checking) {
+					this.syncActiveNote(activeFile, calibreId);
+				}
+				return true;
+			}
+		});
+
+		this.addCommand({
+			id: 'calibre-test-write',
+			name: 'Calibre: Test Write API (Update Rating)',
+			callback: async () => {
+				if (!this.settings.calibreEnabled) {
+					new Notice('Calibre integration is not enabled');
+					return;
+				}
+
+				const contentServer = this.calibreService.getContentServer();
+				if (!contentServer) {
+					new Notice('Connect to Calibre Content Server first (not local database)');
+					return;
+				}
+
+				// Get first book from library
+				const books = this.calibreService.getStore().getValue().books;
+				if (books.length === 0) {
+					new Notice('No books in library. Run Calibre sync first.');
+					return;
+				}
+
+				const testBook = books[0];
+				const currentRating = testBook.rating || 0;
+				const newRating = currentRating >= 8 ? 2 : currentRating + 2;
+
+				new Notice(`Testing: Updating "${testBook.title}" rating from ${currentRating} to ${newRating}...`);
+				console.log(`[CalibreTest] Book: ${testBook.title} (ID: ${testBook.id})`);
+				console.log(`[CalibreTest] Current rating: ${currentRating}, New rating: ${newRating}`);
+
+				// Enable verbose logging
+				contentServer.setVerbose(true);
+
+				try {
+					const result = await contentServer.setRating(testBook.id, newRating / 2, 'stars');
+
+					if (result.success) {
+						new Notice(`✓ Rating updated to ${newRating}! Check Calibre and re-sync to verify.`);
+						console.log('[CalibreTest] SUCCESS - Rating updated in Calibre');
+					} else {
+						new Notice(`✗ Failed: ${result.error}`);
+						console.error('[CalibreTest] FAILED:', result.error);
+					}
+				} catch (error) {
+					new Notice(`✗ Error: ${error instanceof Error ? error.message : 'Unknown'}`);
+					console.error('[CalibreTest] ERROR:', error);
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'calibre-verbose-toggle',
+			name: 'Calibre: Toggle Verbose Logging',
+			callback: () => {
+				const contentServer = this.calibreService.getContentServer();
+				if (!contentServer) {
+					new Notice('Connect to Calibre Content Server first');
+					return;
+				}
+
+				// Toggle verbose mode (we'll need to track state)
+				const currentState = (contentServer as any).verbose || false;
+				contentServer.setVerbose(!currentState);
+				new Notice(`Calibre API verbose logging: ${!currentState ? 'ON' : 'OFF'}`);
+				console.log(`[CalibreAPI] Verbose logging ${!currentState ? 'enabled' : 'disabled'}`);
+			}
+		});
+
 		// Unified Sync commands
 		this.addCommand({
 			id: 'unified-sync-full',
@@ -558,6 +700,68 @@ export default class AmnesiaPlugin extends Plugin {
 				} else {
 					new Notice('No incomplete sync to resume');
 				}
+			}
+		});
+
+		// Reader ↔ Vault Sync commands
+		this.addCommand({
+			id: 'reader-vault-sync-book',
+			name: 'Reader ↔ Vault: Sync Current Book Highlights',
+			checkCallback: (checking: boolean) => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (!activeFile) return false;
+
+				const cache = this.app.metadataCache.getFileCache(activeFile);
+				const bookId = cache?.frontmatter?.bookId || cache?.frontmatter?.calibreId;
+
+				if (checking) return !!bookId;
+
+				if (bookId && this.readerVaultSync) {
+					this.readerVaultSync.syncBook(String(bookId)).then(result => {
+						if (result.success) {
+							new Notice(`Synced ${result.itemsProcessed} highlights`);
+						} else {
+							new Notice(`Sync failed: ${result.errors[0]?.message || 'Unknown error'}`);
+						}
+					});
+				}
+				return true;
+			}
+		});
+
+		this.addCommand({
+			id: 'reader-vault-sync-all',
+			name: 'Reader ↔ Vault: Sync All Highlights',
+			callback: async () => {
+				if (!this.readerVaultSync) {
+					new Notice('Reader ↔ Vault Sync is not initialized');
+					return;
+				}
+				new Notice('Starting full highlight sync...');
+				const result = await this.readerVaultSync.syncAll();
+				if (result.success) {
+					new Notice(`Synced ${result.itemsProcessed} highlights`);
+				} else {
+					new Notice(`Sync completed with ${result.errors.length} errors`);
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'reader-vault-sync-status',
+			name: 'Reader ↔ Vault: Show Sync Status',
+			callback: () => {
+				if (!this.readerVaultSync) {
+					new Notice('Reader ↔ Vault Sync is not initialized');
+					return;
+				}
+				const isSyncing = this.readerVaultSync.isSyncInProgress();
+				const settings = this.readerVaultSync.getSettings();
+				console.log('Reader ↔ Vault Sync Status:', {
+					isSyncing,
+					settings,
+				});
+				new Notice(isSyncing ? 'Sync in progress...' : `Sync idle (mode: ${settings.highlightSyncMode})`);
 			}
 		});
 
@@ -641,11 +845,36 @@ export default class AmnesiaPlugin extends Plugin {
 			}
 		});
 
+		// Command to regenerate book note from template
+		this.addCommand({
+			id: 'regenerate-book-note',
+			name: 'Regenerate current book note from template',
+			checkCallback: (checking: boolean) => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (!activeFile) return false;
+
+				// Check if it's a book note
+				const cache = this.app.metadataCache.getFileCache(activeFile);
+				const isBookNote = cache?.frontmatter?.type === 'book' &&
+					(cache?.frontmatter?.epubPath || cache?.frontmatter?.calibreId);
+
+				if (checking) return isBookNote;
+
+				if (isBookNote) {
+					this.regenerateBookNote(activeFile);
+				}
+				return true;
+			}
+		});
+
+		// Add modal styles
+		addRegenerateModalStyles(document);
+
 		// Add settings tab
 		this.addSettingTab(new AmnesiaSettingTab(this.app, this));
 
-		// Initialize services on layout ready
-		this.app.workspace.onLayoutReady(async () => {
+		// Initialize services on layout ready (or immediately if already ready)
+		const initializeServices = async () => {
 			// Configure library scanner with server settings if enabled
 			if (this.settings.serverEnabled && this.settings.serverUrl) {
 				const { getDeviceId } = await import('./reader/renderer');
@@ -673,7 +902,30 @@ export default class AmnesiaPlugin extends Plugin {
 			if (this.settings.unifiedSync.enabled) {
 				await this.initializeUnifiedSyncEngine();
 			}
-		});
+
+			// Initialize Reader ↔ Vault Sync (if enabled)
+			if (this.settings.readerVaultSync?.enabled) {
+				try {
+					console.log('[Amnesia] Initializing Reader ↔ Vault Sync...');
+					await this.initializeReaderVaultSync();
+					console.log('[Amnesia] Reader ↔ Vault Sync initialized successfully');
+				} catch (error) {
+					console.error('[Amnesia] Failed to initialize Reader ↔ Vault Sync:', error);
+				}
+			} else {
+				console.log('[Amnesia] Reader ↔ Vault Sync disabled in settings');
+			}
+		};
+
+		// Check if layout is already ready (e.g., during hot reload)
+		if (this.app.workspace.layoutReady) {
+			console.log('[Amnesia] Layout already ready, initializing services immediately');
+			// CRITICAL: Must await to ensure Reader ↔ Vault Sync initializes on hot reload
+			await initializeServices();
+		} else {
+			console.log('[Amnesia] Waiting for layout ready');
+			this.app.workspace.onLayoutReady(initializeServices);
+		}
 
 		console.log('Amnesia plugin loaded');
 	}
@@ -692,6 +944,19 @@ export default class AmnesiaPlugin extends Plugin {
 		if (this.syncEngine) {
 			this.syncEngine.destroy();
 			this.syncEngine = null;
+		}
+
+		// ==========================================================================
+		// Cleanup Reader ↔ Vault Sync
+		// ==========================================================================
+		for (const unsubscribe of this.readerVaultSyncUnsubscribes) {
+			unsubscribe();
+		}
+		this.readerVaultSyncUnsubscribes = [];
+
+		if (this.readerVaultSync) {
+			this.readerVaultSync.stop();
+			this.readerVaultSync = null;
 		}
 
 		// ==========================================================================
@@ -771,6 +1036,10 @@ export default class AmnesiaPlugin extends Plugin {
 		// Update unified note generator when templates change
 		if (this.unifiedNoteGenerator) {
 			this.unifiedNoteGenerator.setTemplates(this.settings.templates);
+		}
+		// Update field aliases for Calibre metadata sync
+		if (this.calibreMetadataSync) {
+			this.calibreMetadataSync.setFieldAliases(this.settings.fieldAliases);
 		}
 	}
 
@@ -1008,6 +1277,171 @@ export default class AmnesiaPlugin extends Plugin {
 	}
 
 	/**
+	 * Regenerate a book note from template
+	 */
+	async regenerateBookNote(noteFile: TFile): Promise<void> {
+		const { metadataCache } = this.app;
+
+		// Get frontmatter
+		const cache = metadataCache.getFileCache(noteFile);
+		const frontmatter = cache?.frontmatter;
+
+		if (!frontmatter) {
+			new Notice('No frontmatter found in book note');
+			return;
+		}
+
+		const bookTitle = frontmatter.title || noteFile.basename;
+
+		// Show confirmation modal
+		const modal = new RegenerateConfirmModal(this.app, bookTitle, noteFile.path);
+		const result = await modal.openAndWait();
+
+		if (!result.confirmed) {
+			return;
+		}
+
+		try {
+			// Find the book data and convert to UnifiedBook format
+			let calibreBook = null;
+			let vaultBook = null;
+
+			// Try to find in Calibre store by calibreId
+			if (frontmatter.calibreId) {
+				const calibreBooks = this.calibreService.getStore().getValue().books;
+				calibreBook = calibreBooks.find(b => b.id === frontmatter.calibreId);
+			}
+
+			// Try to find in library store by epubPath
+			if (frontmatter.epubPath) {
+				const vaultBooks = this.libraryStore.getValue().books;
+				vaultBook = vaultBooks.find(b => b.localPath === frontmatter.epubPath);
+			}
+
+			if (!calibreBook && !vaultBook) {
+				new Notice('Could not find book data for regeneration');
+				return;
+			}
+
+			// Convert to UnifiedBook format (required by generateBookNote)
+			const unifiedBook = this.convertToUnifiedBook(calibreBook, vaultBook);
+
+			if (result.preserveUserContent) {
+				// The unified note generator already handles persisted content via renderWithPersist
+				// It reads the existing file and preserves {% persist %} blocks
+				const genResult = await this.unifiedNoteGenerator.generateBookNote(unifiedBook, []);
+
+				if (genResult.success) {
+					new Notice(`Regenerated note for "${bookTitle}" with user content preserved`);
+				} else {
+					new Notice(`Failed to regenerate: ${genResult.error}`);
+				}
+			} else {
+				// Full regeneration - delete existing file first to prevent content preservation
+				await this.app.vault.delete(noteFile);
+				const genResult = await this.unifiedNoteGenerator.generateBookNote(unifiedBook, []);
+
+				if (genResult.success) {
+					new Notice(`Fully regenerated note for "${bookTitle}"`);
+				} else {
+					new Notice(`Failed to regenerate: ${genResult.error}`);
+				}
+			}
+		} catch (error) {
+			console.error('Failed to regenerate book note:', error);
+			new Notice(`Failed to regenerate note: ${error instanceof Error ? error.message : 'Unknown error'}`);
+		}
+	}
+
+	/**
+	 * Convert Calibre/Vault book to UnifiedBook format
+	 */
+	private convertToUnifiedBook(
+		calibreBook: any | null,
+		vaultBook: any | null
+	): import('./types/unified-book').UnifiedBook {
+		const book = calibreBook || vaultBook;
+		if (!book) {
+			throw new Error('No book data available');
+		}
+
+		// Build unified book structure
+		const authors = calibreBook?.authors?.map((a: any) => ({
+			name: typeof a === 'string' ? a : a.name,
+		})) || (vaultBook?.author ? [{ name: vaultBook.author }] : []);
+
+		const tags = calibreBook?.tags?.map((t: any) => typeof t === 'string' ? t : t.name) || [];
+
+		// Build sources array
+		const sources: import('./types/book-source').BookSource[] = [];
+		const now = new Date();
+
+		if (calibreBook) {
+			sources.push({
+				type: 'calibre-local',
+				libraryPath: calibreBook.libraryPath || '',
+				calibreId: calibreBook.id,
+				epubPath: calibreBook.epubPath || '',
+				lastModified: calibreBook.lastModified || now,
+				calibreUuid: calibreBook.uuid,
+				addedAt: now,
+				lastVerified: now,
+				priority: 1,
+			});
+		}
+
+		if (vaultBook?.localPath) {
+			sources.push({
+				type: 'vault-copy',
+				vaultPath: vaultBook.localPath,
+				copiedAt: now,
+				addedAt: now,
+				lastVerified: now,
+				priority: 0,
+			});
+		}
+
+		// Build formats array
+		const formats: import('./types/unified-book').BookFormat[] = [];
+		if (calibreBook?.epubPath) {
+			formats.push({
+				type: 'epub',
+				path: calibreBook.epubPath,
+			});
+		}
+		if (vaultBook?.localPath) {
+			const ext = vaultBook.localPath.split('.').pop()?.toLowerCase();
+			if (ext === 'epub' || ext === 'pdf') {
+				formats.push({
+					type: ext as 'epub' | 'pdf',
+					path: vaultBook.localPath,
+				});
+			}
+		}
+
+		return {
+			id: calibreBook?.uuid || vaultBook?.id || `book-${Date.now()}`,
+			calibreUuid: calibreBook?.uuid,
+			title: book.title || 'Untitled',
+			authors,
+			series: calibreBook?.series ? {
+				name: calibreBook.series.name || calibreBook.series,
+				index: calibreBook.seriesIndex,
+			} : undefined,
+			publisher: calibreBook?.publisher,
+			publishedDate: calibreBook?.pubdate,
+			description: calibreBook?.description,
+			tags,
+			rating: calibreBook?.rating || undefined,
+			sources,
+			formats,
+			status: 'to-read',
+			progress: 0,
+			addedAt: new Date(),
+		};
+	}
+
+	/**
 	 * Open a book by Calibre ID
 	 */
 	async openBookByCalibreId(calibreId: number) {
@@ -1160,6 +1594,125 @@ export default class AmnesiaPlugin extends Plugin {
 		workspace.revealLeaf(leaf);
 	}
 
+	/**
+	 * Load atomic highlights from vault for a specific book
+	 * Scans the book's atomic notes folder and loads any highlights not yet in the store
+	 * @param bookId The book ID (Calibre UUID or vault book ID)
+	 * @param bookTitle The book title (used to find the atomic notes folder)
+	 * @returns Number of highlights loaded from vault
+	 */
+	async loadAtomicHighlightsFromVault(bookId: string, bookTitle: string): Promise<number> {
+		if (!this.readerVaultSync) {
+			console.log('[Amnesia] Reader vault sync not available, skipping atomic highlight scan');
+			return 0;
+		}
+
+		// Get the atomic folder path from template settings
+		const templateSettings = this.settings.templates;
+		const baseFolder = templateSettings?.atomicHighlight?.folder || 'Biblioteca/Florilegios';
+		const atomicFolder = `${baseFolder}/${bookTitle}/atomic`;
+
+		console.log(`[Amnesia] Scanning for atomic highlights in: ${atomicFolder}`);
+
+		return this.readerVaultSync.scanAndLoadHighlightsFromFolder(atomicFolder, bookId);
+	}
+
+	// ==========================================================================
+	// Single Note Sync
+	// ==========================================================================
+
+	/**
+	 * Sync only the active note with Calibre (bidirectional)
+	 */
+	private async syncActiveNote(file: TFile, calibreId: number): Promise<void> {
+		const contentServer = this.calibreService.getContentServer();
+		if (!contentServer) {
+			new Notice('Connect to Calibre Content Server first');
+			return;
+		}
+
+		contentServer.setVerbose(true);
+		new Notice(`Syncing: ${file.basename}...`);
+
+		try {
+			// Get current frontmatter from Obsidian
+			const cache = this.app.metadataCache.getFileCache(file);
+			const fm = cache?.frontmatter || {};
+
+			// Get current metadata from Calibre
+			const calibreBook = await contentServer.getBookMetadata(calibreId);
+
+			console.log('='.repeat(60));
+			console.log(`[SingleSync] Syncing: ${file.basename} (Calibre ID: ${calibreId})`);
+			console.log('='.repeat(60));
+			console.log('[SingleSync] Obsidian frontmatter:', {
+				rating: fm.rating,
+				tags: fm.tags,
+				status: fm.status
+			});
+			console.log('[SingleSync] Calibre metadata:', {
+				rating: calibreBook.rating,
+				tags: calibreBook.tags
+			});
+
+			// Determine sync direction based on lastSync timestamp
+			const lastSync = fm.lastSync ? new Date(fm.lastSync) : new Date(0);
+			const calibreModified = calibreBook.last_modified ? new Date(calibreBook.last_modified) : new Date(0);
+
+			// For now, push Obsidian → Calibre (can be made bidirectional later)
+			const changes: Record<string, unknown> = {};
+
+			// Convert Obsidian rating (1-5 stars) to Calibre (0-10)
+			if (fm.rating !== undefined) {
+				const calibreRating = Math.round(fm.rating * 2);
+				if (calibreRating !== calibreBook.rating) {
+					changes.rating = calibreRating;
+					console.log(`[SingleSync] Rating: ${fm.rating}★ → ${calibreRating} (Calibre scale)`);
+				}
+			}
+
+			// Sync tags (strip wiki-links if present)
+			if (fm.tags && Array.isArray(fm.tags)) {
+				const cleanTags = fm.tags.map((t: string) =>
+					t.replace(/\[\[.*\|?(.*?)\]\]/g, '$1').trim()
+				);
+				const tagsChanged = JSON.stringify(cleanTags.sort()) !== JSON.stringify((calibreBook.tags || []).sort());
+				if (tagsChanged) {
+					changes.tags = cleanTags;
+					console.log(`[SingleSync] Tags: ${JSON.stringify(cleanTags)}`);
+				}
+			}
+
+			if (Object.keys(changes).length === 0) {
+				console.log('[SingleSync] No changes to sync');
+				new Notice('No changes to sync');
+				return;
+			}
+
+			console.log('[SingleSync] Pushing changes to Calibre:', JSON.stringify(changes, null, 2));
+
+			const result = await contentServer.setFields(calibreId, changes);
+
+			if (result.success) {
+				console.log('[SingleSync] SUCCESS - Calibre updated');
+				console.log('[SingleSync] New values:', result.updatedMetadata);
+
+				// Update lastSync in frontmatter
+				await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+					frontmatter.lastSync = new Date().toISOString();
+				});
+
+				new Notice(`Synced: ${Object.keys(changes).join(', ')}`);
+			} else {
+				console.error('[SingleSync] FAILED:', result.error);
+				new Notice(`Sync failed: ${result.error}`);
+			}
+		} catch (error) {
+			console.error('[SingleSync] Error:', error);
+			new Notice(`Sync error: ${error instanceof Error ? error.message : 'Unknown'}`);
+		}
+	}
+
 	// ==========================================================================
 	// Unified Sync Engine
 	// ==========================================================================
@@ -1232,5 +1785,193 @@ export default class AmnesiaPlugin extends Plugin {
 		}
 
 		console.log('Unified Sync Engine initialized');
+	}
+
+	// ==========================================================================
+	// Reader ↔ Vault Sync
+	// ==========================================================================
+
+	/**
+	 * Initialize the Reader ↔ Vault Sync Orchestrator
+	 */
+	private async initializeReaderVaultSync(): Promise<void> {
+		// Build sync settings from plugin settings
+		const syncSettings: Partial<ReaderVaultSyncSettings> = {
+			highlightSyncMode: this.settings.readerVaultSync?.highlightSyncMode ?? 'bidirectional',
+			noteSyncMode: this.settings.readerVaultSync?.noteSyncMode ?? 'bidirectional',
+			appendOnlyVault: this.settings.readerVaultSync?.appendOnlyVault ?? false,
+			preserveReaderHighlights: this.settings.readerVaultSync?.preserveReaderHighlights ?? false,
+			debounceDelay: this.settings.readerVaultSync?.debounceDelay ?? 2000,
+			autoSync: this.settings.readerVaultSync?.autoSync ?? true,
+			autoRegenerateHub: this.settings.readerVaultSync?.autoRegenerateHub ?? false,
+			hubRegenerateDelay: this.settings.readerVaultSync?.hubRegenerateDelay ?? 5000,
+		};
+
+		// Create the sync orchestrator
+		this.readerVaultSync = createReaderVaultSync(
+			this.app,
+			syncSettings,
+			() => this.highlightStore.getValue(),
+			(action) => this.highlightStore.dispatch(action)
+		);
+
+		// Wire up hub regeneration callback if highlightGenerator is available
+		if (this.highlightGenerator) {
+			this.readerVaultSync.setHubRegenerateCallback(async (bookId: string) => {
+				// Find the book in Calibre store by ID, UUID, or epubPath
+				const calibreBooks = this.calibreService.getStore().getValue().books;
+				let calibreBook = calibreBooks.find(b =>
+					b.uuid === bookId || String(b.id) === bookId
+				);
+
+				// If not found by UUID, try to find by epubPath from the current reader view
+				if (!calibreBook) {
+					const readerLeaves = this.app.workspace.getLeavesOfType('amnesia-reader');
+					for (const leaf of readerLeaves) {
+						const view = leaf.view as ReaderView;
+						if (view?.bookPath) {
+							calibreBook = calibreBooks.find(b => b.epubPath === view.bookPath);
+							if (calibreBook) {
+								console.log(`[ReaderVaultSync] Found book by epubPath: ${calibreBook.uuid}`);
+								break;
+							}
+						}
+					}
+				}
+
+				if (!calibreBook) {
+					console.warn(`[ReaderVaultSync] Could not find book ${bookId} for hub regeneration`);
+					return;
+				}
+
+				// Get highlights for this book - try both the provided bookId and the Calibre UUID
+				const highlightState = this.highlightStore.getValue();
+				let highlights = highlightState.highlights[bookId] || [];
+
+				// Also check for highlights under the Calibre UUID if different
+				if (calibreBook.uuid !== bookId) {
+					const calibreHighlights = highlightState.highlights[calibreBook.uuid] || [];
+					highlights = [...highlights, ...calibreHighlights];
+				}
+
+				// Convert to UnifiedBook format
+				const unifiedBook = this.convertToUnifiedBook(calibreBook, null);
+
+				// Regenerate hub file using generateHighlights
+				await this.highlightGenerator.generateHighlights(unifiedBook, highlights, {
+					generateHub: true,
+					generateAtomic: false, // Only regenerate hub, not atomic notes
+				});
+			});
+
+			// Wire up atomic note creation callback
+			this.readerVaultSync.setAtomicNoteCreateCallback(async (bookId: string, highlight) => {
+				// Find the book in Calibre store
+				const calibreBooks = this.calibreService.getStore().getValue().books;
+				let calibreBook = calibreBooks.find(b =>
+					b.uuid === bookId || String(b.id) === bookId
+				);
+
+				// If not found by UUID, try to find by epubPath from the current reader view
+				if (!calibreBook) {
+					const readerLeaves = this.app.workspace.getLeavesOfType('amnesia-reader');
+					for (const leaf of readerLeaves) {
+						const view = leaf.view as ReaderView;
+						if (view?.bookPath) {
+							calibreBook = calibreBooks.find(b => b.epubPath === view.bookPath);
+							if (calibreBook) break;
+						}
+					}
+				}
+
+				if (!calibreBook) {
+					console.warn(`[ReaderVaultSync] Could not find book ${bookId} for atomic note creation`);
+					return null;
+				}
+
+				// Convert to UnifiedBook format
+				const unifiedBook = this.convertToUnifiedBook(calibreBook, null);
+
+				// Generate atomic note for this single highlight
+				const result = await this.highlightGenerator.generateHighlights(unifiedBook, [highlight], {
+					generateHub: false,
+					generateAtomic: true,
+				});
+
+				// Return the path if created
+				if (result.atomicPathMap.size > 0) {
+					return result.atomicPathMap.get(highlight.id) || null;
+				}
+
+				return null;
+			});
+		}
+
+		// Subscribe to sync events
+		const syncEventUnsub = this.readerVaultSync.on((event) => {
+			switch (event.type) {
+				case 'sync-start':
+					console.log('[ReaderVaultSync] Sync started:', event.data.trigger);
+					break;
+				case 'sync-complete':
+					console.log('[ReaderVaultSync] Sync complete:', event.data.result);
+					break;
+				case 'conflict-detected':
+					console.log('[ReaderVaultSync] Conflict detected:', event.data.conflict);
+					new Notice('Sync conflict detected - review in console');
+					break;
+				case 'error':
+					console.error('[ReaderVaultSync] Error:', event.data.error);
+					new Notice(`Sync error: ${event.data.error?.message}`);
+					break;
+			}
+		});
+		this.readerVaultSyncUnsubscribes.push(syncEventUnsub);
+
+		// Wire up highlight service events to sync orchestrator
+		// Subscribe to highlight store changes and detect new/updated/deleted highlights
+		// Store highlight data (including atomicNotePath) so we can pass it when detecting deletions
+		let previousHighlights: Record<string, Map<string, { atomicNotePath?: string }>> = {};
+
+		const highlightStoreUnsub = this.highlightStore.subscribe((state) => {
+			if (!this.readerVaultSync) return;
+
+			// Track changes per book
+			for (const [bookId, highlights] of Object.entries(state.highlights)) {
+				const currentMap = new Map<string, { atomicNotePath?: string }>(
+					highlights.map(h => [h.id, { atomicNotePath: h.atomicNotePath }])
+				);
+				const previousMap = previousHighlights[bookId] || new Map();
+
+				// Detect new highlights
+				for (const highlight of highlights) {
+					if (!previousMap.has(highlight.id)) {
+						this.readerVaultSync.onHighlightCreated(highlight);
+					}
+				}
+
+				// Detect deleted highlights - pass the atomicNotePath we stored
+				for (const [previousId, data] of previousMap) {
+					if (!currentMap.has(previousId)) {
+						this.readerVaultSync.onHighlightDeleted(bookId, previousId, data.atomicNotePath);
+					}
+				}
+
+				previousHighlights[bookId] = currentMap;
+			}
+
+			// Clean up removed books
+			for (const bookId of Object.keys(previousHighlights)) {
+				if (!(bookId in state.highlights)) {
+					delete previousHighlights[bookId];
+				}
+			}
+		});
+		this.readerVaultSyncUnsubscribes.push(highlightStoreUnsub);
+
+		// Start the sync orchestrator
+		this.readerVaultSync.start();
+
+		console.log('Reader ↔ Vault Sync initialized');
 	}
 }

@@ -79,6 +79,11 @@ export const highlightReducer: Reducer<HighlightState, HighlightAction> = (state
 
     case 'ADD_HIGHLIGHT': {
       const highlight = action.payload;
+      // Validate bookId is a string to prevent [object Object] key bug
+      if (typeof highlight.bookId !== 'string') {
+        console.error('[HighlightStore] Invalid bookId type:', typeof highlight.bookId, highlight.bookId);
+        return state;
+      }
       const bookHighlights = state.highlights[highlight.bookId] || [];
       return {
         ...state,
@@ -92,6 +97,11 @@ export const highlightReducer: Reducer<HighlightState, HighlightAction> = (state
 
     case 'UPDATE_HIGHLIGHT': {
       const highlight = action.payload;
+      // Validate bookId is a string
+      if (typeof highlight.bookId !== 'string') {
+        console.error('[HighlightStore] Invalid bookId type in UPDATE:', typeof highlight.bookId);
+        return state;
+      }
       const bookHighlights = state.highlights[highlight.bookId] || [];
       return {
         ...state,
@@ -106,6 +116,11 @@ export const highlightReducer: Reducer<HighlightState, HighlightAction> = (state
 
     case 'REMOVE_HIGHLIGHT': {
       const { bookId, highlightId } = action.payload;
+      // Validate bookId is a string
+      if (typeof bookId !== 'string') {
+        console.error('[HighlightStore] Invalid bookId type in REMOVE:', typeof bookId);
+        return state;
+      }
       const bookHighlights = state.highlights[bookId] || [];
       return {
         ...state,

@@ -179,6 +179,7 @@ export class ContentServerClient {
 
   /**
    * Get list of all book IDs in library
+   * Uses /ajax/search endpoint which returns proper BooksListResponse format
    */
   async getBookIds(
     libraryId?: string,
@@ -186,6 +187,9 @@ export class ContentServerClient {
   ): Promise<BooksListResponse> {
     const lib = libraryId || this.libraryId || '';
     const params = new URLSearchParams();
+
+    // Use empty query to get all books
+    params.set('query', '');
 
     if (options?.offset !== undefined) {
       params.set('offset', String(options.offset));
@@ -197,9 +201,8 @@ export class ContentServerClient {
       params.set('sort', options.sort);
     }
 
-    const query = params.toString();
     return this.request<BooksListResponse>(
-      `/ajax/books/${lib}${query ? '?' + query : ''}`
+      `/ajax/search/${lib}?${params.toString()}`
     );
   }
 
@@ -450,5 +453,257 @@ export class ContentServerClient {
   ): string {
     const lib = libraryId || this.libraryId || '';
     return `${this.baseUrl}/get/${format}/${bookId}/${lib}`;
+  }
+
+  // ==========================================================================
+  // Write Operations (Calibre Content Server /cdb/ API)
+  // ==========================================================================
+
+  /**
+   * Debug/verbose mode for logging API calls
+   */
+  private verbose = false;
+
+  /**
+   * Enable or disable verbose logging
+   */
+  setVerbose(enabled: boolean): void {
+    this.verbose = enabled;
+  }
+
+  /**
+   * Log message if verbose mode is enabled
+   */
+  private log(message: string, ...args: unknown[]): void {
+    if (this.verbose) {
+      console.log(`[CalibreAPI] ${message}`, ...args);
+    }
+  }
+
+  /**
+   * Update metadata fields for a book
+   *
+   * Uses the Calibre Content Server /cdb/set-fields/ endpoint.
+   * Note: This endpoint is not officially documented but is stable.
+   *
+   * @param bookId - The Calibre book ID
+   * @param changes - Object mapping field names to new values
+   * @param libraryId - Optional library ID (uses default if not specified)
+   * @returns Promise<boolean> - True if update succeeded
+   *
+   * @example
+   * // Update rating (Calibre uses 0-10 scale, where 10 = 5 stars)
+   * await client.setFields(123, { rating: 8 });
+   *
+   * // Update multiple fields
+   * await client.setFields(123, {
+   *   rating: 8,
+   *   tags: ['fiction', 'sci-fi'],
+   *   '#my_custom_column': 'custom value'
+   * });
+   */
+  async setFields(
+    bookId: number,
+    changes: Record<string, unknown>,
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string; updatedMetadata?: Record<string, unknown> }> {
+    const lib = libraryId || this.libraryId || '';
+    const endpoint = `/cdb/set-fields/${bookId}/${lib}`;
+
+    this.log(`POST ${endpoint}`, { changes });
+
+    try {
+      // Calibre returns { bookId: { ...updatedMetadata } } on success
+      const response = await this.request<Record<string, unknown>>(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ changes }),
+        }
+      );
+
+      this.log(`Response:`, response);
+
+      // Check if we got the updated book metadata back (success case)
+      // Response format: { "17": { "rating": 8, "title": "...", ... } }
+      const bookIdStr = String(bookId);
+      if (response && response[bookIdStr]) {
+        return {
+          success: true,
+          updatedMetadata: response[bookIdStr] as Record<string, unknown>
+        };
+      }
+
+      // Check for error response format
+      if (response && 'err' in response) {
+        return { success: false, error: String(response.err) };
+      }
+
+      // If we got any response object, assume success
+      if (response && typeof response === 'object') {
+        return { success: true, updatedMetadata: response };
+      }
+
+      return { success: false, error: 'Unexpected response format' };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      this.log(`Error:`, errorMsg);
+      return { success: false, error: errorMsg };
+    }
+  }
+
+  /**
+   * Update a single metadata field
+   *
+   * @param bookId - The Calibre book ID
+   * @param field - The field name (e.g., 'rating', 'tags', 'title')
+   * @param value - The new value
+   * @param libraryId - Optional library ID
+   */
+  async setField(
+    bookId: number,
+    field: string,
+    value: unknown,
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    return this.setFields(bookId, { [field]: value }, libraryId);
+  }
+
+  /**
+   * Update book rating
+   *
+   * Calibre stores ratings as 0-10 (where 10 = 5 stars).
+   * This method accepts either 0-5 (stars) or 0-10 (Calibre scale).
+   *
+   * @param bookId - The Calibre book ID
+   * @param rating - Rating value (0-5 for stars, or 0-10 for Calibre scale)
+   * @param scale - 'stars' (0-5) or 'calibre' (0-10). Default: 'stars'
+   */
+  async setRating(
+    bookId: number,
+    rating: number,
+    scale: 'stars' | 'calibre' = 'stars',
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    // Convert to Calibre scale (0-10) if needed
+    const calibreRating = scale === 'stars' ? rating * 2 : rating;
+
+    // Clamp to valid range
+    const clampedRating = Math.max(0, Math.min(10, calibreRating));
+
+    this.log(`Setting rating for book ${bookId}: ${rating} (${scale}) -> ${clampedRating} (calibre)`);
+
+    return this.setField(bookId, 'rating', clampedRating, libraryId);
+  }
+
+  /**
+   * Update book tags
+   *
+   * @param bookId - The Calibre book ID
+   * @param tags - Array of tag strings
+   * @param mode - 'replace' (default) or 'append'
+   */
+  async setTags(
+    bookId: number,
+    tags: string[],
+    mode: 'replace' | 'append' = 'replace',
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    if (mode === 'append') {
+      // Get current tags first
+      const metadata = await this.getBookMetadata(bookId, libraryId);
+      const existingTags = metadata.tags || [];
+      const mergedTags = [...new Set([...existingTags, ...tags])];
+      return this.setField(bookId, 'tags', mergedTags, libraryId);
+    }
+
+    return this.setField(bookId, 'tags', tags, libraryId);
+  }
+
+  /**
+   * Update book series information
+   *
+   * @param bookId - The Calibre book ID
+   * @param series - Series name (or null to remove from series)
+   * @param index - Series index (e.g., 1, 2, 3.5)
+   */
+  async setSeries(
+    bookId: number,
+    series: string | null,
+    index?: number,
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const changes: Record<string, unknown> = { series };
+    if (index !== undefined) {
+      changes.series_index = index;
+    }
+    return this.setFields(bookId, changes, libraryId);
+  }
+
+  /**
+   * Update book identifiers (ISBN, ASIN, etc.)
+   *
+   * @param bookId - The Calibre book ID
+   * @param identifiers - Object mapping identifier types to values
+   *
+   * @example
+   * await client.setIdentifiers(123, { isbn: '1234567890', asin: 'B00XXX' });
+   */
+  async setIdentifiers(
+    bookId: number,
+    identifiers: Record<string, string>,
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    return this.setField(bookId, 'identifiers', identifiers, libraryId);
+  }
+
+  /**
+   * Update a custom column value
+   *
+   * Custom columns in Calibre are prefixed with '#'.
+   *
+   * @param bookId - The Calibre book ID
+   * @param columnName - Column name (without '#' prefix - it will be added)
+   * @param value - The new value
+   */
+  async setCustomColumn(
+    bookId: number,
+    columnName: string,
+    value: unknown,
+    libraryId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const field = columnName.startsWith('#') ? columnName : `#${columnName}`;
+    return this.setField(bookId, field, value, libraryId);
+  }
+
+  /**
+   * Batch update multiple books
+   *
+   * @param updates - Array of { bookId, changes } objects
+   * @returns Array of results for each book
+   */
+  async batchSetFields(
+    updates: Array<{ bookId: number; changes: Record<string, unknown> }>,
+    libraryId?: string
+  ): Promise<Array<{ bookId: number; success: boolean; error?: string }>> {
+    this.log(`Batch updating ${updates.length} books`);
+
+    const results: Array<{ bookId: number; success: boolean; error?: string }> = [];
+
+    for (const update of updates) {
+      const result = await this.setFields(update.bookId, update.changes, libraryId);
+      results.push({ bookId: update.bookId, ...result });
+
+      // Small delay to avoid overwhelming the server
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+
+    const succeeded = results.filter(r => r.success).length;
+    this.log(`Batch complete: ${succeeded}/${updates.length} succeeded`);
+
+    return results;
   }
 }
