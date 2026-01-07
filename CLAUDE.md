@@ -396,6 +396,7 @@ mcp__obsidian-devtools__obsidian_capture_screenshot({ format: 'png' })
 
 | Version | Change |
 |---------|--------|
+| 0.4.0 (2026-01-07) | **PDF Rendering Optimization & HUD Feature**: Dual-resolution rendering (never show blank pages), spatial prefetching for grid modes, seamless mode transitions with cache preservation, background thumbnail generation. New HUD (Heads-Up Display) with Doc Doctor integration: status bar metrics, 5 tabbed views (Reading, Library, Stats, Server, Series), context-aware display, reading streaks and activity sparklines |
 | 0.3.1 (2026-01-06) | Fixed PDF scroll/zoom in vertical-scroll and horizontal-scroll modes: resolved parent wheel handler conflict that caused unintended page navigation during scroll gestures |
 | 0.3.0 (2026-01-04) | Calibre bidirectional sync (read/write API), advanced query API, library statistics, single-note sync command |
 | 0.2.2 (2026-01-03) | Restructured settings UI: 5 tabs (Library, Reading, Sync, Notes, Advanced), integrated Liquid templates for note generation, added metadata mapping settings |

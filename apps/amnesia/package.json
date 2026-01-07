@@ -1,6 +1,6 @@
 {
   "name": "amnesia",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Ebook reader for Obsidian with OPDS support and Doc Doctor integration",
   "main": "main.js",
   "scripts": {

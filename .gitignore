@@ -33,6 +33,11 @@ temp/
 coverage/
 .nyc_output/
 
+# Test screenshots
+apps/amnesia/screenshots/
+**/test-screenshot*.png
+**/test-*.png
+
 # Docker
 .docker/
 
