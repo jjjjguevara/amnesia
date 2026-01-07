@@ -59,6 +59,20 @@ export interface HybridPdfProviderStatus {
 }
 
 /**
+ * Result of dual-resolution rendering
+ */
+export interface DualResRenderResult {
+  /** The blob to display immediately (may be lower resolution) */
+  initial: Blob;
+  /** Scale of the initial blob */
+  initialScale: number;
+  /** Whether initial is at full requested quality */
+  isFullQuality: boolean;
+  /** Promise that resolves with full quality blob (only if initial was lower quality) */
+  upgradePromise?: Promise<Blob>;
+}
+
+/**
  * Server-based PDF provider with caching and prefetching
  */
 export class HybridPdfProvider {
@@ -151,6 +165,8 @@ export class HybridPdfProvider {
    * Load a PDF document from ArrayBuffer
    * First checks if the PDF already exists on the server, if so uses it.
    * Otherwise uploads the PDF.
+   *
+   * After loading, starts background thumbnail generation for fast placeholder display.
    */
   async loadDocument(data: ArrayBuffer, documentId?: string): Promise<ParsedPdf> {
     if (!this.apiClient) {
@@ -166,6 +182,12 @@ export class HybridPdfProvider {
         this.parsedPdf = await this.apiClient.getPdf(pdfId);
         this.documentId = this.parsedPdf.id;
         console.log('[HybridPdfProvider] Using existing PDF from server:', pdfId);
+
+        // Start background thumbnail generation (non-blocking)
+        this.generateThumbnails(this.parsedPdf.pageCount).catch((err) => {
+          console.warn('[HybridPdfProvider] Thumbnail generation failed:', err);
+        });
+
         return this.parsedPdf;
       } catch {
         // PDF doesn't exist, fall through to upload
@@ -176,6 +198,12 @@ export class HybridPdfProvider {
     // Upload the PDF
     this.parsedPdf = await this.apiClient.uploadPdf(data, documentId);
     this.documentId = this.parsedPdf.id;
+
+    // Start background thumbnail generation (non-blocking)
+    this.generateThumbnails(this.parsedPdf.pageCount).catch((err) => {
+      console.warn('[HybridPdfProvider] Thumbnail generation failed:', err);
+    });
+
     return this.parsedPdf;
   }
 
@@ -189,6 +217,12 @@ export class HybridPdfProvider {
 
     this.parsedPdf = await this.apiClient.getPdf(pdfId);
     this.documentId = pdfId;
+
+    // Start background thumbnail generation (non-blocking)
+    this.generateThumbnails(this.parsedPdf.pageCount).catch((err) => {
+      console.warn('[HybridPdfProvider] Thumbnail generation failed:', err);
+    });
+
     return this.parsedPdf;
   }
 
@@ -235,6 +269,113 @@ export class HybridPdfProvider {
    */
   async getPageImage(pageNumber: number, options?: PdfRenderOptions): Promise<Blob> {
     return this.renderPage(pageNumber, options);
+  }
+
+  /**
+   * Render a page with dual-resolution strategy.
+   *
+   * This method implements the "never show blank pages" strategy:
+   * 1. Returns the best available cached version IMMEDIATELY (even if low-res)
+   * 2. If cached version is lower quality, starts background upgrade
+   * 3. If nothing cached, fetches thumbnail first for instant display
+   *
+   * @param pageNumber Page to render (1-indexed)
+   * @param options Render options (scale, format, etc.)
+   * @returns Initial blob to display + optional upgrade promise
+   */
+  async renderPageDualRes(
+    pageNumber: number,
+    options?: PdfRenderOptions
+  ): Promise<DualResRenderResult> {
+    if (!this.apiClient || !this.documentId) {
+      throw new Error('No document loaded');
+    }
+
+    const requestedScale = options?.scale ?? 1.5;
+
+    // 1. Check for best available cached version
+    const cached = await this.pageCache.getBestAvailable(
+      this.documentId,
+      pageNumber,
+      requestedScale
+    );
+
+    if (cached) {
+      // Check if it's at full requested quality
+      if (cached.scale >= requestedScale) {
+        // Full quality cached - return immediately
+        return {
+          initial: cached.blob,
+          initialScale: cached.scale,
+          isFullQuality: true,
+        };
+      }
+
+      // Lower quality cached - return it and start upgrade
+      const upgradePromise = this.renderPage(pageNumber, options);
+      return {
+        initial: cached.blob,
+        initialScale: cached.scale,
+        isFullQuality: false,
+        upgradePromise,
+      };
+    }
+
+    // 2. Nothing cached - try thumbnail first for instant display
+    const thumbnailScale = HybridPdfProvider.THUMBNAIL_DPI / 72;
+    const thumbnailCached = await this.pageCache.get(
+      this.documentId,
+      pageNumber,
+      thumbnailScale
+    );
+
+    if (thumbnailCached) {
+      // Thumbnail exists - return it and start full fetch
+      const upgradePromise = this.renderPage(pageNumber, options);
+      return {
+        initial: thumbnailCached,
+        initialScale: thumbnailScale,
+        isFullQuality: false,
+        upgradePromise,
+      };
+    }
+
+    // 3. Nothing cached at all - fetch thumbnail first for speed
+    // Race: get thumbnail quickly, then full quality
+    const thumbnailOptions: PdfRenderOptions = {
+      dpi: HybridPdfProvider.THUMBNAIL_DPI,
+      format: 'png',
+    };
+
+    try {
+      // Try to get thumbnail first (faster due to lower DPI)
+      const thumbnail = await this.apiClient.getPdfPage(
+        this.documentId,
+        pageNumber,
+        thumbnailOptions
+      );
+
+      // Cache the thumbnail
+      await this.pageCache.set(this.documentId, pageNumber, thumbnailScale, thumbnail);
+
+      // Start full resolution fetch in background
+      const upgradePromise = this.renderPage(pageNumber, options);
+
+      return {
+        initial: thumbnail,
+        initialScale: thumbnailScale,
+        isFullQuality: false,
+        upgradePromise,
+      };
+    } catch {
+      // If thumbnail fails, just fetch full directly
+      const fullBlob = await this.renderPage(pageNumber, options);
+      return {
+        initial: fullBlob,
+        initialScale: requestedScale,
+        isFullQuality: true,
+      };
+    }
   }
 
   /**
@@ -454,6 +595,119 @@ export class HybridPdfProvider {
    */
   isPrefetchPaused(): boolean {
     return this.prefetchPaused;
+  }
+
+  /** Track if thumbnail generation is in progress */
+  private isGeneratingThumbnails = false;
+
+  /** Thumbnail DPI - lower than full render for fast loading */
+  private static readonly THUMBNAIL_DPI = 72;
+
+  /**
+   * Generate thumbnails for all pages in the background.
+   * This runs non-blocking and yields to the main thread between batches.
+   *
+   * Benefits:
+   * - Thumbnails are cached and available instantly when pages come into view
+   * - Never shows blank pages - thumbnail is displayed while full-res loads
+   * - Batched processing prevents memory spikes
+   * - setTimeout yields prevent UI freezing
+   */
+  private async generateThumbnails(pageCount: number): Promise<void> {
+    if (this.isGeneratingThumbnails) {
+      console.log('[HybridPdfProvider] Thumbnail generation already in progress');
+      return;
+    }
+
+    if (!this.documentId || !this.apiClient) {
+      console.warn('[HybridPdfProvider] Cannot generate thumbnails - no document loaded');
+      return;
+    }
+
+    this.isGeneratingThumbnails = true;
+    const startTime = performance.now();
+    const BATCH_SIZE = 5;
+    const THUMBNAIL_OPTIONS: PdfRenderOptions = {
+      dpi: HybridPdfProvider.THUMBNAIL_DPI,
+      format: 'png',
+    };
+
+    let generated = 0;
+    let skipped = 0;
+
+    try {
+      for (let i = 0; i < pageCount; i += BATCH_SIZE) {
+        // Check if we should stop (e.g., document changed)
+        if (!this.documentId) {
+          console.log('[HybridPdfProvider] Thumbnail generation stopped - document unloaded');
+          break;
+        }
+
+        const batchEnd = Math.min(i + BATCH_SIZE, pageCount);
+        const batch: number[] = [];
+
+        // Build batch of pages that need thumbnails
+        for (let page = i + 1; page <= batchEnd; page++) {
+          // Skip if already cached
+          const isCached = await this.pageCache.has(
+            this.documentId,
+            page,
+            THUMBNAIL_OPTIONS.dpi! / 72 // Convert DPI to scale
+          );
+          if (isCached) {
+            skipped++;
+          } else {
+            batch.push(page);
+          }
+        }
+
+        if (batch.length > 0) {
+          // Render batch in parallel
+          await Promise.all(
+            batch.map(async (page) => {
+              try {
+                await this.renderPage(page, THUMBNAIL_OPTIONS);
+                generated++;
+              } catch (err) {
+                // Individual page errors shouldn't stop the batch
+                console.warn(`[HybridPdfProvider] Thumbnail failed for page ${page}:`, err);
+              }
+            })
+          );
+        }
+
+        // Yield to main thread between batches to prevent UI freezing
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const duration = performance.now() - startTime;
+      console.log(
+        `[HybridPdfProvider] Thumbnail generation complete: ${generated} generated, ${skipped} skipped, ${duration.toFixed(0)}ms`
+      );
+    } finally {
+      this.isGeneratingThumbnails = false;
+    }
+  }
+
+  /**
+   * Get a thumbnail for a page (low-DPI cached version)
+   * Returns null if thumbnail not yet generated
+   */
+  async getThumbnail(pageNumber: number): Promise<Blob | null> {
+    if (!this.documentId) return null;
+
+    const thumbnailScale = HybridPdfProvider.THUMBNAIL_DPI / 72;
+    return this.pageCache.get(this.documentId, pageNumber, thumbnailScale);
+  }
+
+  /**
+   * Check if a thumbnail exists for a page
+   */
+  async hasThumbnail(pageNumber: number): Promise<boolean> {
+    if (!this.documentId) return false;
+
+    const thumbnailScale = HybridPdfProvider.THUMBNAIL_DPI / 72;
+    return this.pageCache.has(this.documentId, pageNumber, thumbnailScale);
   }
 
   private blobToImage(blob: Blob): Promise<HTMLImageElement> {

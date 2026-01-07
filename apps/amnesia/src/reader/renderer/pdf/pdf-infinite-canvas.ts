@@ -80,6 +80,20 @@ export interface InfiniteCanvasConfig {
   pagesPerRow: number;
 }
 
+/**
+ * Result of dual-resolution page image fetch
+ */
+export interface DualResPageResult {
+  /** The blob to display immediately (may be lower resolution) */
+  initial: Blob;
+  /** Scale of the initial blob */
+  initialScale: number;
+  /** Whether initial is at full requested quality */
+  isFullQuality: boolean;
+  /** Promise that resolves with full quality blob (only if initial was lower quality) */
+  upgradePromise?: Promise<Blob>;
+}
+
 export interface PageDataProvider {
   getPageImage(page: number, options: PdfRenderOptions): Promise<Blob>;
   getPageTextLayer(page: number): Promise<TextLayerData>;
@@ -87,6 +101,8 @@ export interface PageDataProvider {
   notifyPageChange?(page: number): void;
   /** Optional: Prefetch specific pages (for spatial prefetching) */
   prefetchPages?(pages: number[]): Promise<void>;
+  /** Optional: Get page image with dual-resolution (thumbnail first, upgrade later) */
+  getPageImageDualRes?(page: number, options: PdfRenderOptions): Promise<DualResPageResult>;
 }
 
 const DEFAULT_CONFIG: InfiniteCanvasConfig = {
@@ -1046,7 +1062,12 @@ export class PdfInfiniteCanvas {
   }
 
   /**
-   * Render a single page
+   * Render a single page with dual-resolution strategy.
+   *
+   * Implementation of "never show blank pages":
+   * 1. If dual-res API is available, use it to get best cached version immediately
+   * 2. Display whatever we have (even if low-res thumbnail)
+   * 3. When upgrade completes, re-render with higher quality
    */
   private async renderPage(
     page: number,
@@ -1058,27 +1079,95 @@ export class PdfInfiniteCanvas {
     element.showLoading();
 
     try {
-      // Get or fetch image
-      const imageBlob = await this.getCachedPageImage(page);
-      if (this.renderVersion !== version) return;
+      // Use dual-resolution if provider supports it (preferred path)
+      if (this.provider.getPageImageDualRes) {
+        const result = await this.provider.getPageImageDualRes(page, {
+          scale: this.config.renderScale * this.config.pixelRatio,
+          dpi: 150,
+          format: 'png',
+        });
 
-      // Get text layer (optional)
-      let textLayerData: TextLayerData | undefined;
-      try {
-        textLayerData = await this.provider.getPageTextLayer(page);
-      } catch {
-        // Text layer is optional
+        if (this.renderVersion !== version) return;
+
+        // Get text layer (non-blocking)
+        let textLayerData: TextLayerData | undefined;
+        try {
+          textLayerData = await this.provider.getPageTextLayer(page);
+        } catch {
+          // Text layer is optional
+        }
+
+        if (this.renderVersion !== version) return;
+
+        // Display initial (may be thumbnail or full quality)
+        await element.render({ imageBlob: result.initial, textLayerData }, this.config.renderScale);
+        element.hideLoading();
+
+        // Update local cache with initial
+        this.pageImageCache.set(page, result.initial);
+        this.pageCacheScales.set(page, result.initialScale);
+        this.updateCacheOrder(page);
+
+        // If not full quality, wait for upgrade and re-render
+        if (!result.isFullQuality && result.upgradePromise) {
+          result.upgradePromise.then(async (fullBlob) => {
+            // Only upgrade if still visible and same render version
+            if (this.renderVersion !== version || !this.visiblePages.has(page)) {
+              return;
+            }
+
+            // Re-render with full quality
+            await element.render({ imageBlob: fullBlob, textLayerData }, this.config.renderScale);
+
+            // Update cache with full quality
+            this.pageImageCache.set(page, fullBlob);
+            this.pageCacheScales.set(page, this.config.renderScale * this.config.pixelRatio);
+            this.updateCacheOrder(page);
+          }).catch((err) => {
+            // Upgrade failed, but we already have something displayed
+            if (!this.isAbortError(err)) {
+              console.warn(`[PdfInfiniteCanvas] Upgrade failed for page ${page}:`, err);
+            }
+          });
+        }
+      } else {
+        // Fallback: use original single-resolution path
+        const imageBlob = await this.getCachedPageImage(page);
+        if (this.renderVersion !== version) return;
+
+        let textLayerData: TextLayerData | undefined;
+        try {
+          textLayerData = await this.provider.getPageTextLayer(page);
+        } catch {
+          // Text layer is optional
+        }
+
+        if (this.renderVersion !== version) return;
+
+        await element.render({ imageBlob, textLayerData }, this.config.renderScale);
+        element.hideLoading();
       }
-
-      if (this.renderVersion !== version) return;
-
-      await element.render({ imageBlob, textLayerData }, this.config.renderScale);
-      element.hideLoading();
     } catch (error) {
       if (!this.isAbortError(error)) {
         console.error(`Failed to render page ${page}:`, error);
       }
       element.hideLoading();
+    }
+  }
+
+  /**
+   * Update cache order for LRU eviction
+   */
+  private updateCacheOrder(page: number): void {
+    const idx = this.cacheOrder.indexOf(page);
+    if (idx > -1) this.cacheOrder.splice(idx, 1);
+    this.cacheOrder.push(page);
+
+    // Evict old entries
+    while (this.cacheOrder.length > this.PAGE_CACHE_SIZE) {
+      const old = this.cacheOrder.shift()!;
+      this.pageImageCache.delete(old);
+      this.pageCacheScales.delete(old);
     }
   }
 

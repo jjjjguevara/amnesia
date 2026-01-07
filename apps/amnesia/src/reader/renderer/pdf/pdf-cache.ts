@@ -21,7 +21,7 @@ interface CacheEntry {
 export class PdfPageCache {
   private dbName = 'amnesia-pdf-cache';
   private storeName = 'pages';
-  private dbVersion = 1;
+  private dbVersion = 5; // Incremented to match existing DB version
   private db: IDBDatabase | null = null;
   private memoryCache: Map<string, Blob> = new Map();
   private maxMemoryEntries = 20;
@@ -177,6 +177,42 @@ export class PdfPageCache {
         resolve(false);
       }
     });
+  }
+
+  /**
+   * Get the best available cached version of a page.
+   * Tries scales from highest to lowest, returning the first available.
+   *
+   * This enables instant display: show thumbnail/low-res immediately
+   * while full resolution loads in background.
+   *
+   * @param pdfId PDF document ID
+   * @param page Page number
+   * @param preferredScale Preferred scale (will try this and lower)
+   * @returns Cached blob and its scale, or null if nothing cached
+   */
+  async getBestAvailable(
+    pdfId: string,
+    page: number,
+    preferredScale: number = 2.0
+  ): Promise<{ blob: Blob; scale: number } | null> {
+    // Common scales to check, from highest to lowest
+    // Includes thumbnail scale (72 DPI = 1.0 scale) as fallback
+    const scalesToCheck = [preferredScale, 2.0, 1.5, 1.0].filter(
+      (s) => s <= preferredScale
+    );
+
+    // Deduplicate and sort descending
+    const uniqueScales = [...new Set(scalesToCheck)].sort((a, b) => b - a);
+
+    for (const scale of uniqueScales) {
+      const blob = await this.get(pdfId, page, scale);
+      if (blob) {
+        return { blob, scale };
+      }
+    }
+
+    return null;
   }
 
   /**

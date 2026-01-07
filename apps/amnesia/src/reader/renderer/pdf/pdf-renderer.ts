@@ -341,6 +341,22 @@ export class PdfRenderer implements DocumentRenderer {
           await (this.provider as any).prefetchPages(pages);
         }
       },
+      // Dual-resolution rendering: returns best cached version immediately,
+      // starts background upgrade if needed (never show blank pages)
+      getPageImageDualRes: async (page: number, options: PdfRenderOptions) => {
+        if (!this.document) throw new Error('No document loaded');
+        // Check if provider supports dual-res rendering
+        if ('renderPageDualRes' in this.provider && typeof (this.provider as any).renderPageDualRes === 'function') {
+          return (this.provider as any).renderPageDualRes(page, options);
+        }
+        // Fallback: wrap regular render as full quality
+        const blob = await this.provider.getPdfPage(this.document.id, page, options);
+        return {
+          initial: blob,
+          initialScale: options.scale ?? 1.5,
+          isFullQuality: true,
+        };
+      },
     };
 
     this.infiniteCanvas = new PdfInfiniteCanvas(
