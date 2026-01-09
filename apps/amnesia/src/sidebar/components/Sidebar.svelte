@@ -92,26 +92,26 @@
   });
 
   // Subscribe to highlight service for live updates
+  // Set up once in onMount - persists for component lifetime
   let unsubscribeHighlights: (() => void) | null = null;
-  $: {
-    // Clean up previous subscription
-    if (unsubscribeHighlights) {
-      unsubscribeHighlights();
-      unsubscribeHighlights = null;
-    }
-    // Subscribe if we have a highlight service
+
+  onMount(() => {
+    // Subscribe to highlight store once on mount
+    // The subscription reads activeBookId fresh from sidebarStore each time
     if (plugin.highlightService) {
       const store = plugin.highlightService.getStore();
       unsubscribeHighlights = store.subscribe((state) => {
-        // Update highlights for current book when store changes
-        if (activeBookId) {
-          highlights = state.highlights[activeBookId] || [];
+        // Read activeBookId fresh from store to avoid stale closure
+        const bookId = sidebarStore.getValue().activeBookId;
+        if (bookId) {
+          highlights = state.highlights[bookId] || [];
         }
       });
     }
-  }
+  });
 
   function loadBookData(bookId: string) {
+    // Load highlights synchronously for immediate display
     if (plugin.highlightService) {
       highlights = plugin.highlightService.getHighlights(bookId);
     }

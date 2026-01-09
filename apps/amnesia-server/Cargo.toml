@@ -98,3 +98,7 @@ harness = false
 [[bench]]
 name = "search_performance"
 harness = false
+
+[[bench]]
+name = "memory_usage"
+harness = false

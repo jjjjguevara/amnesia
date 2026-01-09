@@ -168,10 +168,8 @@ fn bench_epub_parsing(c: &mut Criterion) {
                     "bench-epub".to_string(),
                 )
                 .expect("Failed to create handler");
-                // Access page count through the underlying SafeDocument
-                let item_count = handler.document().item_count();
-                let layout_config = handler.layout_config();
-                black_box((item_count, layout_config))
+                // Construction includes layout - just consume the handler
+                black_box(handler)
             })
         },
     );

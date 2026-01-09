@@ -295,7 +295,8 @@ export class CalibreDatabase {
 
       insertStmt.bind([book.id, book.title, authors, description, tags, publisher]);
       insertStmt.step();
-      insertStmt.reset();
+      // sql.js Statement has reset() but types are incomplete
+      (insertStmt as unknown as { reset(): void }).reset();
     }
 
     insertStmt.free();

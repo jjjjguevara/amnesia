@@ -47,9 +47,9 @@ export class BookSidebarView extends ItemView {
   /**
    * Update the sidebar with the book's Table of Contents.
    */
-  setToc(entries: TocEntry[]): void {
+  setToc(entries: TocEntry[], spine?: any[], initialExpandedState?: string[]): void {
     if (this.component && typeof (this.component as any).setToc === 'function') {
-      (this.component as any).setToc(entries);
+      (this.component as any).setToc(entries, spine, initialExpandedState);
     }
   }
 

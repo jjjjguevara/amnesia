@@ -57,6 +57,8 @@ export class ReaderView extends ItemView {
     this.bookTitle = await this.resolveBookTitle();
     await this.renderReader();
     this.updateViewHeader();
+    // Notify HUD context detector of book change
+    this.notifyBookContextChange();
   }
 
   async setState(state: ReaderViewState, result: { history: boolean }): Promise<void> {
@@ -79,6 +81,9 @@ export class ReaderView extends ItemView {
 
     // Force update the view header DOM element
     this.updateViewHeader();
+
+    // Notify HUD context detector of book change
+    this.notifyBookContextChange();
   }
 
   getState(): ReaderViewState {
@@ -144,12 +149,14 @@ export class ReaderView extends ItemView {
       console.log('[ReaderView] onOpen: No bookPath yet, waiting for setState');
     }
 
-    // Register for active leaf change to handle visibility
+    // Register for active leaf change to handle visibility and sidebar sync
     this.registerEvent(
       this.app.workspace.on('active-leaf-change', (leaf) => {
         if (leaf === this.leaf && this.component) {
           // Trigger a resize event to fix display issues when tab becomes active
           this.component.$set({ _activeLeafTrigger: Date.now() });
+          // Update sidebar to reflect this book when it becomes active
+          (this.component as any).onBecameActive?.();
         }
       })
     );
@@ -168,7 +175,8 @@ export class ReaderView extends ItemView {
       props: {
         plugin: this.plugin,
         bookPath: this.bookPath,
-        bookTitle: this.bookTitle
+        bookTitle: this.bookTitle,
+        view: this
       }
     });
 
@@ -180,6 +188,10 @@ export class ReaderView extends ItemView {
         this.app.workspace.requestSaveLayout();
         // Force update the view header DOM element
         this.updateViewHeader();
+        // Reset deduplication cache so next notifyBookContextChange triggers
+        this.lastNotifiedBookPath = '';
+        // Notify HUD context detector of title change
+        this.notifyBookContextChange();
       }
     });
   }
@@ -289,5 +301,26 @@ export class ReaderView extends ItemView {
     this.updateViewHeader();
     // Trigger layout save to persist the state
     this.app.workspace.requestSaveLayout();
+    // Notify HUD context detector of book change
+    this.notifyBookContextChange();
+  }
+
+  /**
+   * Notify the HUD context detector that the book context has changed.
+   * Custom views don't trigger file-open events, so we manually trigger
+   * active-leaf-change to refresh the context.
+   */
+  private lastNotifiedBookPath: string = '';
+  private notifyBookContextChange(): void {
+    // Skip if already notified for this book path (deduplication)
+    if (this.lastNotifiedBookPath === this.bookPath) return;
+
+    // Only trigger if this leaf is currently active to avoid unnecessary updates
+    if (this.app.workspace.activeLeaf !== this.leaf) return;
+
+    this.lastNotifiedBookPath = this.bookPath;
+    // Trigger active-leaf-change event to notify HUD context detector
+    // This ensures the HUD updates when book state changes in the reader
+    this.app.workspace.trigger('active-leaf-change', this.leaf);
   }
 }

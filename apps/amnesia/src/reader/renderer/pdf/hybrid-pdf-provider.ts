@@ -1,6 +1,18 @@
 /**
  * Server PDF Provider
  *
+ * @deprecated This module is deprecated. Use HybridDocumentProvider from
+ * '../hybrid-document-provider' instead. The unified document provider handles
+ * both PDF and EPUB formats with the same API.
+ *
+ * Migration guide:
+ * - Replace: import { HybridPdfProvider } from './pdf'
+ *   With: import { HybridDocumentProvider } from '../hybrid-document-provider'
+ * - Replace: createHybridPdfProvider(config)
+ *   With: createHybridDocumentProvider(config)
+ * - Replace: manual PdfContentProvider adapter
+ *   With: documentProvider.createPdfContentAdapter()
+ *
  * Server-based PDF rendering provider with intelligent caching and prefetching.
  * Uses the Amnesia server for all PDF operations (parsing, rendering, text extraction).
  *
@@ -11,6 +23,7 @@
  *
  * @example
  * ```typescript
+ * // DEPRECATED - use HybridDocumentProvider instead
  * import { HybridPdfProvider } from './hybrid-pdf-provider';
  *
  * const provider = new HybridPdfProvider({

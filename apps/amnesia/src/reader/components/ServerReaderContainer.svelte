@@ -92,6 +92,9 @@
     createHybridProvider,
     ProviderAdapter,
     createProviderAdapter,
+    // Unified document provider (replaces HybridPdfProvider)
+    HybridDocumentProvider,
+    createHybridDocumentProvider,
     type ReadingLocation,
     type ParsedBook,
     type TocEntry,
@@ -104,10 +107,7 @@
   // Import PDF renderer for PDF file support
   import {
     PdfRenderer,
-    HybridPdfProvider,
-    createHybridPdfProvider,
     type PdfRendererConfig,
-    type HybridPdfProviderStatus,
   } from '../renderer/pdf';
 
   // Import the new Shadow DOM renderer (V2)
@@ -212,10 +212,32 @@
     return '';
   }
 
+  import type { ReaderView } from '../reader-view';
+
   export let plugin: AmnesiaPlugin;
   export let bookPath: string;
   export let bookTitle: string = '';
   export let _activeLeafTrigger: number = 0;
+  export let view: ReaderView | undefined = undefined;
+
+  /**
+   * Called when this reader's leaf becomes active.
+   * Updates the sidebar to reflect this book's content.
+   */
+  export function onBecameActive(): void {
+    if (!book || !plugin) return;
+
+    // Check if sidebar is open
+    const sidebarLeaves = plugin.app.workspace.getLeavesOfType('amnesia-book-sidebar');
+    if (sidebarLeaves.length === 0) return;
+
+    // Update sidebar store with this book's info
+    const activeBookId = highlightBookId || (isCalibreBook ? calibreBook?.uuid : null) || bookPath;
+    sidebarStore.setActiveBook(activeBookId, bookPath, bookTitle);
+
+    // Update ToC
+    updateSidebarToc();
+  }
 
   /**
    * Navigate to a CFI location - exposed for external calls from reader-view
@@ -947,7 +969,7 @@
   let apiClient: ApiClient | null = null;
   let syncManager: SyncManager | null = null;
   let bookProvider: HybridBookProvider | null = null;
-  let pdfProvider: HybridPdfProvider | null = null;
+  let pdfProvider: HybridDocumentProvider | null = null;
   let providerAdapter: ProviderAdapter | null = null;
   let providerStatus: ProviderStatus | null = null;
 
@@ -1069,7 +1091,14 @@
    * Update the sidebar with the book's ToC and spine items
    */
   function updateSidebarToc(): void {
-    if (!toc || !plugin || !book) return;
+    if (!plugin || !book) return;
+
+    // Use toc variable if set, otherwise fall back to book.toc
+    const tocData = toc || book.toc || [];
+    if (tocData.length === 0) {
+      console.log('[ServerReader] updateSidebarToc: No ToC data available');
+      return;
+    }
 
     // Get initial expanded state from book settings
     let initialExpandedState: string[] = [];
@@ -1080,10 +1109,16 @@
 
     // Find the sidebar view and update its ToC
     const leaves = plugin.app.workspace.getLeavesOfType('amnesia-book-sidebar');
+    if (leaves.length === 0) {
+      console.log('[ServerReader] updateSidebarToc: No sidebar leaves found');
+      return;
+    }
+
     for (const leaf of leaves) {
       const view = leaf.view as any;
       if (view.setToc) {
-        view.setToc(toc, book.spine, initialExpandedState);
+        console.log('[ServerReader] updateSidebarToc: Passing', tocData.length, 'entries to sidebar');
+        view.setToc(tocData, book.spine, initialExpandedState);
       }
     }
   }
@@ -1257,24 +1292,14 @@
           displayMode: plugin.settings.pdf?.displayMode,
         });
 
-        // Create PDF provider
-        pdfProvider = createHybridPdfProvider({
+        // Create unified document provider (replaces HybridPdfProvider)
+        pdfProvider = createHybridDocumentProvider({
           serverBaseUrl: plugin.settings.serverEnabled ? plugin.settings.serverUrl : undefined,
           preferMode: plugin.settings.pdf?.preferMode ?? 'auto',
           deviceId: getDeviceId(),
           enableCache: plugin.settings.pdf?.enablePageCache ?? true,
-          cacheSize: plugin.settings.pdf?.pageCacheSize ?? 10,
-          memoryBudgetMB: plugin.settings.pdf?.memoryBudgetMB ?? 200,
           enablePrefetch: (plugin.settings.pdf?.pagePreloadCount ?? 2) > 0,
           prefetchCount: plugin.settings.pdf?.pagePreloadCount ?? 2,
-          enableBatchRequests: plugin.settings.pdf?.enableBatchRequests ?? true,
-          batchSize: plugin.settings.pdf?.batchSize ?? 5,
-          prefetchStrategy: plugin.settings.pdf?.prefetchStrategy ?? 'adaptive',
-          // Render quality settings - must match PdfRenderer for consistent prefetch quality
-          renderDpi: plugin.settings.pdf?.renderDpi ?? 150,
-          renderScale: plugin.settings.pdf?.scale ?? 1.5,
-          imageFormat: plugin.settings.pdf?.imageFormat ?? 'png',
-          imageQuality: plugin.settings.pdf?.imageQuality ?? 85,
         });
 
         // Initialize provider (check server health)
@@ -1285,49 +1310,18 @@
         const filename = loadedBookData!.metadata.filePath.split('/').pop() || 'document.pdf';
 
         // Load document into provider first
-        let parsedPdf;
+        let parsedDocument;
         try {
-          parsedPdf = await pdfProvider.loadDocument(pdfData, filename);
-          console.log('[ServerReader] PDF loaded into provider:', { id: parsedPdf.id, pageCount: parsedPdf.pageCount });
+          parsedDocument = await pdfProvider.loadDocument(pdfData, filename);
+          console.log('[ServerReader] PDF loaded into provider:', { id: parsedDocument.id, pageCount: parsedDocument.itemCount });
         } catch (e) {
           error = `Failed to parse PDF: ${e instanceof Error ? e.message : String(e)}`;
           loading = false;
           return;
         }
 
-        // Create adapter that implements PdfContentProvider interface
-        const pdfContentProvider = {
-          async getPdf(id: string) {
-            return pdfProvider!.getParsedPdf()!;
-          },
-          async uploadPdf(data: ArrayBuffer, fname?: string) {
-            return pdfProvider!.loadDocument(data, fname);
-          },
-          async getPdfPage(id: string, page: number, options?: any) {
-            return pdfProvider!.renderPage(page, options);
-          },
-          async getPdfTextLayer(id: string, page: number) {
-            return pdfProvider!.getTextLayer(page);
-          },
-          async getPdfSvgTextLayer(id: string, page: number) {
-            return pdfProvider!.getSvgTextLayer(page);
-          },
-          async searchPdf(id: string, query: string, limit?: number) {
-            return pdfProvider!.search(query, limit);
-          },
-          // Tile rendering methods for CATiledLayer-style rendering at high zoom
-          renderTile: typeof pdfProvider?.renderTile === 'function'
-            ? async (tile: { page: number; tileX: number; tileY: number; scale: number }) => {
-                return pdfProvider!.renderTile(tile);
-              }
-            : undefined,
-          getRenderCoordinator: typeof pdfProvider?.getRenderCoordinator === 'function'
-            ? () => pdfProvider!.getRenderCoordinator()
-            : undefined,
-          isTileRenderingAvailable: typeof pdfProvider?.isTileRenderingAvailable === 'function'
-            ? () => pdfProvider!.isTileRenderingAvailable()
-            : undefined,
-        };
+        // Create PdfContentProvider adapter from HybridDocumentProvider
+        const pdfContentProvider = pdfProvider.createPdfContentAdapter();
 
         // Create PDF renderer config with all optimization settings
         const pdfRendererConfig: PdfRendererConfig = {
@@ -1377,20 +1371,31 @@
 
         // Load PDF document into renderer (document already loaded in provider)
         try {
-          await (renderer as PdfRenderer).load(parsedPdf.id);
+          await (renderer as PdfRenderer).load(parsedDocument.id);
 
-          // Get ToC from PDF outline
-          toc = parsedPdf.toc || [];
-          totalPages = parsedPdf.pageCount;
+          // Get ToC from PDF outline (convert TocEntry format recursively)
+          // document-worker.TocEntry: { title, page, level, children }
+          // renderer.TocEntry: { id, label, href, children }
+          type DocTocEntry = { title: string; page: number; level: number; children: DocTocEntry[] };
+          const convertToc = (entries: DocTocEntry[], prefix = 'toc'): TocEntry[] => {
+            return entries.map((entry, idx) => ({
+              id: `${prefix}-${idx}-p${entry.page}`,
+              label: entry.title,
+              href: `#page=${entry.page}`,
+              children: entry.children ? convertToc(entry.children, `${prefix}-${idx}`) : [],
+            }));
+          };
+          toc = convertToc((parsedDocument.toc || []) as unknown as DocTocEntry[]);
+          totalPages = parsedDocument.itemCount;
 
           // Set book title from PDF metadata or filename
           if (!bookTitle) {
-            bookTitle = parsedPdf.metadata?.title || filename.replace('.pdf', '');
+            bookTitle = parsedDocument.metadata?.title || filename.replace('.pdf', '');
             dispatch('titleResolved', { title: bookTitle });
           }
 
           // Set bookId for highlights
-          bookId = parsedPdf.id;
+          bookId = parsedDocument.id;
           highlightBookId = bookId;
 
           // Load existing highlights for this PDF
@@ -1501,22 +1506,15 @@
         console.log('[ServerReader] Title set from book metadata:', bookTitle);
       }
 
-      // Update highlightBookId to use book's actual ID for correct highlight lookup
-      // BUT for Calibre books, keep the Calibre UUID since highlights are stored under it
-      // The EPUB's internal ID (like urn:uuid:...) differs from the Calibre UUID
-      if (!isCalibreBook) {
-        const bookMetadataId = book.metadata?.id || book.metadata?.identifier || book.id;
-        if (bookMetadataId && bookMetadataId !== highlightBookId) {
-          console.log('[ServerReader] Updating highlightBookId from', highlightBookId, 'to', bookMetadataId);
-          highlightBookId = bookMetadataId;
-        }
-      } else {
-        // For Calibre books, use the Calibre UUID consistently
-        // This ensures highlights are looked up and stored under the same ID
-        if (calibreBook?.uuid && calibreBook.uuid !== highlightBookId) {
-          console.log('[ServerReader] Using Calibre UUID for highlightBookId:', calibreBook.uuid);
-          highlightBookId = calibreBook.uuid;
-        }
+      // CRITICAL: Use the file path as highlightBookId for consistent highlight storage/lookup.
+      // The highlight service stores highlights under file paths, not internal metadata IDs.
+      // For Calibre books: Use the actual file path (loadedBook.metadata.filePath)
+      // For vault books: Use bookPath
+      // This ensures highlights created in this session match the storage key used by main.ts
+      const filePath = loadedBook.metadata.filePath || bookPath;
+      if (filePath && filePath !== highlightBookId) {
+        console.log('[ServerReader] Using file path for highlightBookId:', filePath);
+        highlightBookId = filePath;
       }
 
       // Load book in renderer
@@ -1639,6 +1637,16 @@
       // Update sidebar with ToC
       updateSidebarToc();
 
+      // Also update ToC when sidebar opens (in case it wasn't open when book loaded)
+      const layoutChangeRef = plugin.app.workspace.on('layout-change', () => {
+        // Debounce: only call if sidebar exists and book is loaded
+        if (book) {
+          updateSidebarToc();
+        }
+      });
+      // Store reference for cleanup
+      (window as any).__amnesiaLayoutChangeRef = layoutChangeRef;
+
       // Build search index in background (non-blocking)
       buildSearchIndex();
     } catch (e) {
@@ -1681,6 +1689,13 @@
 
     // Remove beforeunload handler
     window.removeEventListener('beforeunload', saveProgress);
+
+    // Clean up layout change listener
+    const layoutChangeRef = (window as any).__amnesiaLayoutChangeRef;
+    if (layoutChangeRef) {
+      plugin.app.workspace.offref(layoutChangeRef);
+      delete (window as any).__amnesiaLayoutChangeRef;
+    }
 
     // Clean up auto-scroll
     stopAutoScroll();
@@ -2404,13 +2419,23 @@
   }
 
   // Open book sidebar (new Obsidian ItemView)
-  function openBookSidebar(tab?: SidebarTab) {
-    const activeBookId = isCalibreBook ? calibreBook?.uuid : highlightBookId;
+  async function openBookSidebar(tab?: SidebarTab) {
+    // Use highlightBookId, calibre UUID, or bookPath as fallback for active book ID
+    const activeBookId = highlightBookId || (isCalibreBook ? calibreBook?.uuid : null) || bookPath;
+    console.log('[ServerReader] openBookSidebar:', { tab, activeBookId, bookPath, bookTitle, hasBook: !!book, hasToc: !!book?.toc });
+
     if (tab) {
       sidebarStore.setTab(tab);
     }
-    sidebarStore.setActiveBook(activeBookId || null, bookPath, bookTitle);
-    plugin.activateBookSidebar(activeBookId || undefined, bookPath, bookTitle);
+    sidebarStore.setActiveBook(activeBookId, bookPath, bookTitle);
+    await plugin.activateBookSidebar(activeBookId, bookPath, bookTitle);
+
+    // Update sidebar with ToC data after it's opened
+    // Use setTimeout to ensure sidebar component is mounted
+    setTimeout(() => {
+      updateSidebarToc();
+    }, 100);
+
     showMoreMenu = false;
     if (readerSettings.hapticFeedback) HapticFeedback.light();
   }
@@ -2745,7 +2770,18 @@
 
   // Keyboard handling
   function handleKeydown(event: KeyboardEvent) {
+    // Skip if typing in an input or textarea
     if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+
+    // Skip if this reader's leaf is not the active leaf (prevents event leaking to other panes)
+    if (view && plugin.app.workspace.activeLeaf !== view.leaf) return;
+
+    // Skip if lightbox is open (let lightbox handle its own navigation)
+    if (lightboxOpen) return;
+
+    // Skip navigation keys if any modal/popup is open (let them handle their own events)
+    const isNavigationKey = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', ' '].includes(event.key);
+    if (isNavigationKey && (showSettings || showNotebook || showHighlightPopup || showBookInfo || showMoreMenu)) return;
 
     // Skip if this is a repeat event (key held down)
     if (event.repeat) return;

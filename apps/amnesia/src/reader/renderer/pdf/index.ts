@@ -47,8 +47,20 @@ export type {
   PdfScrollerConfig,
 } from './pdf-scroller';
 
-// Server-based PDF provider (PDF.js deprecated)
+/**
+ * @deprecated Use HybridDocumentProvider from '../hybrid-document-provider' instead.
+ * HybridPdfProvider is being phased out in favor of the unified document provider
+ * that handles both PDF and EPUB formats.
+ *
+ * Migration:
+ * - Replace: createHybridPdfProvider(config) → createHybridDocumentProvider(config)
+ * - Replace: pdfProvider.loadDocument(data) → documentProvider.loadDocument(data)
+ * - Replace: manual adapter creation → documentProvider.createPdfContentAdapter()
+ */
 export { HybridPdfProvider, createHybridPdfProvider } from './hybrid-pdf-provider';
+/**
+ * @deprecated Use HybridDocumentProviderConfig from '../hybrid-document-provider' instead.
+ */
 export type {
   HybridPdfProviderConfig,
   HybridPdfProviderStatus,

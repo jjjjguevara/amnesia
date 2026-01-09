@@ -54,6 +54,8 @@ import { ServerManager, type ServerState } from './server/server-manager';
 
 // PDF WASM Worker Path Configuration
 import { setMuPDFPluginPath } from './reader/renderer/pdf/mupdf-bridge';
+// Document WASM Worker Path Configuration (for unified document provider)
+import { setDocumentPluginPath } from './reader/renderer/document-bridge';
 import { getTelemetry } from './reader/renderer/pdf/pdf-telemetry';
 import { initializeTestHarness } from './reader/renderer/pdf/mcp-test-harness';
 
@@ -135,11 +137,12 @@ export default class AmnesiaPlugin extends Plugin {
 	async onload() {
 		console.log('Loading Amnesia plugin');
 
-		// Configure MuPDF worker path for PDF WASM rendering
-		// Must be done before any PDF operations
+		// Configure WASM worker paths for PDF and document rendering
+		// Must be done before any PDF/document operations
 		const vaultPath = (this.app.vault.adapter as { basePath?: string }).basePath;
 		if (vaultPath) {
 			setMuPDFPluginPath(vaultPath);
+			setDocumentPluginPath(vaultPath);
 		}
 
 		// Initialize PDF telemetry for performance monitoring
@@ -2545,12 +2548,15 @@ export default class AmnesiaPlugin extends Plugin {
 		const bookTitle = readerView.bookTitle || readerView.state?.bookTitle;
 
 		if (bookPath) {
-			// Generate book ID from path (consistent with other parts of the codebase)
-			const bookId = this.generateBookIdFromPath(bookPath);
+			// CRITICAL: Use bookPath as the bookId since that's how highlights are stored.
+			// The highlight service and reader component use the full path as the key,
+			// NOT a hash. Using a hash here caused highlights to disappear when clicking
+			// on book content because the sidebar would look up highlights under the
+			// wrong key (hash vs path).
 			const title = bookTitle || this.extractTitleFromPath(bookPath);
 
 			// Update sidebar store with the new active book
-			sidebarStore.setActiveBook(bookId, bookPath, title);
+			sidebarStore.setActiveBook(bookPath, bookPath, title);
 		}
 	}
 

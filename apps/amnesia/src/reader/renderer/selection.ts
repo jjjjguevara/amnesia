@@ -27,11 +27,12 @@ export type SelectionCallback = (selection: SelectionData) => void;
  *
  * Works with both regular documents and Shadow DOM.
  * For Shadow DOM, listens on the shadow root for events
- * but uses window.getSelection() for the selection API.
+ * and uses shadowRoot.getSelection() for proper selection capture.
  */
 export class SelectionHandler {
   private doc: Document;
   private eventTarget: EventTarget; // Shadow root or document
+  private shadowRoot: ShadowRoot | null = null; // Store shadow root for getSelection()
   private config: RendererConfig;
   private onSelection: SelectionCallback;
 
@@ -56,6 +57,7 @@ export class SelectionHandler {
   ) {
     this.doc = doc;
     this.eventTarget = shadowRoot || doc;
+    this.shadowRoot = shadowRoot || null; // Store for getSelection()
     this.config = config;
     this.onSelection = onSelection;
 
@@ -101,12 +103,37 @@ export class SelectionHandler {
   }
 
   /**
+   * Get selection from the appropriate source.
+   * For Shadow DOM, use shadowRoot.getSelection() which properly captures
+   * selections within the shadow tree. Falls back to window.getSelection().
+   */
+  private getSelection(): Selection | null {
+    // For Shadow DOM, use shadowRoot.getSelection() if available
+    // This is necessary because window.getSelection() doesn't capture
+    // selections within Shadow DOM in most browsers
+    // Note: getSelection() on ShadowRoot is not in standard TS types yet
+    if (this.shadowRoot) {
+      const shadowRootWithSelection = this.shadowRoot as ShadowRoot & {
+        getSelection?: () => Selection | null
+      };
+      if (typeof shadowRootWithSelection.getSelection === 'function') {
+        const shadowSelection = shadowRootWithSelection.getSelection();
+        if (shadowSelection && shadowSelection.toString().trim()) {
+          return shadowSelection;
+        }
+      }
+    }
+    // Fallback to window.getSelection() for regular DOM or if shadow selection is empty
+    return window.getSelection();
+  }
+
+  /**
    * Handle end of selection (mouseup/touchend)
    */
   private handleSelectionEnd(): void {
     console.log('[SelectionHandler] handleSelectionEnd called');
-    // Use window.getSelection() which works with both regular DOM and Shadow DOM
-    const selection = window.getSelection();
+    // Use appropriate selection source (shadowRoot or window)
+    const selection = this.getSelection();
     if (!selection) {
       console.log('[SelectionHandler] No selection');
       return;
@@ -128,7 +155,7 @@ export class SelectionHandler {
    * Handle selection change events
    */
   private handleSelectionChange(): void {
-    const selection = window.getSelection();
+    const selection = this.getSelection();
     if (!selection) {
       this.lastSelection = null;
       return;

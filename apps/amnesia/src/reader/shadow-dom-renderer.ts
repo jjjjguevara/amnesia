@@ -37,7 +37,6 @@ import {
   type Locator,
   type SpineItemContent,
 } from './navigator';
-import { anchorToDOM, reanchorLocators } from './locator';
 import { CSSHighlightManager, isCSSHighlightAPISupported } from './renderer/css-highlights';
 import { SelectionHandler, type SelectionData } from './renderer/selection';
 import { getObsidianThemeColors, isObsidianDarkMode } from './reader-settings';
@@ -275,6 +274,20 @@ export class ShadowDOMRenderer {
         const href = this.book?.spine[spineIndex]?.href || '';
         this.emit('rendered', { spineIndex, href });
         this.reanchorHighlights();
+      })
+    );
+
+    // Chapter visibility changed - re-anchor highlights for newly visible chapters
+    // This is critical for scrolled mode where chapters get virtualized
+    this.navigatorCleanup.push(
+      this.navigator.on('chapterVisible', ({ spineIndex, visible }) => {
+        if (visible) {
+          // Delay to ensure chapter content is fully rendered before anchoring.
+          // Use 200ms to account for DOM rendering time after content injection.
+          // Also do a second pass at 500ms for any late-loading content.
+          setTimeout(() => this.reanchorHighlights(), 200);
+          setTimeout(() => this.reanchorHighlights(), 500);
+        }
       })
     );
 
@@ -695,7 +708,11 @@ export class ShadowDOMRenderer {
     this.reanchorHighlights();
   }
 
-  private async reanchorHighlights(): Promise<void> {
+  /**
+   * Re-anchor stored highlights to the DOM.
+   * @param skipHighlightId - Optional highlight ID to skip (used when navigating to a specific highlight to prevent range mismatch flash)
+   */
+  private async reanchorHighlights(skipHighlightId?: string): Promise<void> {
     if (!this.view || !this.cssHighlights || this.storedHighlights.length === 0) {
       return;
     }
@@ -708,6 +725,15 @@ export class ShadowDOMRenderer {
     // Process highlights one at a time with timeout protection
     for (let i = 0; i < this.storedHighlights.length; i++) {
       const highlight = this.storedHighlights[i];
+
+      // Skip the target highlight if specified OR if we're currently navigating to it
+      // This prevents visual flash from range mismatch between anchorToDOM and findTextRange
+      if ((skipHighlightId && highlight.id === skipHighlightId) ||
+          (this.navigatingToHighlightId && highlight.id === this.navigatingToHighlightId)) {
+        skipped++;
+        continue;
+      }
+
       if (!highlight.text) {
         skipped++;
         continue;
@@ -725,46 +751,16 @@ export class ShadowDOMRenderer {
         continue;
       }
 
-      // Get the href from the spine index
-      const spineItem = this.book?.spine[highlight.spineIndex];
-      const href = spineItem?.href || '';
-
-      // Get text context from selector if available
-      // The selector has textQuote with prefix/suffix for better matching
-      const fallback = highlight.selector?.fallback;
-      const textContext = fallback && fallback.type === 'TextQuoteSelector'
-        ? {
-            highlight: fallback.exact || highlight.text,
-            before: fallback.prefix,
-            after: fallback.suffix,
-          }
-        : { highlight: highlight.text };
-
-      // Create locator from highlight
-      // CFI resolution doesn't work with Shadow DOM (wrapper elements in path),
-      // so we use text-based anchoring with context
-      const locator: Locator = {
-        href,
-        locations: {
-          progression: 0,
-          cfi: highlight.cfi,
-          position: highlight.spineIndex,
-        },
-        // Include text with context for exact match fallback
-        text: textContext,
-      };
-
+      // Use findTextRange for consistency with navigateToHighlight
+      // This ensures all highlights use the same range-finding algorithm
+      // Previously used anchorToDOM which could return different ranges
       try {
-        // Anchor with timeout protection - search within the specific chapter element
-        const result = await Promise.race([
-          anchorToDOM(locator, chapterEl),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), TIMEOUT_MS))
-        ]);
+        const range = this.findTextRange(highlight.text, chapterEl);
 
-        if (result) {
+        if (range) {
           this.cssHighlights.add(
             highlight.id,
-            result.range,
+            range,
             highlight.color as HighlightColor
           );
           anchored++;
@@ -1087,6 +1083,9 @@ export class ShadowDOMRenderer {
       .replace(/^Text\//, '');
   }
 
+  // Track highlight ID being navigated to - prevents chapterVisible from adding it with wrong range
+  private navigatingToHighlightId: string | null = null;
+
   /**
    * Navigate to a highlight by CFI and text.
    * Uses text search to find the exact location within the chapter.
@@ -1112,128 +1111,173 @@ export class ShadowDOMRenderer {
       return;
     }
 
-    // Find the text within the chapter first to check visibility
-    const shadowRoot = this.view.getShadowRoot();
-    let chapterEl = shadowRoot.querySelector(`.epub-chapter[data-spine-index="${spineIndex}"]`);
+    // Find the matching highlight IMMEDIATELY and remove it from CSS highlights
+    // This prevents chapterVisible's reanchorHighlights from adding it with the wrong range
+    const matchingHighlight = this.storedHighlights.find(h =>
+      h.spineIndex === spineIndex && h.text === text && h.color === color
+    );
+    if (matchingHighlight) {
+      this.navigatingToHighlightId = matchingHighlight.id;
+      // Remove immediately to prevent any flash of wrong range
+      this.cssHighlights?.remove(matchingHighlight.id);
+    }
 
-    // Try to find the range in current state (if chapter is loaded)
+    const shadowRoot = this.view.getShadowRoot();
+    const viewportWrapper = this.view.getViewportWrapper();
+    const isPaginatedMode = this.navigator.mode === 'paginated';
+    const scrollContainer = shadowRoot.querySelector('.epub-scroll-container') as HTMLElement | null;
+
+    // Try to find the chapter and range in current state
+    let chapterEl = shadowRoot.querySelector(`.epub-chapter[data-spine-index="${spineIndex}"]`) as HTMLElement | null;
     let range: Range | null = null;
+    let fullHighlightRange: Range | null = null;
     const searchText = text.slice(0, 100);
 
+    // Pre-compute both ranges BEFORE any navigation/fading
     if (chapterEl) {
-      range = this.findTextRange(searchText, chapterEl as HTMLElement);
-
-      // Check if highlight is already visible - skip navigation if so
-      if (range && this.isRangeVisible(range)) {
-        // Just apply blink effect, don't navigate
-        this.highlightTextWithBlink(range, text, color);
-        return;
+      range = this.findTextRange(searchText, chapterEl);
+      if (range && matchingHighlight) {
+        fullHighlightRange = this.findTextRange(matchingHighlight.text, chapterEl);
       }
     }
 
-    // Check if we're in paginated mode for fade transition
-    const isPaginatedMode = this.navigator.mode === 'paginated';
-    const viewportWrapper = this.view.getViewportWrapper();
+    const rangeToUse = fullHighlightRange || range;
 
-    // For paginated mode: fade out FIRST before any navigation
-    // This ensures a smooth fade-in/fade-out transition instead of visible page shifts
-    if (isPaginatedMode && viewportWrapper) {
-      viewportWrapper.style.transition = 'opacity 0.12s ease-out';
-      viewportWrapper.style.opacity = '0';
-      await new Promise(r => setTimeout(r, 120));
+    // CASE 1: Highlight is already visible - just scroll to center and pulse
+    if (range && this.isRangeVisible(range)) {
+      // Add CSS highlight first (ensures persistence)
+      if (matchingHighlight && this.cssHighlights && color && rangeToUse) {
+        this.cssHighlights.add(matchingHighlight.id, rangeToUse.cloneRange(), color);
+      }
+
+      // Smooth scroll to center the highlight (for scrolled mode)
+      if (!isPaginatedMode && scrollContainer) {
+        const rect = range.getBoundingClientRect();
+        const containerRect = scrollContainer.getBoundingClientRect();
+        const targetScrollTop = scrollContainer.scrollTop + (rect.top - containerRect.top) - (containerRect.height / 2) + (rect.height / 2);
+        scrollContainer.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+      }
+
+      // Apply pulse animation (visual effect only, CSS highlight already added)
+      if (rangeToUse) {
+        this.highlightTextWithBlink(rangeToUse, text, color, rangeToUse);
+      }
+
+      this.navigatingToHighlightId = null;
+      return;
     }
 
+    // CASE 2: Highlight not visible - hide, navigate, then fade in
+    const fadeTarget = isPaginatedMode ? viewportWrapper : scrollContainer;
+
+    // Set opacity 0 AND visibility hidden for complete invisibility during navigation
+    if (fadeTarget) {
+      fadeTarget.style.transition = 'none';
+      fadeTarget.style.opacity = '0';
+      fadeTarget.style.visibility = 'hidden';
+    }
+
+    // Force instant scrolling (disable smooth scroll during navigation)
+    const originalScrollBehavior = scrollContainer?.style.scrollBehavior || '';
+    if (scrollContainer) {
+      scrollContainer.style.scrollBehavior = 'auto';
+    }
+
+    // CRITICAL: Wait for hide styles to be painted BEFORE navigation
+    // Without this, goTo() triggers DOM operations that paint before opacity:0 is rendered
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
     // Navigate to the chapter to ensure it's loaded
-    // For paginated mode, this is invisible (faded out)
-    // For scrolled mode, this jumps instantly to let navigateToElement do the directional scroll
     await this.navigator.goTo(
       { type: 'href', href: spineItem.href },
       { instant: true }
     );
 
-    // Wait for content to be ready
-    await new Promise(r => requestAnimationFrame(r));
-    await new Promise(r => setTimeout(r, 50));
-
-    // Re-find the chapter element after navigation
-    chapterEl = shadowRoot.querySelector(`.epub-chapter[data-spine-index="${spineIndex}"]`);
+    // Re-find the chapter element after navigation (may have changed)
+    chapterEl = shadowRoot.querySelector(`.epub-chapter[data-spine-index="${spineIndex}"]`) as HTMLElement | null;
 
     if (!chapterEl) {
       console.warn('[ShadowDOMRenderer] Chapter element not found for spine index:', spineIndex);
-      // Restore opacity if we faded out
-      if (isPaginatedMode && viewportWrapper) {
-        viewportWrapper.style.transition = 'opacity 0.15s ease-in';
-        viewportWrapper.style.opacity = '1';
-        await new Promise(r => setTimeout(r, 150));
-        viewportWrapper.style.transition = '';
-        viewportWrapper.style.opacity = '';
+      if (fadeTarget) {
+        fadeTarget.style.transition = '';
+        fadeTarget.style.opacity = '';
+        fadeTarget.style.visibility = '';
       }
+      this.navigatingToHighlightId = null;
       return;
     }
 
-    // Search for the text again if needed
-    if (!range) {
-      range = this.findTextRange(searchText, chapterEl as HTMLElement);
+    // Re-find range if chapter element changed or wasn't found before
+    if (!range || !chapterEl.contains(range.commonAncestorContainer)) {
+      range = this.findTextRange(searchText, chapterEl);
+      if (range && matchingHighlight) {
+        fullHighlightRange = this.findTextRange(matchingHighlight.text, chapterEl);
+      }
     }
 
     if (!range) {
       console.warn('[ShadowDOMRenderer] Text not found in chapter:', searchText.slice(0, 30));
-      // Restore opacity if we faded out
-      if (isPaginatedMode && viewportWrapper) {
-        viewportWrapper.style.transition = 'opacity 0.15s ease-in';
-        viewportWrapper.style.opacity = '1';
-        await new Promise(r => setTimeout(r, 150));
-        viewportWrapper.style.transition = '';
-        viewportWrapper.style.opacity = '';
+      if (fadeTarget) {
+        fadeTarget.style.transition = '';
+        fadeTarget.style.opacity = '';
+        fadeTarget.style.visibility = '';
       }
+      this.navigatingToHighlightId = null;
       return;
     }
 
-    // Navigate to the column containing the text element
+    const finalRange = fullHighlightRange || range;
+
+    // For paginated mode, navigate while hidden
     const targetElement = range.commonAncestorContainer.parentElement;
-    if (targetElement) {
-      if (isPaginatedMode) {
-        // Paginated mode: navigate instantly (we're already faded out), then fade in
-        await this.navigator.navigateToElement(targetElement, spineIndex, { instant: true });
-
-        // Small delay to ensure transform is applied
-        await new Promise(r => setTimeout(r, 30));
-
-        // Fade in
-        viewportWrapper.style.transition = 'opacity 0.18s ease-in';
-        viewportWrapper.style.opacity = '1';
-        await new Promise(r => setTimeout(r, 180));
-
-        // Clean up
-        viewportWrapper.style.transition = '';
-        viewportWrapper.style.opacity = '';
-      } else {
-        // Scrolled mode: use animated navigation with directional indicator
-        await this.navigator.navigateToElement(targetElement, spineIndex, { instant: false });
-
-        // Wait for scroll animation to complete
-        await new Promise(r => setTimeout(r, 400));
-      }
-
-      // Re-anchor highlights after navigation to ensure they're visible
-      await this.reanchorHighlights();
-
-      // Re-query the chapter element as it may have been replaced during navigation
-      const freshChapterEl = shadowRoot.querySelector(`.epub-chapter[data-spine-index="${spineIndex}"]`);
-      if (!freshChapterEl) {
-        console.warn('[ShadowDOMRenderer] Chapter element not found after navigation');
-        return;
-      }
-
-      // Re-find the range in the fresh chapter element
-      const freshRange = this.findTextRange(searchText, freshChapterEl as HTMLElement);
-
-      if (freshRange) {
-        this.highlightTextWithBlink(freshRange, text, color);
-      } else {
-        console.warn('[ShadowDOMRenderer] Could not find text after navigation');
-      }
+    if (isPaginatedMode && targetElement) {
+      await this.navigator.navigateToElement(targetElement, spineIndex, { instant: true });
     }
+
+    // Add CSS highlight (while still hidden) - ensures persistence
+    if (matchingHighlight && this.cssHighlights && color) {
+      this.cssHighlights.add(matchingHighlight.id, finalRange.cloneRange(), color);
+    }
+
+    // Restore visibility but keep opacity 0 - needed for accurate getBoundingClientRect
+    if (fadeTarget) {
+      fadeTarget.style.visibility = '';
+    }
+
+    // Wait for layout with visibility restored
+    await new Promise(r => requestAnimationFrame(r));
+
+    // For scrolled mode, now calculate and set scroll position (visibility restored, opacity still 0)
+    if (!isPaginatedMode && scrollContainer && targetElement) {
+      const rect = range.getBoundingClientRect();
+      const containerRect = scrollContainer.getBoundingClientRect();
+      const targetScrollTop = scrollContainer.scrollTop + (rect.top - containerRect.top) - (containerRect.height / 2) + (rect.height / 2);
+      scrollContainer.scrollTop = targetScrollTop;
+      // Wait for scroll to be painted
+      await new Promise(r => requestAnimationFrame(r));
+    }
+
+    // Now fade in
+    if (fadeTarget) {
+      fadeTarget.style.transition = 'opacity 0.15s ease-in';
+      fadeTarget.style.opacity = '1';
+      await new Promise(r => setTimeout(r, 150));
+      fadeTarget.style.transition = '';
+      fadeTarget.style.opacity = '';
+    }
+
+    // Restore original scroll behavior
+    if (scrollContainer) {
+      scrollContainer.style.scrollBehavior = originalScrollBehavior;
+    }
+
+    // Start pulse animation AFTER fade-in (visual effect only, CSS highlight already added)
+    this.highlightTextWithBlink(finalRange, text, color, finalRange);
+
+    // Re-anchor OTHER highlights in background
+    this.reanchorHighlights().then(() => {
+      this.navigatingToHighlightId = null;
+    });
   }
 
   /**
@@ -1373,27 +1417,34 @@ export class ShadowDOMRenderer {
   }
 
   /**
-   * Highlight color mapping for blink animation
+   * Highlight color mapping for blink animation.
+   * IMPORTANT: Must match opacity values in css-highlights.ts (0.5/50%)
+   * to prevent duplicate/layered visual effect when both are visible.
    */
   private readonly BLINK_COLORS: Record<HighlightColor, string> = {
-    yellow: 'rgba(254, 243, 199, 0.8)',
-    green: 'rgba(187, 247, 208, 0.8)',
-    blue: 'rgba(191, 219, 254, 0.8)',
-    pink: 'rgba(251, 207, 232, 0.8)',
-    purple: 'rgba(221, 214, 254, 0.8)',
-    orange: 'rgba(254, 215, 170, 0.8)',
+    yellow: 'rgba(254, 243, 199, 0.5)',
+    green: 'rgba(187, 247, 208, 0.5)',
+    blue: 'rgba(191, 219, 254, 0.5)',
+    pink: 'rgba(251, 207, 232, 0.5)',
+    purple: 'rgba(221, 214, 254, 0.5)',
+    orange: 'rgba(254, 215, 170, 0.5)',
   };
 
   /**
    * Highlight text with blink animation using the highlight's color.
    * For highlights: Uses the actual highlight color to span the full text.
    * For other elements (links, headings): Uses the accent color.
+   *
+   * @param range - The base range to animate
+   * @param fullText - Optional full text (used as fallback for range finding)
+   * @param color - Highlight color for blink effect
+   * @param precomputedRange - Optional pre-computed range to use directly (avoids re-finding)
    */
-  private highlightTextWithBlink(range: Range, fullText?: string, color?: HighlightColor): void {
+  private highlightTextWithBlink(range: Range, fullText?: string, color?: HighlightColor, precomputedRange?: Range): void {
     try {
       // For highlights with color, create a custom blink effect
       if (color && this.BLINK_COLORS[color]) {
-        this.applyHighlightBlink(range, fullText, color);
+        this.applyHighlightBlink(range, fullText, color, precomputedRange);
         return;
       }
 
@@ -1424,41 +1475,92 @@ export class ShadowDOMRenderer {
   /**
    * Apply blink animation for highlights with their specific color.
    * Creates an overlay that pulses with the highlight color.
+   *
+   * In scrolled mode: Uses position: absolute within scroll container so
+   * the overlay scrolls with content (prevents floating/stuck overlays).
+   * In paginated mode: Uses position: fixed for viewport-relative overlay.
+   *
+   * Note: CSS highlight should already be added before calling this method.
+   * This just provides the visual pulse effect.
+   *
+   * @param range - Base range (used as fallback)
+   * @param fullText - Full text (used for fallback range finding)
+   * @param color - Highlight color
+   * @param precomputedRange - Optional pre-computed range (used directly if provided)
    */
-  private applyHighlightBlink(range: Range, fullText?: string, color?: HighlightColor): void {
+  private applyHighlightBlink(range: Range, fullText?: string, color?: HighlightColor, precomputedRange?: Range): void {
     if (!this.view || !color) return;
 
     const blinkColor = this.BLINK_COLORS[color] || this.BLINK_COLORS.yellow;
 
-    // Try to expand range to full highlight text if provided
-    let targetRange = range;
-    if (fullText && fullText.length > 100) {
-      // Find the full text range
+    // Use precomputed range if provided, otherwise try to find it
+    let targetRange: Range;
+    if (precomputedRange) {
+      // Use the exact same range as the CSS highlight - no re-finding needed
+      targetRange = precomputedRange;
+    } else if (fullText && fullText.length > 100) {
+      // Fallback: Try to find the full text range
       const container = range.commonAncestorContainer.parentElement;
       if (container) {
         const fullRange = this.findTextRange(fullText, container);
-        if (fullRange) {
-          targetRange = fullRange;
-        }
+        targetRange = fullRange || range;
+      } else {
+        targetRange = range;
       }
+    } else {
+      targetRange = range;
     }
 
     // Get all client rects for the range (handles multi-line highlights)
     const rects = Array.from(targetRange.getClientRects());
     if (rects.length === 0) return;
 
+    // Check if we're in scrolled mode by looking for scroll container
+    const shadowRoot = this.view.getShadowRoot();
+    const scrollContainer = shadowRoot?.querySelector('.epub-scroll-container') as HTMLElement | null;
+    const isScrolledMode = !!scrollContainer;
+
+    // Get scroll offset and container position for coordinate adjustment
+    let scrollOffsetX = 0;
+    let scrollOffsetY = 0;
+    let containerOffsetX = 0;
+    let containerOffsetY = 0;
+
+    if (isScrolledMode && scrollContainer) {
+      scrollOffsetX = scrollContainer.scrollLeft;
+      scrollOffsetY = scrollContainer.scrollTop;
+      const containerRect = scrollContainer.getBoundingClientRect();
+      containerOffsetX = containerRect.left;
+      containerOffsetY = containerRect.top;
+    }
+
     // Create overlay container
     const overlayContainer = document.createElement('div');
     overlayContainer.className = 'highlight-blink-overlay';
-    overlayContainer.style.cssText = `
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      z-index: 9999;
-    `;
+
+    if (isScrolledMode) {
+      // Scrolled mode: Use absolute positioning within scroll container
+      overlayContainer.style.cssText = `
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 9999;
+      `;
+    } else {
+      // Paginated mode: Use fixed positioning for viewport overlay
+      overlayContainer.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 9999;
+      `;
+    }
 
     // Create blink rectangles for each line of the highlight
     for (const rect of rects) {
@@ -1466,30 +1568,122 @@ export class ShadowDOMRenderer {
 
       const blinkRect = document.createElement('div');
       blinkRect.className = 'highlight-blink-rect';
-      blinkRect.style.cssText = `
-        position: fixed;
-        top: ${rect.top}px;
-        left: ${rect.left}px;
-        width: ${rect.width}px;
-        height: ${rect.height}px;
-        background-color: ${blinkColor};
-        border-radius: 2px;
-        animation: highlight-glow-fade 2.5s ease-in-out forwards;
-        pointer-events: none;
-      `;
+
+      if (isScrolledMode) {
+        // Convert viewport coords to scroll-container coords
+        // rect.top/left are viewport-relative from getClientRects()
+        // We need scroll-container-relative + scroll offset
+        const absoluteTop = rect.top - containerOffsetY + scrollOffsetY;
+        const absoluteLeft = rect.left - containerOffsetX + scrollOffsetX;
+
+        blinkRect.style.cssText = `
+          position: absolute;
+          top: ${absoluteTop}px;
+          left: ${absoluteLeft}px;
+          width: ${rect.width}px;
+          height: ${rect.height}px;
+          background-color: ${blinkColor};
+          border-radius: 2px;
+          animation: highlight-pulse 1.3s ease-in-out forwards;
+          pointer-events: none;
+        `;
+      } else {
+        // Paginated mode: Use viewport coords directly
+        blinkRect.style.cssText = `
+          position: fixed;
+          top: ${rect.top}px;
+          left: ${rect.left}px;
+          width: ${rect.width}px;
+          height: ${rect.height}px;
+          background-color: ${blinkColor};
+          border-radius: 2px;
+          animation: highlight-pulse 1.3s ease-in-out forwards;
+          pointer-events: none;
+        `;
+      }
       overlayContainer.appendChild(blinkRect);
     }
 
-    // Add keyframes to document head (not shadow root) for proper animation
-    this.ensureBlinkKeyframesInDocument();
+    // Add keyframes - in scrolled mode add to scroll container, otherwise document
+    if (isScrolledMode && scrollContainer) {
+      this.ensureBlinkKeyframesInScrollContainer(scrollContainer);
+      scrollContainer.appendChild(overlayContainer);
+    } else {
+      this.ensureBlinkKeyframesInDocument();
+      document.body.appendChild(overlayContainer);
+    }
 
-    // Add to document body (not shadow root) so fixed positioning works correctly
-    document.body.appendChild(overlayContainer);
+    // Track scroll ignore timeout for cleanup
+    let scrollIgnoreTimeout: ReturnType<typeof setTimeout> | null = null;
 
-    // Remove after animation completes (2.5s glow-fade animation)
-    setTimeout(() => {
+    // Cleanup function for removing overlay and event listeners
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+
       overlayContainer.remove();
-    }, 2600);
+
+      if (scrollCleanupHandler) {
+        scrollContainer?.removeEventListener('scroll', scrollCleanupHandler);
+      }
+      // Clear the ignore timeout if still pending (prevents memory leak)
+      if (scrollIgnoreTimeout !== null) {
+        clearTimeout(scrollIgnoreTimeout);
+        scrollIgnoreTimeout = null;
+      }
+    };
+
+    // In scrolled mode: add scroll listener to cancel blink if user scrolls
+    // This prevents the overlay from becoming stale/misaligned during user interaction
+    let scrollCleanupHandler: ((event: Event) => void) | null = null;
+    if (isScrolledMode && scrollContainer) {
+      // Small debounce to ignore the initial scroll that brought us here
+      scrollIgnoreTimeout = setTimeout(() => {
+        scrollIgnoreTimeout = null;
+      }, 100);
+
+      scrollCleanupHandler = () => {
+        // Ignore scroll events within first 100ms (from navigation)
+        if (scrollIgnoreTimeout !== null) return;
+        // User scrolled during animation - clean up immediately
+        cleanup();
+      };
+      scrollContainer.addEventListener('scroll', scrollCleanupHandler, { passive: true });
+    }
+
+    // Remove after animation completes (1.3s animation + small buffer)
+    setTimeout(cleanup, 1400);
+  }
+
+  /**
+   * Pulse animation keyframes CSS.
+   * CSS highlight is visible underneath. Overlay pulses to create attention effect.
+   * Pattern: 0.5 → 0 → 0.5 → 0 → 0.5 → 0.5 (ends matching CSS highlight)
+   * Duration: 1.3s
+   */
+  private readonly PULSE_KEYFRAMES = `
+    @keyframes highlight-pulse {
+      0% { opacity: 0.5; }
+      20% { opacity: 0; }
+      40% { opacity: 0.5; }
+      60% { opacity: 0; }
+      80% { opacity: 0.5; }
+      100% { opacity: 0.5; }
+    }
+  `;
+
+  /**
+   * Ensure the blink keyframes are added to the scroll container
+   */
+  private ensureBlinkKeyframesInScrollContainer(scrollContainer: HTMLElement): void {
+    const existingStyle = scrollContainer.querySelector('#highlight-blink-keyframes-scroll');
+    if (existingStyle) return;
+
+    const style = document.createElement('style');
+    style.id = 'highlight-blink-keyframes-scroll';
+    style.textContent = this.PULSE_KEYFRAMES;
+    scrollContainer.appendChild(style);
   }
 
   /**
@@ -1501,14 +1695,7 @@ export class ShadowDOMRenderer {
 
     const style = document.createElement('style');
     style.id = 'highlight-blink-keyframes';
-    style.textContent = `
-      @keyframes highlight-glow-fade {
-        0% { opacity: 0; }
-        10% { opacity: 0.85; }
-        40% { opacity: 0.85; }
-        100% { opacity: 0; }
-      }
-    `;
+    style.textContent = this.PULSE_KEYFRAMES;
     shadowRoot.appendChild(style);
   }
 
@@ -1522,14 +1709,7 @@ export class ShadowDOMRenderer {
 
     const style = document.createElement('style');
     style.id = 'highlight-blink-keyframes-global';
-    style.textContent = `
-      @keyframes highlight-glow-fade {
-        0% { opacity: 0; }
-        10% { opacity: 0.85; }
-        40% { opacity: 0.85; }
-        100% { opacity: 0; }
-      }
-    `;
+    style.textContent = this.PULSE_KEYFRAMES;
     document.head.appendChild(style);
   }
 

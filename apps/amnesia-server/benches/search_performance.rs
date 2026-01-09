@@ -84,19 +84,29 @@ fn create_multipage_pdf(page_count: usize) -> Vec<u8> {
 
 /// Benchmark text search on a PDF
 fn bench_pdf_search(c: &mut Criterion) {
-    // Note: This benchmark uses the minimal PDF which has limited text content.
-    // For real-world benchmarks, use actual PDF files with substantial text.
-
     let mut group = c.benchmark_group("pdf_search");
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(50);
 
-    // Benchmark search on minimal PDF
-    let pdf_data = create_minimal_pdf_with_text();
+    // Benchmark search on 100-page PDF per target requirement (<500ms)
+    let pdf_data_100 = create_multipage_pdf(100);
+
+    group.bench_function("search_100_pages", |b| {
+        let parser =
+            PdfParser::from_bytes(&pdf_data_100, "bench-search-100".to_string()).unwrap();
+
+        b.iter(|| {
+            let results = parser.search(black_box("benchmark"), 10);
+            black_box(results)
+        })
+    });
+
+    // Also benchmark single page for comparison
+    let pdf_data_1 = create_minimal_pdf_with_text();
 
     group.bench_function("search_single_page", |b| {
         let parser =
-            PdfParser::from_bytes(&pdf_data, "bench-search".to_string()).unwrap();
+            PdfParser::from_bytes(&pdf_data_1, "bench-search-1".to_string()).unwrap();
 
         b.iter(|| {
             let results = parser.search(black_box("benchmark"), 10);
@@ -151,11 +161,12 @@ fn bench_text_extraction(c: &mut Criterion) {
     let mut group = c.benchmark_group("text_extraction");
     group.measurement_time(Duration::from_secs(10));
 
-    group.bench_function("extract_text_page_0", |b| {
+    group.bench_function("extract_text_page_1", |b| {
         let parser =
             PdfParser::from_bytes(&pdf_data, "bench-text".to_string()).unwrap();
 
         b.iter(|| {
+            // get_text_layer uses 1-indexed page numbers
             let text = parser.get_text_layer(black_box(1));
             black_box(text)
         })

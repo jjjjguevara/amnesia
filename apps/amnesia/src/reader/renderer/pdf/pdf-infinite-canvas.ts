@@ -275,8 +275,6 @@ export class PdfInfiniteCanvas {
       bottom: 0;
       overflow: hidden;
       touch-action: none;
-      user-select: none;
-      -webkit-user-select: none;
     `;
     this.container.appendChild(this.viewport);
 
@@ -2054,6 +2052,8 @@ export class PdfInfiniteCanvas {
     this.panStartCamera = { ...this.camera };
     this.viewport.setPointerCapture(e.pointerId);
     this.viewport.style.cursor = 'grabbing';
+    // Disable text selection during pan to prevent accidental selection
+    this.viewport.style.userSelect = 'none';
   }
 
   private handlePointerMove(e: PointerEvent): void {
@@ -2122,6 +2122,8 @@ export class PdfInfiniteCanvas {
     this.panStartCamera = null;
     this.viewport.releasePointerCapture(e.pointerId);
     this.viewport.style.cursor = '';
+    // Re-enable text selection after pan completes
+    this.viewport.style.userSelect = '';
 
     // Update current page based on what's visible
     this.updateCurrentPage();

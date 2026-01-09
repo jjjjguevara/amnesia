@@ -181,6 +181,13 @@ export { WasmBookProvider } from './wasm-provider';
 export { HybridBookProvider, createHybridProvider } from './hybrid-provider';
 export type { HybridProviderConfig, ProviderMode } from './hybrid-provider';
 export { ProviderAdapter, createProviderAdapter } from './provider-adapter';
+// Unified Document Provider (PDF + EPUB)
+export {
+  HybridDocumentProvider,
+  createHybridDocumentProvider,
+  destroySharedResources,
+} from './hybrid-document-provider';
+export type { HybridDocumentProviderConfig, RenderOptions, TileRenderOptions } from './hybrid-document-provider';
 
 // PDF Renderer (server-based, PDF.js deprecated)
 export {

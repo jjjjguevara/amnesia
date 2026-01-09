@@ -219,6 +219,59 @@ self.addEventListener('message', function initHandler(event) {
   console.warn("   WASM PDF rendering will fall back to server-side rendering.");
 }
 
+// Build Document worker as separate bundle (unified PDF/EPUB provider)
+console.log("📦 Building Document worker...");
+try {
+  await esbuild.build({
+    entryPoints: ["src/reader/renderer/document-worker.ts"],
+    bundle: true,
+    format: "esm",
+    target: "esnext",
+    outfile: path.join(pluginDir, "document-worker.js"),
+    minify: prod,
+    sourcemap: false,
+    platform: "browser",
+    conditions: ["browser", "worker"],
+    external: ["node:fs", "node:path", "fs", "path", "module"],
+    define: {
+      "process.env.NODE_ENV": prod ? '"production"' : '"development"',
+    },
+    banner: {
+      js: `
+// Shim browser environment for document worker
+if (typeof window === 'undefined') {
+  globalThis.window = self;
+}
+globalThis.process = { env: {}, versions: {} };
+
+// Configure MuPDF WASM loading
+globalThis.$libmupdf_wasm_Module = {
+  wasmBinary: null,
+  locateFile: function(filename) {
+    console.warn('[Document Worker] locateFile called, but wasmBinary should be provided');
+    return filename;
+  }
+};
+
+// Wait for WASM binary from main thread
+let wasmBinaryResolve = null;
+globalThis.__MUPDF_WASM_READY__ = new Promise(resolve => { wasmBinaryResolve = resolve; });
+self.addEventListener('message', function initHandler(event) {
+  if (event.data && event.data.type === 'INIT_WASM' && event.data.wasmBinary) {
+    globalThis.$libmupdf_wasm_Module.wasmBinary = event.data.wasmBinary;
+    wasmBinaryResolve();
+    self.removeEventListener('message', initHandler);
+  }
+}, { once: false });
+`,
+    },
+  });
+  console.log("✅ Document worker built");
+} catch (error) {
+  console.warn("⚠️  Document worker build failed:", error.message);
+  console.warn("   Unified document provider will fall back to server-side rendering.");
+}
+
 const context = await esbuild.context({
   banner: {
     js: banner,

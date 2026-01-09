@@ -26,6 +26,10 @@
 import { ApiClient, getApiClient } from './api-client';
 import { DocumentBridge, getSharedDocumentBridge, destroySharedDocumentBridge } from './document-bridge';
 import type { ParsedDocument, StructuredText, SearchResult, DocumentFormat } from './document-worker';
+import { getTileEngine, type TileCoordinate } from './pdf/tile-render-engine';
+import { getRenderCoordinator, type RenderCoordinator } from './pdf/render-coordinator';
+import type { ParsedPdf, PdfTextLayerData, TocEntry } from './types';
+import type { PdfContentProvider } from './pdf/pdf-renderer';
 
 // ============================================================================
 // Types
@@ -199,6 +203,9 @@ export class HybridDocumentProvider {
   private isPrefetching = false;
   private isDestroyed = false;
 
+  // RenderCoordinator for PDF tile management (Phase 1: HybridPdfProvider migration)
+  private renderCoordinator: RenderCoordinator | null = null;
+
   constructor(config: HybridDocumentProviderConfig = {}) {
     this.config = {
       serverBaseUrl: config.serverBaseUrl ?? '',
@@ -340,6 +347,22 @@ export class HybridDocumentProvider {
           // Wait for WASM load to complete
           await wasmLoadPromise;
 
+          // Set up TileEngine for PDF documents (non-blocking)
+          if (this.parsedDocument.format === 'pdf') {
+            this.setupTileEngine().catch((err) => {
+              console.warn('[HybridDocumentProvider] TileEngine setup failed:', err);
+            });
+            // Set up RenderCoordinator if it was already created before document load
+            if (this.renderCoordinator) {
+              this.setupRenderCoordinator();
+            }
+          }
+
+          // Start background thumbnail generation (non-blocking)
+          this.generateThumbnails(this.parsedDocument.itemCount).catch((err) => {
+            console.warn('[HybridDocumentProvider] Thumbnail generation failed:', err);
+          });
+
           return this.parsedDocument;
         }
       } catch (error) {
@@ -353,6 +376,23 @@ export class HybridDocumentProvider {
       this.parsedDocument = wasmResult.document;
       this.wasmDocumentId = wasmResult.id;
       this.documentId = wasmResult.id;
+
+      // Set up TileEngine for PDF documents (non-blocking)
+      if (this.parsedDocument.format === 'pdf') {
+        this.setupTileEngine().catch((err) => {
+          console.warn('[HybridDocumentProvider] TileEngine setup failed:', err);
+        });
+        // Set up RenderCoordinator if it was already created before document load
+        if (this.renderCoordinator) {
+          this.setupRenderCoordinator();
+        }
+      }
+
+      // Start background thumbnail generation (non-blocking)
+      this.generateThumbnails(this.parsedDocument.itemCount).catch((err) => {
+        console.warn('[HybridDocumentProvider] Thumbnail generation failed:', err);
+      });
+
       return this.parsedDocument;
     }
 
@@ -612,6 +652,335 @@ export class HybridDocumentProvider {
   }
 
   // ============================================================================
+  // Thumbnail Generation
+  // ============================================================================
+
+  /** Thumbnail scale factor (low-DPI for fast loading) */
+  private static readonly THUMBNAIL_SCALE = 0.5; // 72 DPI equivalent
+
+  /** Track if thumbnail generation is in progress */
+  private isGeneratingThumbnails = false;
+
+  /**
+   * Generate thumbnails for all items in the background.
+   * Uses a two-phase approach for perceived instant document open:
+   *
+   * Phase 1: First 20 items with minimal delay (critical for initial view)
+   * Phase 2: Remaining items with yields to avoid UI blocking
+   *
+   * Benefits:
+   * - Thumbnails are cached and available instantly when items come into view
+   * - Never shows blank content - thumbnail is displayed while full-res loads
+   * - First 20 items load fast for immediate perceived responsiveness
+   * - Batched processing prevents memory spikes
+   */
+  async generateThumbnails(itemCount?: number): Promise<void> {
+    if (this.isGeneratingThumbnails) {
+      console.log('[HybridDocumentProvider] Thumbnail generation already in progress');
+      return;
+    }
+
+    const docId = this.documentId ?? this.wasmDocumentId;
+    const count = itemCount ?? this.getItemCount();
+
+    if (!docId || count === 0) {
+      console.warn('[HybridDocumentProvider] Cannot generate thumbnails - no document loaded');
+      return;
+    }
+
+    this.isGeneratingThumbnails = true;
+    const startTime = performance.now();
+
+    // Two-phase thumbnail generation
+    const IMMEDIATE_BATCH = 20; // First 20 for instant perceived load
+    const BACKGROUND_BATCH = 5; // Rest in smaller batches with yields
+    const thumbnailScale = HybridDocumentProvider.THUMBNAIL_SCALE;
+
+    try {
+      let generated = 0;
+
+      // PHASE 1: First batch without yields for immediate availability
+      if (count > 0) {
+        const phase1End = Math.min(IMMEDIATE_BATCH, count);
+        await Promise.all(
+          Array.from({ length: phase1End }, (_, i) => i).map(async (item) => {
+            // Skip if already cached
+            const isCached = await this.cache.has(docId, item, thumbnailScale);
+            if (isCached) return;
+
+            try {
+              await this.renderItem(item, { scale: thumbnailScale });
+              generated++;
+            } catch (err) {
+              console.warn(`[HybridDocumentProvider] Thumbnail failed for item ${item}:`, err);
+            }
+          })
+        );
+        console.log(
+          `[HybridDocumentProvider] Phase 1 complete: ${generated} thumbnails in ${(performance.now() - startTime).toFixed(0)}ms`
+        );
+      }
+
+      // PHASE 2: Remaining items with yields to avoid UI blocking
+      for (let i = IMMEDIATE_BATCH; i < count; i += BACKGROUND_BATCH) {
+        // Check if we should stop (e.g., document changed)
+        const currentDocId = this.documentId ?? this.wasmDocumentId;
+        if (this.isDestroyed || currentDocId !== docId) {
+          console.log('[HybridDocumentProvider] Stopping thumbnail generation - document changed');
+          break;
+        }
+
+        const batchEnd = Math.min(i + BACKGROUND_BATCH, count);
+        const batch: number[] = [];
+
+        // Build batch of items that need thumbnails
+        for (let item = i; item < batchEnd; item++) {
+          const isCached = await this.cache.has(docId, item, thumbnailScale);
+          if (!isCached) {
+            batch.push(item);
+          }
+        }
+
+        // Render batch
+        for (const item of batch) {
+          try {
+            await this.renderItem(item, { scale: thumbnailScale });
+            generated++;
+          } catch (err) {
+            console.warn(`[HybridDocumentProvider] Thumbnail failed for item ${item}:`, err);
+          }
+        }
+
+        // Yield to UI thread
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      console.log(
+        `[HybridDocumentProvider] Thumbnail generation complete: ${generated} thumbnails in ${(performance.now() - startTime).toFixed(0)}ms`
+      );
+    } finally {
+      this.isGeneratingThumbnails = false;
+    }
+  }
+
+  /**
+   * Get a thumbnail for an item (low-scale cached version)
+   * Returns null if thumbnail not yet generated
+   */
+  async getThumbnail(itemIndex: number): Promise<Blob | null> {
+    const docId = this.documentId ?? this.wasmDocumentId;
+    if (!docId) return null;
+
+    return this.cache.get(docId, itemIndex, HybridDocumentProvider.THUMBNAIL_SCALE);
+  }
+
+  /**
+   * Check if a thumbnail exists for an item
+   */
+  async hasThumbnail(itemIndex: number): Promise<boolean> {
+    const docId = this.documentId ?? this.wasmDocumentId;
+    if (!docId) return false;
+
+    return this.cache.has(docId, itemIndex, HybridDocumentProvider.THUMBNAIL_SCALE);
+  }
+
+  /**
+   * Render with dual-resolution strategy (never show blank).
+   * Returns the best available cached version immediately,
+   * with an optional upgrade promise for full quality.
+   *
+   * @param itemIndex Item to render (0-indexed)
+   * @param options Render options
+   * @returns Initial blob to display + optional upgrade promise
+   */
+  async renderItemWithFallback(
+    itemIndex: number,
+    options?: RenderOptions
+  ): Promise<{
+    initial: Blob;
+    initialScale: number;
+    isFullQuality: boolean;
+    upgradePromise?: Promise<Blob>;
+  }> {
+    const docId = this.documentId ?? this.wasmDocumentId;
+    if (!docId) {
+      throw new Error('No document loaded');
+    }
+
+    const requestedScale = options?.scale ?? 1.5;
+    const thumbnailScale = HybridDocumentProvider.THUMBNAIL_SCALE;
+
+    // 1. Check if we have full quality cached
+    const fullCached = await this.cache.get(docId, itemIndex, requestedScale);
+    if (fullCached) {
+      return {
+        initial: fullCached,
+        initialScale: requestedScale,
+        isFullQuality: true,
+      };
+    }
+
+    // 2. Check if we have thumbnail cached
+    const thumbnailCached = await this.cache.get(docId, itemIndex, thumbnailScale);
+    if (thumbnailCached) {
+      // Thumbnail exists - return it and start full fetch
+      const upgradePromise = this.renderItem(itemIndex, options);
+      return {
+        initial: thumbnailCached,
+        initialScale: thumbnailScale,
+        isFullQuality: false,
+        upgradePromise,
+      };
+    }
+
+    // 3. Nothing cached - fetch thumbnail first for speed
+    try {
+      const thumbnail = await this.renderItem(itemIndex, { scale: thumbnailScale });
+      const upgradePromise = this.renderItem(itemIndex, options);
+      return {
+        initial: thumbnail,
+        initialScale: thumbnailScale,
+        isFullQuality: false,
+        upgradePromise,
+      };
+    } catch {
+      // If thumbnail fails, just fetch full directly
+      const fullBlob = await this.renderItem(itemIndex, options);
+      return {
+        initial: fullBlob,
+        initialScale: requestedScale,
+        isFullQuality: true,
+      };
+    }
+  }
+
+  // ============================================================================
+  // TileEngine Integration (PDF-specific)
+  // ============================================================================
+
+  /**
+   * Get page dimensions map for TileEngine setup (PDF only)
+   */
+  async getPageDimensionsMap(): Promise<Map<number, { width: number; height: number }>> {
+    const dimensionsMap = new Map<number, { width: number; height: number }>();
+    const itemCount = this.getItemCount();
+
+    for (let i = 0; i < itemCount; i++) {
+      const dims = await this.getItemDimensions(i);
+      // TileEngine uses 1-indexed pages
+      dimensionsMap.set(i + 1, dims);
+    }
+
+    return dimensionsMap;
+  }
+
+  /**
+   * Get document ID for TileEngine
+   */
+  getDocumentId(): string | null {
+    return this.documentId ?? this.wasmDocumentId;
+  }
+
+  /**
+   * Set up the TileEngine for PDF rendering.
+   * Configures the shared TileEngine with document info and render callback.
+   * Should be called after loading a PDF document.
+   */
+  async setupTileEngine(): Promise<void> {
+    const docId = this.documentId ?? this.wasmDocumentId;
+    const format = this.getFormat();
+
+    if (!docId || format !== 'pdf') {
+      console.log('[HybridDocumentProvider] TileEngine setup skipped - not a PDF document');
+      return;
+    }
+
+    const pageCount = this.getItemCount();
+    if (pageCount === 0) {
+      console.warn('[HybridDocumentProvider] TileEngine setup skipped - no pages');
+      return;
+    }
+
+    // Get page dimensions for all pages
+    const pageDimensions = await this.getPageDimensionsMap();
+
+    // Configure the shared TileEngine
+    const tileEngine = getTileEngine();
+    tileEngine.setDocument(docId, pageCount, pageDimensions);
+    tileEngine.setRenderCallback(async (tile: TileCoordinate, _docId: string) => {
+      // Convert TileCoordinate to our renderTile format (0-indexed itemIndex)
+      const itemIndex = tile.page - 1; // TileEngine uses 1-indexed pages
+      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+    });
+
+    console.log(`[HybridDocumentProvider] TileEngine configured for ${pageCount} pages`);
+  }
+
+  /**
+   * Create a tile render callback for external use (e.g., PdfRenderer).
+   * Returns a callback function compatible with TileEngine.
+   */
+  createTileRenderCallback(): (tile: TileCoordinate, docId: string) => Promise<Blob> {
+    return async (tile: TileCoordinate, _docId: string): Promise<Blob> => {
+      const itemIndex = tile.page - 1; // TileEngine uses 1-indexed pages
+      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+    };
+  }
+
+  // ============================================================================
+  // RenderCoordinator Integration (Phase 1: HybridPdfProvider migration)
+  // ============================================================================
+
+  /**
+   * Get the RenderCoordinator for PDF tile management.
+   * Lazily initializes the coordinator. Callbacks are configured only if
+   * a document is already loaded; otherwise they're set during loadDocument().
+   */
+  getRenderCoordinator(): RenderCoordinator {
+    if (!this.renderCoordinator) {
+      this.renderCoordinator = getRenderCoordinator();
+      // Only setup if document is already loaded (avoids timing race)
+      const docId = this.documentId ?? this.wasmDocumentId;
+      if (docId) {
+        this.setupRenderCoordinator();
+      }
+    }
+    return this.renderCoordinator;
+  }
+
+  /**
+   * Set up the RenderCoordinator with render callbacks.
+   * Called from getRenderCoordinator() if document is loaded, or from
+   * loadDocument() after document is ready. Safe to call multiple times.
+   */
+  private setupRenderCoordinator(): void {
+    if (!this.renderCoordinator) return;
+
+    const docId = this.documentId ?? this.wasmDocumentId;
+    if (!docId) {
+      // This shouldn't happen if callers check document state first
+      console.warn('[HybridDocumentProvider] setupRenderCoordinator called without document');
+      return;
+    }
+
+    // Set render callbacks
+    this.renderCoordinator.setRenderCallbacks({
+      renderTile: async (tile: TileCoordinate, _docId: string) => {
+        const itemIndex = tile.page - 1; // Convert 1-indexed to 0-indexed
+        return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+      },
+      renderPage: async (page: number, scale: number, _docId: string) => {
+        const itemIndex = page - 1; // Convert 1-indexed to 0-indexed
+        return this.renderItem(itemIndex, { scale });
+      },
+    });
+
+    // Set current document
+    this.renderCoordinator.setDocument(docId);
+    console.log(`[HybridDocumentProvider] RenderCoordinator configured for document ${docId}`);
+  }
+
+  // ============================================================================
   // Prefetching
   // ============================================================================
 
@@ -667,6 +1036,148 @@ export class HybridDocumentProvider {
     }
 
     this.isPrefetching = false;
+  }
+
+  // ============================================================================
+  // PdfContentProvider Adapter (for PdfRenderer compatibility)
+  // ============================================================================
+
+  /**
+   * Create a PdfContentProvider adapter for use with PdfRenderer.
+   * This allows HybridDocumentProvider to be used as a drop-in replacement
+   * for HybridPdfProvider in ServerReaderContainer.
+   *
+   * @returns PdfContentProvider-compatible object with additional methods
+   */
+  createPdfContentAdapter(): PdfContentProvider & {
+    renderTile?: (tile: TileCoordinate) => Promise<Blob>;
+    isTileRenderingAvailable?: () => boolean;
+    getRenderCoordinator?: () => RenderCoordinator;
+    getPdfSvgTextLayer?: (id: string, page: number) => Promise<string>;
+  } {
+    const provider = this;
+
+    return {
+      async getPdf(_id: string): Promise<ParsedPdf> {
+        if (!provider.parsedDocument) {
+          throw new Error('No document loaded');
+        }
+        return provider.toParsedPdf(provider.parsedDocument);
+      },
+
+      async uploadPdf(data: ArrayBuffer, filename?: string): Promise<ParsedPdf> {
+        const doc = await provider.loadDocument(data, filename);
+        return provider.toParsedPdf(doc);
+      },
+
+      async getPdfPage(_id: string, page: number, options?: { scale?: number; format?: string }): Promise<Blob> {
+        // PdfRenderer uses 1-indexed pages, our API uses 0-indexed
+        const itemIndex = page - 1;
+        return provider.renderItem(itemIndex, {
+          scale: options?.scale,
+          format: options?.format as 'png' | 'jpeg' | 'webp' | undefined,
+        });
+      },
+
+      async getPdfTextLayer(_id: string, page: number): Promise<PdfTextLayerData> {
+        const itemIndex = page - 1;
+        const structuredText = await provider.getStructuredText(itemIndex);
+        return provider.toPdfTextLayer(structuredText, page);
+      },
+
+      async searchPdf(_id: string, query: string, limit?: number): Promise<Array<{
+        page: number;
+        text: string;
+        prefix?: string;
+        suffix?: string;
+      }>> {
+        const results = await provider.search(query, limit ?? 50, true);
+        return results.map((r) => ({
+          page: r.page, // SearchResult already uses 1-indexed pages
+          text: r.text,
+          prefix: r.context?.prefix,
+          suffix: r.context?.suffix,
+        }));
+      },
+
+      // Tile rendering methods
+      renderTile: async (tile: TileCoordinate): Promise<Blob> => {
+        const itemIndex = tile.page - 1;
+        return provider.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+      },
+
+      isTileRenderingAvailable: () => provider.isTileRenderingAvailable(),
+
+      // RenderCoordinator for PDF tile management (Phase 1 addition)
+      getRenderCoordinator: () => provider.getRenderCoordinator(),
+
+      // SVG text layer stub (Phase 1 addition)
+      // Note: This feature was referenced in ServerReaderContainer but not implemented
+      // in HybridPdfProvider. Stubbed here for API compatibility.
+      async getPdfSvgTextLayer(_id: string, _page: number): Promise<string> {
+        console.warn('[HybridDocumentProvider] SVG text layer not implemented - using standard text layer');
+        return ''; // Return empty string as fallback
+      },
+    };
+  }
+
+  /**
+   * Convert ParsedDocument to ParsedPdf format
+   */
+  private toParsedPdf(doc: ParsedDocument): ParsedPdf {
+    // Convert ToC entries from document-worker format to types format
+    // document-worker.TocEntry has: title, page, level, children
+    // types.TocEntry expects: id, label, href, children (non-optional array)
+    type DocWorkerTocEntry = typeof doc.toc[number];
+    const convertToc = (entries: DocWorkerTocEntry[]): TocEntry[] => {
+      return entries.map((entry, idx) => ({
+        id: `toc-${idx}-p${entry.page}`,
+        label: entry.title,
+        href: `#page=${entry.page}`, // Generate href from page number
+        children: entry.children ? convertToc(entry.children) : [],
+      }));
+    };
+
+    return {
+      id: doc.id,
+      metadata: {
+        title: doc.metadata?.title ?? 'Untitled',
+        author: doc.metadata?.author,
+        keywords: [],
+      },
+      toc: convertToc(doc.toc),
+      pageCount: doc.itemCount,
+      hasTextLayer: doc.hasTextLayer,
+      orientation: 'portrait', // Default - could be calculated from dimensions
+    };
+  }
+
+  /**
+   * Convert StructuredText to PdfTextLayerData format
+   */
+  private toPdfTextLayer(text: StructuredText, page: number): PdfTextLayerData {
+    return {
+      page,
+      width: text.width ?? 612,
+      height: text.height ?? 792,
+      items: text.items?.map((item) => ({
+        text: item.text,
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height: item.height,
+        fontSize: item.fontSize,
+        charPositions: item.charPositions?.map((c) => ({
+          char: c.char,
+          x: c.x,
+          y: c.y,
+          width: c.width,
+          height: c.height,
+          fontSize: c.fontSize,
+          fontName: c.fontName,
+        })),
+      })) ?? [],
+    };
   }
 
   // ============================================================================

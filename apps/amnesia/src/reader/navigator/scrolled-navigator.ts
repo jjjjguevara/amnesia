@@ -754,17 +754,25 @@ export class ScrolledNavigator implements Navigator {
     const targetScrollTop = elementTopInContainer - (containerRect.height / 2) + (elementRect.height / 2);
     const scrollDirection = targetScrollTop > currentScrollTop ? 'down' : 'up';
 
+    // Calculate scroll distance to determine if we need fade transition
+    const scrollDistance = Math.abs(targetScrollTop - currentScrollTop);
+    const viewportHeight = this.scrollContainer.clientHeight;
+
+    // Use fade transition if scrolling more than 1.5 viewport heights
+    // This provides a cleaner experience for long-distance navigation (e.g., highlight jumps)
+    const shouldFadeTransition = !instant && scrollDistance > (viewportHeight * 1.5);
+
     // Update current spine index
     this.currentSpineIndex = spineIndex;
 
     if (instant) {
       // Instant scroll (for quick navigation)
       element.scrollIntoView({ behavior: 'auto', block: 'center' });
+    } else if (shouldFadeTransition) {
+      // Fade transition for long-distance scrolling (similar to paginated mode)
+      await this.navigateWithScrollFade(element);
     } else {
-      // Add directional visual indicator
-      this.showScrollDirectionIndicator(scrollDirection);
-
-      // Smooth scroll to center the element
+      // Smooth scroll for nearby navigation
       element.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
       // Wait for scroll animation to complete
@@ -780,6 +788,39 @@ export class ScrolledNavigator implements Navigator {
     }
 
     return true;
+  }
+
+  /**
+   * Navigate with a fade-out/fade-in transition effect.
+   * Used for long-distance navigation (e.g., jumping to highlights far from current position).
+   * Similar to paginated mode's page transition effect.
+   */
+  private async navigateWithScrollFade(element: HTMLElement): Promise<void> {
+    if (!this.scrollContainer) return;
+
+    // Fade out the scroll container
+    this.scrollContainer.style.transition = 'opacity 0.1s ease-out';
+    this.scrollContainer.style.opacity = '0';
+
+    await new Promise(r => setTimeout(r, 100));
+
+    // CRITICAL: Use 'instant' not 'auto' because the scroll container has
+    // CSS scroll-behavior: smooth which 'auto' would respect.
+    // We need truly instant scroll while faded out.
+    element.scrollIntoView({ behavior: 'instant' as ScrollBehavior, block: 'center' });
+
+    // Small delay to ensure scroll is applied
+    await new Promise(r => setTimeout(r, 30));
+
+    // Fade back in
+    this.scrollContainer.style.transition = 'opacity 0.15s ease-in';
+    this.scrollContainer.style.opacity = '1';
+
+    await new Promise(r => setTimeout(r, 150));
+
+    // Clean up transition styles
+    this.scrollContainer.style.transition = '';
+    this.scrollContainer.style.opacity = '';
   }
 
   /**

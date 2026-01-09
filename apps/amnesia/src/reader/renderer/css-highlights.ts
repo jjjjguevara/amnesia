@@ -27,12 +27,12 @@ export function isCSSHighlightAPISupported(): boolean {
  * Highlight color values for ::highlight pseudo-elements
  */
 const HIGHLIGHT_COLORS: Record<HighlightColor, string> = {
-  yellow: 'rgba(254, 243, 199, 0.7)',
-  green: 'rgba(187, 247, 208, 0.7)',
-  blue: 'rgba(191, 219, 254, 0.7)',
-  pink: 'rgba(251, 207, 232, 0.7)',
-  purple: 'rgba(221, 214, 254, 0.7)',
-  orange: 'rgba(254, 215, 170, 0.7)',
+  yellow: 'rgba(254, 243, 199, 0.5)',
+  green: 'rgba(187, 247, 208, 0.5)',
+  blue: 'rgba(191, 219, 254, 0.5)',
+  pink: 'rgba(251, 207, 232, 0.5)',
+  purple: 'rgba(221, 214, 254, 0.5)',
+  orange: 'rgba(254, 215, 170, 0.5)',
 };
 
 /**
