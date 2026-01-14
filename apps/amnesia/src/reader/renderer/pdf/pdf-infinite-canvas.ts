@@ -559,12 +559,17 @@ export class PdfInfiniteCanvas {
       height: viewportRect.height,
     };
 
+    // CRITICAL: Cache viewport rect for visibility calculations
+    // Without this, getViewportRect() returns null on first render, causing blank pages
+    this.cachedViewportRect = viewportRect;
+
     // Initial view setup based on mode
     // ASPECT RATIO FIX: Check if viewport has valid dimensions before setting up initial view.
     // During Obsidian startup, the flex layout may not be computed yet, causing viewportRect
     // to have 0 height. This leads to incorrect zoom calculations that cut off page bottoms.
     if (viewportRect.width > 0 && viewportRect.height > 0) {
       this.setupInitialView();
+      this.updateVisiblePages(); // CRITICAL: Create page elements for initial view
     } else {
       console.log(`[PdfInfiniteCanvas] Viewport not ready (${viewportRect.width}x${viewportRect.height}), deferring initial view setup`);
       this.initialViewSetupPending = true;
