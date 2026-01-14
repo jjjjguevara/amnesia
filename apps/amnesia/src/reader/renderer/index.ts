@@ -233,3 +233,46 @@ export type {
   AnchorError,
   AnchorErrorCode,
 } from './highlight-anchor';
+
+// MuPDF EPUB Module (EPUB Migration)
+export {
+  MuPDFEpubBridge,
+  getSharedMuPDFEpubBridge,
+  destroySharedMuPDFEpubBridge,
+  MuPDFEpubContentProvider,
+  getSharedMuPDFEpubContentProvider,
+  destroySharedMuPDFEpubContentProvider,
+  // Search (Stage 3)
+  MuPDFEpubSearch,
+  getMuPDFEpubSearch,
+  clearMuPDFEpubSearch,
+  createHybridSearchProvider,
+  // Format detection (Stage 4)
+  EpubFormatDetector,
+  getEpubFormatDetector,
+  isFixedLayoutEpub,
+  getEpubFormatInfo,
+  // Fixed-layout renderer (Stage 4)
+  FixedLayoutEpubRenderer,
+} from './epub';
+export type {
+  EpubMetadata,
+  EpubSpineItem,
+  ParsedEpub,
+  EpubChapterContent,
+  EpubSearchResult,
+  FixedLayoutPageDimensions,
+  // Search types (Stage 3)
+  MuPDFSearchResult,
+  MuPDFSearchOptions,
+  SearchProvider,
+  // Format detection types (Stage 4)
+  EpubLayoutType,
+  EpubFormatInfo,
+  DetectionOptions,
+  // Fixed-layout renderer types (Stage 4)
+  FixedLayoutRendererConfig,
+  PageRenderOptions,
+  RenderedPage,
+  FixedLayoutRendererEvents,
+} from './epub';
