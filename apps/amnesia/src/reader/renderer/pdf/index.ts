@@ -47,26 +47,6 @@ export type {
   PdfScrollerConfig,
 } from './pdf-scroller';
 
-/**
- * @deprecated Use HybridDocumentProvider from '../hybrid-document-provider' instead.
- * HybridPdfProvider is being phased out in favor of the unified document provider
- * that handles both PDF and EPUB formats.
- *
- * Migration:
- * - Replace: createHybridPdfProvider(config) → createHybridDocumentProvider(config)
- * - Replace: pdfProvider.loadDocument(data) → documentProvider.loadDocument(data)
- * - Replace: manual adapter creation → documentProvider.createPdfContentAdapter()
- */
-export { HybridPdfProvider, createHybridPdfProvider } from './hybrid-pdf-provider';
-/**
- * @deprecated Use HybridDocumentProviderConfig from '../hybrid-document-provider' instead.
- */
-export type {
-  HybridPdfProviderConfig,
-  HybridPdfProviderStatus,
-  PdfProviderMode,
-} from './hybrid-pdf-provider';
-
 // Multi-page container
 export { PdfMultiPageContainer } from './pdf-multi-page-container';
 export type {
@@ -97,6 +77,11 @@ export {
   lerpCamera,
   screenToCanvas,
   canvasToScreen,
+  // Unified coordinate space functions (Phase 2)
+  panCameraUnified,
+  screenToCanvasUnified,
+  canvasToScreenUnified,
+  getVisibleBoundsUnified,
 } from './pdf-canvas-camera';
 export type { Camera, Point, CameraConstraints } from './pdf-canvas-camera';
 
@@ -113,28 +98,135 @@ export {
   getTelemetry,
   trackCacheAccess,
   trackRenderTime,
+  createPipelineTimer,
+  PipelineTimerBuilder,
+  // Classification telemetry (Phase 5)
+  trackClassification,
+  trackRenderByContentType,
+  trackJpegExtraction,
+  trackVectorOptimization,
+  trackCacheAccessByContentType,
+  getClassificationStats,
 } from './pdf-telemetry';
-export type { TelemetryMetrics, TelemetryStats } from './pdf-telemetry';
+export type {
+  TelemetryMetrics,
+  TelemetryStats,
+  PipelineTiming,
+  PipelineStats,
+  PipelineStageStats,
+  // Classification telemetry types (Phase 5)
+  ClassificationMetrics,
+  ClassificationStats,
+} from './pdf-telemetry';
+
+// Feature flags for optimization control
+export {
+  FeatureFlagsManager,
+  getFeatureFlags,
+  isFeatureEnabled,
+  setFeatureFlag,
+  resetFeatureFlags,
+} from './feature-flags';
+export type {
+  FeatureFlagDefinitions,
+  ResolvedFeatureFlags,
+  CapabilityDetection,
+} from './feature-flags';
+
+// Benchmark suite for performance testing
+export {
+  BenchmarkSuite,
+  getBenchmarkSuite,
+  resetBenchmarkSuite,
+} from './benchmark-suite';
+export type {
+  BenchmarkConfig,
+  BenchmarkResult,
+  SuiteResults,
+  BenchmarkComparison,
+  IterationResult,
+} from './benchmark-suite';
+
+// Coordinate debugger for V4 unified coordinate space
+export {
+  CoordinateDebugger,
+  getCoordinateDebugger,
+  resetCoordinateDebugger,
+} from './coordinate-debugger';
+export type {
+  CoordinateSnapshot,
+  ValidationResult,
+  SnapshotFilter,
+  OperationType,
+  ZoomInputs,
+  ZoomOutputs,
+  PanInputs,
+  PanOutputs,
+  VisibilityInputs,
+  VisibilityOutputs,
+  ConstraintInputs,
+  ConstraintOutputs,
+  TileInputs,
+  TileOutputs,
+  // Render pipeline types (for tracing zoom bump)
+  RenderRequestInputs,
+  RenderCompleteInputs,
+  CanvasUpdateInputs,
+  TransformApplyInputs,
+  CssStretchChangeInputs,
+} from './coordinate-debugger';
 
 // SVG text layer for vector-crisp text rendering
 export { PdfSvgTextLayer } from './pdf-svg-text-layer';
 export type { SvgTextLayerConfig, SvgTextSelection, SvgTextLayerFetcher } from './pdf-svg-text-layer';
 
 // Tile rendering infrastructure (CATiledLayer-style)
-export { TileRenderEngine, TILE_SIZE } from './tile-render-engine';
+export { TileRenderEngine, TILE_SIZE, getTileSize } from './tile-render-engine';
 export type { TileCoordinate, TileScale, TileRenderRequest, PageLayout as TilePageLayout, Rect } from './tile-render-engine';
 
 export { TileCacheManager, getTileCacheManager } from './tile-cache-manager';
-export type { PageMetadata } from './tile-cache-manager';
+export type { PageMetadata, CachedTileData, CachedPageClassification } from './tile-cache-manager';
+
+// Progressive zoom infrastructure (Phase 2: Multi-Resolution Zoom)
+export {
+  SCALE_TIERS,
+  getTargetScaleTier,
+  getProgressiveScales,
+  getIntermediateScale,
+  getCssScaleFactor,
+  getAdaptiveTileSize,
+  getAdaptiveTileSizeUnified,
+  ProgressiveTileRenderer,
+  getProgressiveTileRenderer,
+  resetProgressiveTileRenderer,
+} from './progressive-tile-renderer';
+export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig } from './progressive-tile-renderer';
+
+export {
+  ZoomTransformLayer,
+  getQualityDegradation,
+  shouldUseProgressiveZoom,
+} from './zoom-transform-layer';
+export type { ZoomPhase, ZoomTransformState, ZoomTransformConfig } from './zoom-transform-layer';
 
 export { RenderCoordinator, getRenderCoordinator, resetRenderCoordinator } from './render-coordinator';
 export type { RenderRequest, RenderResult, RenderMode, RenderPriority } from './render-coordinator';
+
+// WASM renderer types
+export type { TileRenderResult } from './wasm-renderer';
 
 // Mode-specific strategies
 export { PaginatedStrategy, getPaginatedStrategy } from './paginated-strategy';
 export { ScrollStrategy, getScrollStrategy } from './scroll-strategy';
 export type { PrioritizedTile, SpeedZone, SpeedZoneConfig } from './scroll-strategy';
-export { GridStrategy, getGridStrategy } from './grid-strategy';
+export {
+  GridStrategy,
+  getGridStrategy,
+  getThumbnailRippleOrder,
+  groupPagesByPriority,
+  type ThumbnailPriority,
+  type ThumbnailPriorityPage,
+} from './grid-strategy';
 
 // Lifecycle testing (Phase C & D)
 export { LifecycleTestRunner, formatTestResults } from './lifecycle-test-runner';
@@ -160,3 +252,58 @@ export {
   initializeTestHarness,
 } from './mcp-test-harness';
 export type { ComparisonScreenshotResult, McpTestHarness } from './mcp-test-harness';
+
+// Worker Pool (Phase 3: Multi-Worker Architecture)
+export {
+  WorkerPoolManager,
+  getWorkerPool,
+  getWorkerPoolSync,
+  destroyWorkerPool,
+  resetWorkerPool,
+  setWorkerPoolPluginPath,
+} from './worker-pool-manager';
+export type {
+  WorkerPoolConfig,
+  WorkerPoolStats,
+  LoadBalancingStrategy,
+} from './worker-pool-manager';
+
+export {
+  PooledMuPDFBridge,
+  setPooledBridgePluginPath,
+  destroyPooledBridge,
+} from './pooled-mupdf-bridge';
+
+// IndexedDB thumbnail persistence (Phase 4: Grid Mode Optimization)
+export {
+  ThumbnailIdbCache,
+  getThumbnailIdbCache,
+  resetThumbnailIdbCache,
+  generateDocumentHash,
+  imageToWebPBlob,
+  blobToImageBitmap,
+} from './thumbnail-idb-cache';
+export type { ThumbnailEntry } from './thumbnail-idb-cache';
+
+// Content-Type Detection (Phase 5: Content-Type Detection)
+export {
+  PDFContentType,
+  ImageFilter,
+  CLASSIFICATION_THRESHOLDS,
+  parseImageFilter,
+  isDirectExtractableFilter,
+  getRenderStrategy,
+  // Vector scale optimization (Phase 5.9)
+  getOptimizedRenderParams,
+  shouldApplyVectorOptimization,
+  getVectorScaleTransform,
+  calculateVectorOptimizationSavings,
+  VECTOR_OPTIMIZATION_MIN_SCALE,
+} from './content-type-classifier';
+export type {
+  PageImageInfo,
+  OperatorCounts,
+  PageClassification,
+  RenderStrategy,
+  OptimizedRenderParams,
+} from './content-type-classifier';
