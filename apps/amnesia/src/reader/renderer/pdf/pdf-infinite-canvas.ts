@@ -11,7 +11,7 @@
  * - Page elements never resize - only the viewport moves
  */
 
-import { PdfPageElement, type PageRenderData, type PageHighlight, type ReadingMode } from './pdf-page-element';
+import { PdfPageElement, type PageRenderData, type PageHighlight, type ReadingMode, type TransformSnapshot } from './pdf-page-element';
 import {
   type Camera,
   type Point,
@@ -24,6 +24,7 @@ import {
   fitBoxInView,
   centerOnPoint,
   lerpCamera,
+  screenToCanvas, // FOCAL-POINT-RADIAL: Convert screen focal point to canvas coordinates
   // Unified coordinate space functions (V4 Architecture)
   panCameraUnified,
   getVisibleBoundsUnified,
@@ -45,6 +46,7 @@ import {
 } from './progressive-tile-renderer';
 import { ZoomTransformLayer, type ZoomPhase } from './zoom-transform-layer';
 import { ZoomStateMachine } from './zoom-state-machine';
+import { ZoomStateManager } from './zoom-state-manager';
 import { getRenderSessionManager } from './render-session';
 
 export interface PageLayout {
@@ -147,7 +149,7 @@ const DEFAULT_CONFIG: InfiniteCanvasConfig = {
   gap: 16,
   padding: 24,
   minZoom: 0.1,
-  maxZoom: 16, // Allow high zoom for detailed viewing
+  maxZoom: 32, // Allow very high zoom for detailed viewing (amnesia-pi0)
   pageWidth: 612,
   pageHeight: 792,
   renderScale: 1.5,
@@ -198,7 +200,7 @@ export class PdfInfiniteCanvas {
   private visiblePages: Set<number> = new Set();
   private renderQueue: number[] = [];
   private isRendering = false;
-  private renderVersion = 0;
+  // NOTE: renderVersion removed (amnesia-l0r) - now using ZoomStateManager.getEpoch()
 
   // Priority rendering - immediate neighbors get rendered first
   private priorityRenderQueue: number[] = [];
@@ -212,6 +214,27 @@ export class PdfInfiniteCanvas {
   // Track which pages were rendered with tiles (vs full-page)
   // Used to force re-render when crossing the tiling threshold
   private pageWasTiled: Map<number, boolean> = new Map();
+
+  // HYSTERESIS: Tiling threshold constants
+  // Prevents rapid mode switches when zoom fluctuates around the boundary.
+  // - lastRenderMode tracks current rendering mode
+  // - To switch TO tiled mode: zoom must exceed THRESHOLD + BAND (4.2)
+  // - To switch FROM tiled mode: zoom must drop below THRESHOLD - BAND (3.8)
+  // This creates a "sticky" zone where the mode doesn't change.
+  private readonly TILING_THRESHOLD = 4.0;
+  private readonly HYSTERESIS_BAND = 0.2;
+
+  // EXTREME ZOOM FIX: Maximum zoom for tiled rendering.
+  // At zoom levels above this, viewport→tile coordinate calculations produce
+  // invalid tile indices (outside page bounds), causing blank pages.
+  // Above this threshold, use full-page rendering which is more reliable.
+  // Full-page rendering at high zoom still provides sharp output due to scale capping
+  // at 4096px max dimension, which is sufficient for the tiny visible viewport.
+  private readonly MAX_TILED_ZOOM = 16.0;
+  private lastRenderMode: 'full-page' | 'tiled' = 'full-page';
+  // DEFERRED MODE TRANSITION (amnesia-z8v): Track pending mode during gesture
+  // The actual transition only executes when gesture ends to prevent blank frames
+  private pendingModeTransition: 'full-page' | 'tiled' | null = null;
 
   // Zoom-dependent re-rendering
   private zoomRerenderTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -266,6 +289,11 @@ export class PdfInfiniteCanvas {
   // single source of truth. All render paths check zoomStateMachine.canRender().
   private zoomStateMachine!: ZoomStateMachine;
 
+  // ZOOM STATE MANAGER (amnesia-5so): New unified zoom state with rebound detection.
+  // Provides epoch-based tile validation and rebound filtering to prevent drift.
+  // This works alongside zoomStateMachine until full migration is complete.
+  private zoomStateManager!: ZoomStateManager;
+
   // UNIFIED COORDINATE SPACE (Phase 2): Controls whether we use the new coordinate system.
   // When true:
   // - Page elements are sized to their final displayed dimensions (zoom × layout)
@@ -275,8 +303,9 @@ export class PdfInfiniteCanvas {
   // - Legacy mode with scale transform
   // - cssStretch mechanism (removed but could be added back if needed)
   //
-  // Reads from feature flag 'useUnifiedCoordinateSpace'.
-  private useUnifiedCoordinateSpace = isFeatureEnabled('useUnifiedCoordinateSpace');
+  // Unified coordinate space is disabled - use legacy mode where container
+  // stays at base size and camera transform handles zoom.
+  private useUnifiedCoordinateSpace: boolean = false;
 
   // Document ID for cross-document isolation in global singletons.
   // Cached from provider.getDocumentId() to include in render requests.
@@ -386,6 +415,8 @@ export class PdfInfiniteCanvas {
     this.container.appendChild(this.viewport);
 
     // Create canvas (transformed container for all pages)
+    // GPU LAYER PROMOTION: will-change + backface-visibility ensure the canvas
+    // is promoted to its own compositing layer for smooth 60fps zoom/pan.
     this.canvas = document.createElement('div');
     this.canvas.className = 'pdf-infinite-canvas';
     this.canvas.style.cssText = `
@@ -394,6 +425,7 @@ export class PdfInfiniteCanvas {
       left: 0;
       transform-origin: 0 0;
       will-change: transform;
+      backface-visibility: hidden;
     `;
     this.viewport.appendChild(this.canvas);
 
@@ -420,16 +452,16 @@ export class PdfInfiniteCanvas {
     }
 
     // Initialize ZoomTransformLayer for progressive zoom rendering.
-    // Note: We disable ZoomTransformLayer's CSS transform application because
-    // our camera system already handles instant zoom feedback. ZoomTransformLayer
-    // still manages timing/phase scheduling, quality gap calculations (cssStretch),
+    // CSS transforms are enabled for smooth 60fps zoom feedback.
+    // The camera system applies transforms via getCameraTransform() using translate3d
+    // for GPU compositing. ZoomTransformLayer manages timing/phase scheduling
     // and progressive render coordination.
     if (isFeatureEnabled('useMultiResZoom')) {
       this.zoomTransformLayer = new ZoomTransformLayer(this.canvas, {
         pixelRatio: this.config.pixelRatio,
         intermediateDelay: this.ZOOM_INTERMEDIATE_DELAY,
         finalDelay: this.ZOOM_FINAL_DELAY,
-        disableCssTransforms: true, // Camera handles CSS transforms
+        disableCssTransforms: false, // CSS transforms enabled for smooth zoom
       });
 
       // Wire render callback to our render system
@@ -453,14 +485,17 @@ export class PdfInfiniteCanvas {
     // All render paths check zoomStateMachine.canRender() before executing.
     this.zoomStateMachine = new ZoomStateMachine(
       this.renderCoordinator,
-      this.config.pixelRatio
+      { pixelRatio: this.config.pixelRatio }
     );
 
     // Wire render callback - state machine triggers render when settling completes
-    this.zoomStateMachine.onRenderPhase = (phase, zoom) => {
-      console.log(`[PdfInfiniteCanvas] ZoomStateMachine triggered ${phase} render at zoom=${zoom.toFixed(2)}`);
-      // Get scale tier for this zoom level
+    // CRITICAL: Callback signature is (phase, scale, zoom) - NOT (phase, zoom)!
+    // The orchestrator passes (phase, scale, zoom) where scale is already calculated.
+    // However, handleZoomRenderPhase expects ScaleTier, so we recalculate to ensure type safety.
+    this.zoomStateMachine.onRenderPhase = (phase, _orchestratorScale, zoom) => {
+      // Recalculate scale tier from zoom to ensure type safety (ScaleTier vs number)
       const { tier: scale } = getTargetScaleTier(zoom, this.config.pixelRatio);
+      console.log(`[PdfInfiniteCanvas] ZoomStateMachine triggered ${phase} render at scale=${scale}, zoom=${zoom.toFixed(2)}, orchestratorScale=${_orchestratorScale}`);
       this.handleZoomRenderPhase(scale, phase);
     };
 
@@ -469,9 +504,107 @@ export class PdfInfiniteCanvas {
       // UNIFIED COORDINATE SPACE: No freeze needed
       // Page elements are sized to final dimensions via handleZoomChange()
       console.log('[PdfInfiniteCanvas] Zoom gesture started');
+      // Sync with ZoomStateManager
+      this.zoomStateManager.startGesture();
+      // Telemetry: Track gesture start (amnesia-hem investigation)
+      getTelemetry().trackGestureStart(this.camera);
+    };
+
+    // Wire gesture end callback for rebound detection (amnesia-5so) + hard constraints (amnesia-u9l)
+    // + deferred mode transitions (amnesia-z8v)
+    this.zoomStateMachine.onGestureEnd = () => {
+      // ═══════════════════════════════════════════════════════════════════════════
+      // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
+      // Captures complete state at gesture end to identify broken/stretched content bug
+      // ═══════════════════════════════════════════════════════════════════════════
+      const cameraBefore = { ...this.camera };
+      const viewportRect = this.getViewportRect();
+      const visibleBoundsBefore = this.getVisibleBoundsForMode(this.camera, viewportRect.width, viewportRect.height);
+
+      console.log('[GESTURE-END-DEBUG] ═══ START ═══', {
+        camera: `x=${cameraBefore.x.toFixed(1)}, y=${cameraBefore.y.toFixed(1)}, z=${cameraBefore.z.toFixed(4)}`,
+        viewport: `${viewportRect.width}x${viewportRect.height}`,
+        visibleBounds: `x=${visibleBoundsBefore.x.toFixed(1)}, y=${visibleBoundsBefore.y.toFixed(1)}, ` +
+                       `w=${visibleBoundsBefore.width.toFixed(1)}, h=${visibleBoundsBefore.height.toFixed(1)}`,
+        isAtMaxZoom: this.zoomStateManager.isAtMaxZoom(),
+        isAtMinZoom: this.zoomStateManager.isAtMinZoom(),
+        maxZoom: this.config.maxZoom,
+        pendingModeTransition: this.pendingModeTransition,
+        lastRenderMode: this.lastRenderMode,
+        visiblePages: Array.from(this.visiblePages),
+        epoch: this.zoomStateManager.getEpoch(),
+      });
+
+      this.zoomStateManager.endGesture();
+
+      // Telemetry: Track gesture end (amnesia-hem investigation)
+      getTelemetry().trackGestureEnd(
+        this.camera,
+        this.zoomStateManager.isAtMaxZoom(),
+        this.zoomStateManager.isAtMinZoom()
+      );
+
+      // DEFERRED MODE TRANSITION (amnesia-z8v): Execute any pending mode transition
+      // This prevents blank frames when crossing the 4.0 threshold during pinch gestures
+      if (this.pendingModeTransition) {
+        console.log(`[GESTURE-END-DEBUG] Mode transition: ${this.lastRenderMode} → ${this.pendingModeTransition}`);
+        this.executeModeTransition(this.pendingModeTransition);
+      }
+
+      // Apply HARD constraints now that gesture has ended (amnesia-u9l)
+      // This snaps the camera back to valid bounds if soft constraints allowed overscroll
+      const cameraAfterModeTransition = { ...this.camera };
+      this.constrainCameraPositionPreservingFocalPoint(/* soft */ false);
+      const cameraAfterConstraint = { ...this.camera };
+
+      const constraintDelta = {
+        x: cameraAfterConstraint.x - cameraAfterModeTransition.x,
+        y: cameraAfterConstraint.y - cameraAfterModeTransition.y,
+        z: cameraAfterConstraint.z - cameraAfterModeTransition.z,
+      };
+
+      if (Math.abs(constraintDelta.x) > 1 || Math.abs(constraintDelta.y) > 1 || Math.abs(constraintDelta.z) > 0.01) {
+        console.log('[GESTURE-END-DEBUG] ⚠️ HARD CONSTRAINT CHANGED CAMERA:', {
+          before: `x=${cameraAfterModeTransition.x.toFixed(1)}, y=${cameraAfterModeTransition.y.toFixed(1)}, z=${cameraAfterModeTransition.z.toFixed(4)}`,
+          after: `x=${cameraAfterConstraint.x.toFixed(1)}, y=${cameraAfterConstraint.y.toFixed(1)}, z=${cameraAfterConstraint.z.toFixed(4)}`,
+          delta: `dx=${constraintDelta.x.toFixed(1)}, dy=${constraintDelta.y.toFixed(1)}, dz=${constraintDelta.z.toFixed(4)}`,
+        });
+      }
+
+      // FIX (amnesia-hem): Sync position change with ZoomStateManager
+      this.zoomStateManager.syncFromCamera(this.camera);
+
+      // FIX (amnesia-hem): Propagate constrained position to CSS transform
+      // This was MISSING - the primary cause of focal point drift at gesture end
+      this.applyTransform();
+
+      // Log final state
+      const visibleBoundsAfter = this.getVisibleBoundsForMode(this.camera, viewportRect.width, viewportRect.height);
+      console.log('[GESTURE-END-DEBUG] ═══ END ═══', {
+        finalCamera: `x=${this.camera.x.toFixed(1)}, y=${this.camera.y.toFixed(1)}, z=${this.camera.z.toFixed(4)}`,
+        finalVisibleBounds: `x=${visibleBoundsAfter.x.toFixed(1)}, y=${visibleBoundsAfter.y.toFixed(1)}, ` +
+                           `w=${visibleBoundsAfter.width.toFixed(1)}, h=${visibleBoundsAfter.height.toFixed(1)}`,
+        totalPositionDelta: `dx=${(this.camera.x - cameraBefore.x).toFixed(1)}, dy=${(this.camera.y - cameraBefore.y).toFixed(1)}`,
+        newEpoch: this.zoomStateManager.getEpoch(),
+      });
+
+      // Telemetry: Track the transform event
+      getTelemetry().trackTransformEvent('gesture-end', cameraBefore, this.camera, true);
     };
 
     console.log('[PdfInfiniteCanvas] ZoomStateMachine initialized');
+
+    // Initialize ZoomStateManager for rebound detection and epoch-based validation (amnesia-5so)
+    // This provides additional protection against focal point drift from trackpad rebound events.
+    this.zoomStateManager = new ZoomStateManager({
+      pixelRatio: this.config.pixelRatio,
+      minZoom: this.config.minZoom,
+      maxZoom: this.config.maxZoom,
+      initialZoom: this.camera.z,
+      initialPosition: { x: this.camera.x, y: this.camera.y },
+    });
+
+    console.log('[PdfInfiniteCanvas] ZoomStateManager initialized for rebound detection');
 
     // Setup ResizeObserver to handle deferred initial view setup
     // This catches the case where viewport dimensions aren't ready during initialize()
@@ -1170,7 +1303,14 @@ export class PdfInfiniteCanvas {
   }
 
   /**
-   * Constrain camera position based on display mode
+   * Constrain camera position based on display mode.
+   *
+   * USAGE GUIDANCE (amnesia-ao7):
+   * - Use this for general positioning (initial load, resize, display mode changes)
+   * - For zoom gestures, use constrainCameraPositionPreservingFocalPoint() instead
+   *
+   * This function applies display-mode-specific centering logic which can override
+   * focal point calculations. During zoom gestures, the focal point must be preserved.
    *
    * HIGH ZOOM PAN FIX: At zoom > 1.5, allow free panning in all modes so users
    * can inspect any part of the page. Without this, vertical-scroll and auto-grid
@@ -1265,16 +1405,37 @@ export class PdfInfiniteCanvas {
 
     if (useFreePanConstraints) {
       // Free panning mode - only constrain to keep content visible
+      // FOCAL POINT FIX: When content fits in viewport, don't snap to center!
+      // Instead, allow the camera to stay at its current position as long as
+      // content remains fully visible. This preserves the focal point during zoom.
+      const xBefore = x;
       if (contentScreenWidth <= vpWidth) {
-        x = vpWidth / (2 * z) - contentWidth / 2;
+        // Content fits - calculate the range where content stays fully visible
+        // At center: x = vpWidth / (2 * z) - contentWidth / 2
+        // The "slack" is how much extra space we have on each side
+        const centerX = vpWidth / (2 * z) - contentWidth / 2;
+        const slackX = (vpWidth - contentScreenWidth) / (2 * z);
+        // Allow camera anywhere within [centerX - slackX, centerX + slackX]
+        // This preserves focal point while keeping content fully visible
+        const minX = centerX - slackX;
+        const maxX = centerX + slackX;
+        x = Math.max(minX, Math.min(maxX, x));
+        console.log(`[CONSTRAINT-DEBUG] FITS: z=${z.toFixed(2)}, vpW=${vpWidth.toFixed(0)}, contentW=${contentWidth.toFixed(0)}, screenW=${contentScreenWidth.toFixed(0)}, xBefore=${xBefore.toFixed(1)}, center=${centerX.toFixed(1)}, slack=${slackX.toFixed(1)}, range=[${minX.toFixed(1)}, ${maxX.toFixed(1)}], xAfter=${x.toFixed(1)}`);
       } else {
         const minX = vpWidth / z - contentWidth;
         const maxX = 0;
-        x = Math.max(minX, Math.min(maxX, x));
+        const xClamped = Math.max(minX, Math.min(maxX, x));
+        console.log(`[CONSTRAINT-DEBUG] OVERFLOW: z=${z.toFixed(2)}, vpW=${vpWidth.toFixed(0)}, contentW=${contentWidth.toFixed(0)}, screenW=${contentScreenWidth.toFixed(0)}, xBefore=${xBefore.toFixed(1)}, range=[${minX.toFixed(1)}, ${maxX.toFixed(1)}], xAfter=${xClamped.toFixed(1)}`);
+        x = xClamped;
       }
 
       if (contentScreenHeight <= vpHeight) {
-        y = vpHeight / (2 * z) - contentHeight / 2;
+        // Content fits - calculate the range where content stays fully visible
+        const centerY = vpHeight / (2 * z) - contentHeight / 2;
+        const slackY = (vpHeight - contentScreenHeight) / (2 * z);
+        const minY = centerY - slackY;
+        const maxY = centerY + slackY;
+        y = Math.max(minY, Math.min(maxY, y));
       } else {
         const minY = vpHeight / z - contentHeight;
         const maxY = 0;
@@ -1334,8 +1495,13 @@ export class PdfInfiniteCanvas {
 
         case 'canvas':
           // Free panning, but constrain to keep content visible
+          // FOCAL POINT FIX: When content fits, use clamp instead of snap-to-center
           if (contentScreenWidth <= vpWidth) {
-            x = vpWidth / (2 * z) - contentWidth / 2;
+            const centerX = vpWidth / (2 * z) - contentWidth / 2;
+            const slackX = (vpWidth - contentScreenWidth) / (2 * z);
+            const minXCanvas = centerX - slackX;
+            const maxXCanvas = centerX + slackX;
+            x = Math.max(minXCanvas, Math.min(maxXCanvas, x));
           } else {
             const minX = vpWidth / z - contentWidth;
             const maxX = 0;
@@ -1343,7 +1509,11 @@ export class PdfInfiniteCanvas {
           }
 
           if (contentScreenHeight <= vpHeight) {
-            y = vpHeight / (2 * z) - contentHeight / 2;
+            const centerY = vpHeight / (2 * z) - contentHeight / 2;
+            const slackY = (vpHeight - contentScreenHeight) / (2 * z);
+            const minYCanvas = centerY - slackY;
+            const maxYCanvas = centerY + slackY;
+            y = Math.max(minYCanvas, Math.min(maxYCanvas, y));
           } else {
             const minY = vpHeight / z - contentHeight;
             const maxY = 0;
@@ -1373,6 +1543,178 @@ export class PdfInfiniteCanvas {
           : 'none',
       }
     );
+  }
+
+  /**
+   * Constrain camera position while preserving focal point during zoom gestures.
+   *
+   * UNIFIED CONSTRAINT LOGIC (amnesia-u9l):
+   * - Soft mode (during gesture): Allow 30% overscroll with rubber-band resistance
+   * - Hard mode (gesture ended): Snap to valid bounds immediately
+   *
+   * This constraint NEVER applies centering logic that could override the
+   * focal-point-preserving position calculated by zoomCameraToPoint().
+   *
+   * @param soft If true, allow rubber-band overscroll (30% resistance)
+   */
+  private constrainCameraPositionPreservingFocalPoint(soft: boolean = false): void {
+    const viewportRect = this.viewport.getBoundingClientRect();
+    if (viewportRect.width === 0 || viewportRect.height === 0) return;
+
+    const { z } = this.camera;
+    let { x, y } = this.camera;
+
+    const vpWidth = viewportRect.width;
+    const vpHeight = viewportRect.height;
+
+    // UNIFIED CONSTRAINT (amnesia-u9l): Single formula regardless of fits/exceeds state
+    // Soft mode: rubber-band with 30% resistance
+    // Hard mode: strict clamping
+    const resistance = 0.3;
+    const softClamp = (value: number, min: number, max: number): number => {
+      if (!soft) {
+        // Hard constraint
+        return Math.max(min, Math.min(max, value));
+      }
+      // Soft constraint: rubber-band effect
+      if (value < min) {
+        const undershoot = min - value;
+        return min - undershoot * resistance;
+      }
+      if (value > max) {
+        const overshoot = value - max;
+        return max + overshoot * resistance;
+      }
+      return value;
+    };
+
+    // UNIFIED MODE: Use unified coordinate bounds
+    if (this.useUnifiedCoordinateSpace) {
+      const contentWidth = this.canvasBounds.width;
+      const contentHeight = this.canvasBounds.height;
+
+      // UNIFIED CONSTRAINT: Single formula for all zoom states (amnesia-u9l)
+      // Calculate bounds - same formula whether content fits or exceeds
+      const minX = Math.min(0, contentWidth - vpWidth);
+      const maxX = Math.max(0, contentWidth - vpWidth);
+      x = softClamp(x, minX, maxX);
+
+      const minY = Math.min(0, contentHeight - vpHeight);
+      const maxY = Math.max(0, contentHeight - vpHeight);
+      y = softClamp(y, minY, maxY);
+
+      this.camera = { x, y, z };
+      return;
+    }
+
+    // LEGACY MODE: Use content coordinate bounds
+    const contentWidth = this.canvasBounds.width;
+    const contentHeight = this.canvasBounds.height;
+    const contentScreenWidth = contentWidth * z;
+    const contentScreenHeight = contentHeight * z;
+
+    // UNIFIED CONSTRAINT: Single formula for all zoom states (amnesia-u9l)
+    // Calculate the valid pan range in content coordinates
+    // - When content exceeds viewport: can pan from 0 to (vpWidth/z - contentWidth)
+    // - When content fits: reverse range, but softClamp handles either direction
+    const xEdgeRight = vpWidth / z - contentWidth;
+    const minX = Math.min(0, xEdgeRight);
+    const maxX = Math.max(0, xEdgeRight);
+    x = softClamp(x, minX, maxX);
+
+    const yEdgeBottom = vpHeight / z - contentHeight;
+    const minY = Math.min(0, yEdgeBottom);
+    const maxY = Math.max(0, yEdgeBottom);
+    y = softClamp(y, minY, maxY);
+
+    const cameraBefore = { ...this.camera };
+    this.camera = { x, y, z };
+
+    // Log if position changed (for debugging)
+    const constrained = cameraBefore.x !== x || cameraBefore.y !== y;
+    if (constrained && !soft) {
+      console.log(`[FOCAL-POINT-CONSTRAINT] Applied ${soft ? 'soft' : 'hard'} constraint: before=(${cameraBefore.x.toFixed(1)}, ${cameraBefore.y.toFixed(1)}), after=(${x.toFixed(1)}, ${y.toFixed(1)})`);
+    }
+
+    // Telemetry: Track constraint event (amnesia-hem investigation)
+    if (constrained) {
+      getTelemetry().trackConstraintEvent(
+        soft ? 'soft' : 'hard',
+        cameraBefore,
+        this.camera,
+        'constrainCameraPositionPreservingFocalPoint'
+      );
+    }
+  }
+
+
+  /**
+   * Execute a pending mode transition (full-page ↔ tiled).
+   * Called either immediately (if no gesture active) or when gesture ends (amnesia-z8v).
+   *
+   * @param targetMode The mode to transition to
+   */
+  private executeModeTransition(targetMode: 'full-page' | 'tiled'): void {
+    const oldMode = this.lastRenderMode;
+    if (oldMode === targetMode) {
+      console.log(`[PdfInfiniteCanvas] executeModeTransition: already in ${targetMode} mode`);
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
+    // ═══════════════════════════════════════════════════════════════════════════
+    console.log('[MODE-TRANSITION-DEBUG] ═══ EXECUTING ═══', {
+      oldMode,
+      targetMode,
+      camera: `z=${this.camera.z.toFixed(4)}`,
+      visiblePages: Array.from(this.visiblePages),
+      pageLayouts: Array.from(this.pageLayouts.entries()).map(([page, layout]) =>
+        `p${page}: ${layout.width.toFixed(0)}x${layout.height.toFixed(0)} @ (${layout.x.toFixed(0)},${layout.y.toFixed(0)})`
+      ),
+    });
+
+    this.lastRenderMode = targetMode;
+    const newEpoch = this.zoomStateManager.incrementEpoch();
+    console.log(`[MODE-TRANSITION-DEBUG] Epoch incremented: ${newEpoch}`);
+
+    // IMMEDIATE CSS RESET: When transitioning tiled→full-page, immediately reset
+    // canvas CSS for visible pages. This prevents the old viewport-only content
+    // (which was positioned/sized for a small region) from being displayed clipped
+    // while waiting for the new full-page render to complete.
+    if (oldMode === 'tiled' && targetMode === 'full-page') {
+      console.log(`[PdfInfiniteCanvas] Tiled→Full-page: immediately resetting canvas CSS for ${this.visiblePages.size} pages`);
+      for (const pageNum of this.visiblePages) {
+        const element = this.pageElements.get(pageNum);
+        if (element) {
+          element.prepareForFullPageRender();
+        }
+      }
+      // FIX (2026-01-20): Queue full-page renders after mode transition
+      // Without this, pages stay on stretched snapshot because no renders are requested.
+      console.log(`[MODE-TRANSITION-FIX] Queuing full-page renders for ${this.visiblePages.size} pages`);
+      this.queueRender([...this.visiblePages]);
+    }
+
+    // SYMMETRIC MODE TRANSITION: When transitioning full-page→tiled,
+    // prepare pages for viewport-only tile rendering.
+    if (oldMode === 'full-page' && targetMode === 'tiled') {
+      console.log(`[PdfInfiniteCanvas] Full-page→Tiled: preparing ${this.visiblePages.size} pages for tiled render`);
+      for (const pageNum of this.visiblePages) {
+        const element = this.pageElements.get(pageNum);
+        if (element) {
+          element.prepareForTiledRender();
+        }
+      }
+      // FIX (2026-01-20): Queue tile renders after mode transition
+      // This was MISSING - pages were prepared but tiles were never requested.
+      // Result: pages stayed on stretched transition snapshot forever.
+      console.log(`[MODE-TRANSITION-FIX] Queuing tile renders for ${this.visiblePages.size} pages`);
+      this.queueRender([...this.visiblePages]);
+    }
+
+    // Clear pending transition
+    this.pendingModeTransition = null;
   }
 
   /**
@@ -1438,7 +1780,29 @@ export class PdfInfiniteCanvas {
    * In legacy mode, uses scale + translate transform.
    */
   private applyTransform(): void {
-    this.canvas.style.transform = getCameraTransform(this.camera, this.useUnifiedCoordinateSpace);
+    const transform = getCameraTransform(this.camera);
+    this.canvas.style.transform = transform;
+
+    // INV-3 COHERENCE CHECK: Verify CSS transform matches camera state numerically
+    // Browser normalizes CSS values (rounds floats), so we must parse and compare with tolerance
+    // This detects async gaps or stale transform values that could cause visual glitches
+    const actualCss = this.canvas.style.transform;
+    const parsed = this.parseTransform(actualCss);
+    if (parsed) {
+      const TOLERANCE = 0.01; // 0.01px tolerance for browser rounding
+      const scaleMatch = Math.abs(parsed.scale - this.camera.z) < TOLERANCE;
+      const xMatch = Math.abs(parsed.x - this.camera.x) < TOLERANCE;
+      const yMatch = Math.abs(parsed.y - this.camera.y) < TOLERANCE;
+      if (!scaleMatch || !xMatch || !yMatch) {
+        console.error(`[INV-3-VIOLATION] Transform coherence failed:`, {
+          expected: { x: this.camera.x, y: this.camera.y, scale: this.camera.z },
+          actual: parsed,
+          diff: { x: parsed.x - this.camera.x, y: parsed.y - this.camera.y, scale: parsed.scale - this.camera.z }
+        });
+      }
+    }
+
+    // DRIFT DIAGNOSTIC removed - too verbose for production use
   }
 
   /**
@@ -1731,11 +2095,22 @@ export class PdfInfiniteCanvas {
     );
 
     // Get velocity-aware tile scale with pixelRatio for crisp rendering
-    // Tiles are small (256×256) so can render at high scale without OOM
-    // At zoom 16x with pixelRatio 2, scale = 32 for crisp display
+    // TILE PIXEL CAP: The old comment said "Tiles are small (256×256)" but with
+    // CACHE FIX, getAdaptiveTileSize() now returns 512px for all zoom levels.
+    // At scale 32 with 512px tiles = 16384px per tile, which exceeds GPU limits.
+    //
+    // Fix: Cap scale based on tile size such that tile pixels ≤ MAX_TILE_PIXELS.
+    // MAX_TILE_PIXELS = 4096 is MuPDF's internal cap and a safe GPU texture limit.
     const MAX_TILE_SCALE = 32;
+    const MAX_TILE_PIXELS = 4096;
+    const tileSize = getTileSize(zoom); // Returns 512 with useAdaptiveTileSize=true
+    const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize); // 4096/512 = 8
     const rawScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
-    const tileScale = Math.min(MAX_TILE_SCALE, rawScale);
+    const tileScale = Math.min(MAX_TILE_SCALE, maxScaleForTileSize, rawScale);
+
+    if (rawScale > tileScale) {
+      console.warn(`[PdfInfiniteCanvas] Capping tile scale from ${rawScale} to ${tileScale} (tileSize=${tileSize}px, max pixels=${MAX_TILE_PIXELS})`);
+    }
 
     // Get visible tiles for current viewport with proper scale
     const visibleTiles = this.tileEngine.getVisibleTiles(canvasViewport, layouts, zoom, tileScale);
@@ -1923,12 +2298,16 @@ export class PdfInfiniteCanvas {
     const layout = this.pageLayouts.get(page);
     if (!layout) return;
 
+    // Get native PDF dimensions for this page (used as fallback in renderTiles)
+    const pdfDimensions = this.tileEngine?.pageDimensions.get(page);
+
     const element = new PdfPageElement({
       pageNumber: page,
       pixelRatio: this.config.pixelRatio,
       enableTextAntialiasing: true,
       enableImageSmoothing: true,
       useSvgTextLayer: true, // Enable vector-crisp text at any zoom
+      pdfDimensions: pdfDimensions, // Pass PDF dimensions for tile coordinate fallback
     });
 
     // Set reading mode
@@ -2045,7 +2424,7 @@ export class PdfInfiniteCanvas {
     if (this.isRendering || !hasWork) return;
 
     this.isRendering = true;
-    const currentVersion = ++this.renderVersion;
+    const currentVersion = this.zoomStateManager.incrementEpoch();
 
     // Scale concurrent renders with worker pool (2x workers, capped at 12)
     const pool = getCanvasPool();
@@ -2083,7 +2462,7 @@ export class PdfInfiniteCanvas {
     };
 
     const startNextRender = (): void => {
-      while (activeRenders.size < CONCURRENT_RENDERS && this.renderVersion === currentVersion) {
+      while (activeRenders.size < CONCURRENT_RENDERS && this.zoomStateManager.getEpoch() === currentVersion) {
         const page = getNextPage();
         if (page === null) break;
 
@@ -2095,7 +2474,7 @@ export class PdfInfiniteCanvas {
           .finally(() => {
             activeRenders.delete(page);
             // Start next render as soon as slot becomes available (streaming)
-            if (this.renderVersion === currentVersion) {
+            if (this.zoomStateManager.getEpoch() === currentVersion) {
               startNextRender();
             }
           });
@@ -2108,7 +2487,7 @@ export class PdfInfiniteCanvas {
     startNextRender();
 
     // Wait for all active renders to complete
-    while (activeRenders.size > 0 && this.renderVersion === currentVersion) {
+    while (activeRenders.size > 0 && this.zoomStateManager.getEpoch() === currentVersion) {
       await Promise.race(activeRenders.values());
     }
 
@@ -2132,7 +2511,7 @@ export class PdfInfiniteCanvas {
     element: PdfPageElement,
     version: number
   ): Promise<void> {
-    if (this.renderVersion !== version) return;
+    if (this.zoomStateManager.getEpoch() !== version) return;
 
     // CRITICAL FIX: Use consistent zoom from snapshot (same pattern as visible pages calculation)
     // This ensures zoom for tile calculations matches the viewport from which tiles were determined.
@@ -2147,12 +2526,44 @@ export class PdfInfiniteCanvas {
     // - Tiles can render at scale 32 (zoom 16x * pixelRatio 2) without OOM
     // - Full pages cap at scale 8 to avoid memory issues
     // - Coordinate conversion now properly handles canvas→PDF units
+    //
+    // HYSTERESIS CONSISTENCY FIX: Use same hysteresis logic as mode transition.
+    // This prevents state divergence where mode says "tiled" but render uses "full-page".
+    // - When in full-page mode: switch to tiled when zoom exceeds 4.2 (THRESHOLD + BAND)
+    // - When in tiled mode: stay tiled until zoom drops below 3.8 (THRESHOLD - BAND)
+    // This matches the mode transition logic at zoomAtPoint() for consistent behavior.
+    //
+    // EXTREME ZOOM FIX: Also check MAX_TILED_ZOOM upper bound.
+    // At zoom > 16x, tiled rendering breaks due to coordinate calculation issues.
+    // Full-page rendering with scale capping provides reliable, sharp output.
+    const shouldTileByZoom = this.lastRenderMode === 'full-page'
+      ? zoom > (this.TILING_THRESHOLD + this.HYSTERESIS_BAND) && zoom <= this.MAX_TILED_ZOOM
+      : zoom > (this.TILING_THRESHOLD - this.HYSTERESIS_BAND) && zoom <= this.MAX_TILED_ZOOM;
     const shouldTile = this.tileEngine &&
                        this.renderCoordinator &&
                        layout &&
-                       zoom > 4.0;
+                       shouldTileByZoom;
 
-    // DEBUG: Log render path decision
+    // MODE TRANSITION FIX (2026-01-21): During mode transition from full-page to tiled,
+    // use FULL-PAGE rendering at the target scale first. This ensures:
+    // 1. Complete page coverage (no blank areas)
+    // 2. Full-page render gets cached as fallback for subsequent tiled renders
+    // 3. Mode transition is seamless
+    //
+    // Without this, mode transition tries tiled rendering with partial tiles,
+    // causing blank areas when tiles fail during continuous zoom.
+    const wasTiled = this.pageWasTiled.get(page) ?? false;
+    const isModeTransitionToTiled = !wasTiled && shouldTile;
+
+    if (isModeTransitionToTiled) {
+      console.log(`[MODE-TRANSITION-FIX] Page ${page}: Using full-page render for tiled transition at zoom ${zoom.toFixed(2)}`);
+      // Render full-page first to establish a base layer
+      await this.renderPageFull(page, element, version);
+      // Mark as tiled so subsequent renders use tiled mode (not another full-page)
+      // This prevents infinite full-page render loop
+      this.pageWasTiled.set(page, true);
+      return;
+    }
 
     if (shouldTile) {
       await this.renderPageTiled(page, element, layout, zoom, version);
@@ -2172,7 +2583,7 @@ export class PdfInfiniteCanvas {
     zoom: number,
     version: number
   ): Promise<void> {
-    if (this.renderVersion !== version) return;
+    if (this.zoomStateManager.getEpoch() !== version) return;
 
     // ZOOM STATE GUARD: Don't render during zoom gestures.
     // This prevents queued renders from executing while zooming.
@@ -2183,15 +2594,94 @@ export class PdfInfiniteCanvas {
 
     element.showLoading();
 
+    // TRANSFORM SNAPSHOT FIX: Capture all transform-relevant values at REQUEST time.
+    // 
+    // Tiles take 100-300ms to render in workers. During this time, zoom may change,
+    // causing container dimensions to change. If we calculate transforms at DISPLAY
+    // time using current dimensions, the result will be wrong for tiles rendered
+    // for the previous dimensions → visual drift (focal point shifts ±5-10px).
+    //
+    // Solution: Create a TransformSnapshot capturing:
+    // - Container dimensions at request time
+    // - pdfToElementScale at request time (for positioning calculations)
+    // - epoch (via ZoomStateManager.getEpoch()) for detecting stale tiles
+    //
+    // Use these snapshot values at DISPLAY time instead of current values.
+    
+    const containerWidth = element.getCurrentWidth();
+    const containerHeight = element.getCurrentHeight();
+    
+    // Get PDF dimensions for pdfToElementScale calculation
+    // pageDimensions is populated when document is loaded via setDocument()
+    const pdfDims = this.tileEngine!.pageDimensions.get(page);
+    const pdfWidth = pdfDims?.width ?? containerWidth;
+    const pdfToElementScale = containerWidth / pdfWidth;
+    
+    const transformSnapshot: TransformSnapshot = {
+      containerWidth,
+      containerHeight,
+      pdfToElementScale,
+      epoch: version, // From ZoomStateManager.getEpoch() - incremented on zoom changes
+    };
+
+    // Log snapshot for debugging
+    const effectiveCamera = this.zoomStateMachine.getZoomSnapshot()?.camera ??
+                            this.scrollRenderSnapshot?.camera ??
+                            this.camera;
+    console.log(`[TransformSnapshot] REQUEST page=${page}: zoom=${zoom.toFixed(2)}, snapshot.dims=${containerWidth.toFixed(0)}×${containerHeight.toFixed(0)}, snapshot.scale=${pdfToElementScale.toFixed(3)}, epoch=${version}, camera.z=${this.camera.z.toFixed(2)}`);
+
     try {
-      // TILE SCALE FIX: Use getTargetScaleTier to get a VALID scale tier.
+      // Check if we're transitioning rendering modes FIRST
+      // HYSTERESIS CONSISTENCY FIX: Use lastRenderMode (already computed with hysteresis)
+      // instead of raw zoom > 4.0 threshold to match mode transition logic.
+      const wasTiled = this.pageWasTiled.get(page) ?? false;
+      const shouldBeTiled = this.lastRenderMode === 'tiled';
+      const isModeTransition = wasTiled !== shouldBeTiled;
+
+      // FULL-PAGE CANVAS FIX (2026-01-21): Always use full-page canvas sizing.
+      //
+      // Viewport-only sizing (forceFullPageTiles=false) causes blank areas when:
+      // 1. Viewport calculation misses some tiles (e.g., X=0,1 not generated)
+      // 2. Tiles fail to render - no fallback to fill the space
+      // 3. Panning reveals areas outside the viewport-sized canvas
+      //
+      // Full-page sizing ensures:
+      // - Canvas covers the entire page
+      // - Missing tiles show as blank but don't shift content
+      // - Subsequent renders fill in missing areas progressively
+      const forceFullPageTiles = true;
+
+      // ADAPTIVE SCALE TIER FIX: Use higher scale for viewport-only tiles, lower for full-page.
+      //
+      // At zoom 16x with viewport-only rendering:
+      // - Only ~12 tiles visible (small viewport region)
+      // - Can safely use scale 32 for crisp text → cssStretch = 1.0
+      //
+      // At zoom 16x with full-page tiles (mode transition):
+      // - ~1950 tiles for entire page at scale 32 → OOM risk!
+      // - Keep scale 8 → cssStretch = 4.0 (acceptable for brief transition)
       //
       // Before: tileScale = Math.ceil(zoom * pixelRatio) produced arbitrary scales
       // like 7, 9, 11 which don't exist in SCALE_TIERS = [2,3,4,6,8,12,16,24,32].
       // This caused every tile to miss cache (looking for "s7" but cache has "s6" or "s8").
       //
       // Now: getTargetScaleTier returns the nearest valid tier, ensuring cache hits.
-      const { tier: tileScale } = getTargetScaleTier(zoom, this.config.pixelRatio);
+      // Pass maxZoom only for viewport-only tiles (safe for high scale).
+      const useHighQualityScale = shouldBeTiled && !forceFullPageTiles;
+      const { tier: rawTileScale } = useHighQualityScale
+        ? getTargetScaleTier(zoom, this.config.pixelRatio, this.config.maxZoom)
+        : getTargetScaleTier(zoom, this.config.pixelRatio);
+
+      // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), scale 32 produces
+      // 16384px tiles which exceed GPU limits. Cap scale so tile pixels ≤ 4096.
+      const MAX_TILE_PIXELS = 4096;
+      const tileSize = getTileSize(zoom);
+      const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
+      const tileScale = Math.min(rawTileScale, maxScaleForTileSize);
+
+      if (rawTileScale > tileScale) {
+        console.warn(`[PdfInfiniteCanvas] renderPageTiled: Capping tile scale from ${rawTileScale} to ${tileScale} (tileSize=${tileSize}px, max pixels=${MAX_TILE_PIXELS})`);
+      }
 
       // At high zoom (>4x), only render VISIBLE tiles (viewport-clipped)
       // At lower zoom, render all tiles for the page (for smooth panning)
@@ -2201,56 +2691,96 @@ export class PdfInfiniteCanvas {
       // visual "jumps" when the zoom gesture ends.
       let tiles: TileCoordinate[];
 
-      // Check if we're transitioning rendering modes
-      const wasTiled = this.pageWasTiled.get(page) ?? false;
-      const shouldBeTiled = zoom > 4.0;
-      const isModeTransition = wasTiled !== shouldBeTiled;
+      // === TILE-DEBUG-MARKER === (unconditional log to trace tile generation)
+      console.error(`[TILE-GEN-DEBUG] page=${page} zoom=${zoom.toFixed(2)} shouldBeTiled=${shouldBeTiled} forceFullPageTiles=${forceFullPageTiles} wasTiled=${wasTiled} isModeTransition=${isModeTransition}`);
 
-      // UNIFIED COORDINATE SPACE: Mode transitions are handled by resizing page elements
-      // to their final dimensions. No cssStretch compensation needed.
-      //
-      // Only force full-page tiles during mode transitions to ensure smooth visual handoff
-      const forceFullPageTiles = isModeTransition;
+      // CRITICAL: Use camera snapshot if available (from scroll rerender)
+      // This ensures we calculate visibility based on where the user was when scroll/zoom
+      // rerender was scheduled, not where the camera has moved to during debounce.
+      // This fixes the "0 visible tiles" issue during continuous scroll/zoom.
+      // Priority: state machine snapshot > scroll snapshot > current camera
+      const effectiveCamera = this.zoomStateMachine.getZoomSnapshot()?.camera ??
+                              this.scrollRenderSnapshot?.camera ??
+                              this.camera;
 
-      if (zoom > 4.0 && !forceFullPageTiles) {
-        // CRITICAL: Use camera snapshot if available (from scroll rerender)
-        // This ensures we calculate visibility based on where the user was when scroll/zoom
-        // rerender was scheduled, not where the camera has moved to during debounce.
-        // This fixes the "0 visible tiles" issue during continuous scroll/zoom.
-        // Priority: state machine snapshot > scroll snapshot > current camera
-        const effectiveCamera = this.zoomStateMachine.getZoomSnapshot()?.camera ??
-                                this.scrollRenderSnapshot?.camera ??
-                                this.camera;
+      // Get viewport in WORLD coordinates (not screen coordinates!)
+      const screenRect = this.getViewportRect();
+      // PHASE 1: Use mode-aware visibility calculation (V4 Architecture)
+      const viewport = this.getVisibleBoundsForMode(effectiveCamera, screenRect.width, screenRect.height);
 
-        // Get viewport in WORLD coordinates (not screen coordinates!)
-        const screenRect = this.getViewportRect();
-        // PHASE 1: Use mode-aware visibility calculation (V4 Architecture)
-        const viewport = this.getVisibleBoundsForMode(effectiveCamera, screenRect.width, screenRect.height);
-
+      if (shouldBeTiled) {
+        // MODE TRANSITION FIX (2026-01-21): Always use getVisibleTiles() to get only
+        // viewport-intersecting tiles. Previously, forceFullPageTiles=true used
+        // getPageTileGrid() which returned ALL 130 tiles per page. With 4 visible pages,
+        // this meant 520 tile requests overwhelming the 100-item semaphore queue,
+        // causing massive tile failures (60%+ dropped) and blank areas.
+        //
+        // NEW APPROACH:
+        // - Always get only VISIBLE tiles (~30-50 per page, not 130)
+        // - forceFullPageTiles only affects canvas SIZING in renderTiles(), not tile count
+        // - This keeps queue utilization reasonable while maintaining full-page canvas sizing
         tiles = this.tileEngine!.getVisibleTiles(viewport, [layout], zoom, tileScale);
-      } else {
-        // At normal zoom OR during mode transition, get all tiles for smooth transition
-        if (forceFullPageTiles && zoom > 4.0) {
-          console.log(`[PdfInfiniteCanvas] Page ${page}: Forcing full-page tiles (modeTransition=${isModeTransition})`);
+
+        // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
+        if (zoom >= 4) {
+          const overlaps = this.rectsOverlap(viewport, layout);
+          const intLeft = Math.max(viewport.x, layout.x);
+          const intTop = Math.max(viewport.y, layout.y);
+          const intRight = Math.min(viewport.x + viewport.width, layout.x + layout.width);
+          const intBottom = Math.min(viewport.y + viewport.height, layout.y + layout.height);
+          const intWidth = Math.max(0, intRight - intLeft);
+          const intHeight = Math.max(0, intBottom - intTop);
+
+          console.log('[TILED-RENDER-DEBUG]', {
+            page,
+            zoom: zoom.toFixed(2),
+            tileScale,
+            tileCount: tiles.length,
+            forceFullPageTiles,
+            viewportLayoutOverlap: overlaps,
+            viewport: `x=${viewport.x.toFixed(1)}, y=${viewport.y.toFixed(1)}, w=${viewport.width.toFixed(1)}, h=${viewport.height.toFixed(1)}`,
+            layout: `x=${layout.x.toFixed(1)}, y=${layout.y.toFixed(1)}, w=${layout.width.toFixed(1)}, h=${layout.height.toFixed(1)}`,
+            intersection: `x=${intLeft.toFixed(1)}, y=${intTop.toFixed(1)}, w=${intWidth.toFixed(1)}, h=${intHeight.toFixed(1)}`,
+            tileCoords: tiles.length > 0
+              ? tiles.slice(0, 5).map(t => `(${t.tileX},${t.tileY})`).join(', ') + (tiles.length > 5 ? `... (${tiles.length} total)` : '')
+              : '(NONE - BUG!)',
+            cameraSource: this.zoomStateMachine.getZoomSnapshot() ? 'zoomSnapshot' : (this.scrollRenderSnapshot ? 'scrollSnapshot' : 'current'),
+            camera: `x=${effectiveCamera.x.toFixed(1)}, y=${effectiveCamera.y.toFixed(1)}, z=${effectiveCamera.z.toFixed(2)}`,
+          });
         }
-        tiles = this.tileEngine!.getPageTileGrid(page, tileScale);
+      } else {
+        // Non-tiled path (zoom below threshold)
+        // TILE-SIZE-MISMATCH-FIX: Pass zoom parameter to ensure consistent tile sizing.
+        tiles = this.tileEngine!.getPageTileGrid(page, tileScale, zoom);
+      }
+
+      // === TILE-RANGE-DEBUG === Log the actual tile ranges generated
+      if (tiles.length > 0 && zoom >= 4) {
+        const tileXs = tiles.map(t => t.tileX);
+        const tileYs = tiles.map(t => t.tileY);
+        const minX = Math.min(...tileXs), maxX = Math.max(...tileXs);
+        const minY = Math.min(...tileYs), maxY = Math.max(...tileYs);
+        console.error(`[TILE-RANGE] page=${page} zoom=${zoom.toFixed(2)} tiles=${tiles.length}: X=[${minX}-${maxX}], Y=[${minY}-${maxY}]`);
       }
 
       if (tiles.length === 0) {
         // No tiles calculated - check if page is actually in viewport
-        if (zoom > 4.0) {
-          // VISIBILITY CHECK FIX: Use CURRENT camera, not snapshot!
+        if (shouldBeTiled) {
+          // VISIBILITY CHECK CONSISTENCY FIX: Use SNAPSHOT camera (effectiveCamera)
+          // for visibility check, matching the camera used for tile calculation above.
           //
-          // Pages are queued by updateVisiblePages() which uses this.camera.
-          // If we check visibility against the snapshot camera here, pages that
-          // were visible when queued may not overlap the snapshot viewport,
-          // causing "Page X never rendered" errors.
+          // Previously used this.camera (current), which caused a race condition:
+          // - Tiles calculated at line 2303 using effectiveCamera (snapshot)
+          // - If tiles.length === 0, visibility checked with this.camera (current)
+          // - Camera could have moved during async render, causing mismatch
           //
-          // The snapshot is useful for tile COORDINATE calculations (stability),
-          // but visibility must match the queuing logic (current camera).
+          // Using effectiveCamera ensures:
+          // 1. Tiles and visibility use same camera state
+          // 2. Pages visible in snapshot get fallback render (not skipped)
+          // 3. No race condition between tile calculation and visibility check
           const screenRect = this.getViewportRect();
           // PHASE 1: Use mode-aware visibility calculation (V4 Architecture)
-          const viewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
+          const viewport = this.getVisibleBoundsForMode(effectiveCamera, screenRect.width, screenRect.height);
           const overlaps = this.rectsOverlap(viewport, layout);
           if (!overlaps) {
             // Page is not visible - but only skip if it has content to preserve
@@ -2287,8 +2817,16 @@ export class PdfInfiniteCanvas {
 
       // BLANK PAGE FIX: If version changed but page has no content, still render what we have.
       // A stale tiled render or fallback to full-page is better than a blank page.
-      const versionStale = this.renderVersion !== version;
+      const versionStale = this.zoomStateManager.getEpoch() !== version;
       const mustShowSomething = !element.getIsRendered();
+
+      // DIAGNOSTIC: Log at first epoch check (this is where tiles were being discarded)
+      if (versionStale && zoom >= 4) {
+        const successCount = results.filter(r => r.success && r.data instanceof ImageBitmap).length;
+        console.warn(`[EpochDiscard-1] page=${page} zoom=${zoom.toFixed(2)}: epoch ${version}→${this.zoomStateManager.getEpoch()}, ` +
+          `${successCount}/${tiles.length} tiles successful, mustShowSomething=${mustShowSomething}, ` +
+          `DISCARDING=${!mustShowSomething}`);
+      }
 
       if (versionStale && !mustShowSomething) {
         // CLEANUP: Close all ImageBitmaps before returning to prevent GPU memory leak
@@ -2309,13 +2847,14 @@ export class PdfInfiniteCanvas {
           }
         }
         console.warn(`[PdfInfiniteCanvas] Version stale but page ${page} has no content, forcing full render`);
-        await this.renderPageFull(page, element, this.renderVersion);
+        await this.renderPageFull(page, element, this.zoomStateManager.getEpoch());
         return;
       }
 
       // Collect successful tile data for rendering
       // Include cssStretch for fallback tiles to enable proper CSS sizing
       const tileImages: Array<{ tile: typeof tiles[0]; bitmap: ImageBitmap; cssStretch?: number }> = [];
+      let failedCount = 0;
 
       for (let i = 0; i < tiles.length; i++) {
         const result = results[i];
@@ -2327,7 +2866,32 @@ export class PdfInfiniteCanvas {
             bitmap: result.data,
             cssStretch: result.cssStretch, // May be undefined for exact-scale tiles
           });
+        } else {
+          failedCount++;
         }
+      }
+
+      // DIAGNOSTIC: Log tile collection results at mid-zoom
+      if (zoom >= 4 && zoom <= 10) {
+        const tileXs = tileImages.map(t => t.tile.tileX);
+        const tileYs = tileImages.map(t => t.tile.tileY);
+        // Log failed tile details
+        const failedTiles: string[] = [];
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          if (!result.success || !(result.data instanceof ImageBitmap)) {
+            const tile = tiles[i];
+            failedTiles.push(`(${tile.tileX},${tile.tileY}):${result.success ? 'no-bitmap' : 'failed'}`);
+          }
+        }
+        console.error(`[TileCollection] page=${page} zoom=${zoom.toFixed(2)}: ${tileImages.length}/${tiles.length} tiles (${failedCount} failed)`, {
+          xRange: tileImages.length > 0 ? `${Math.min(...tileXs)}-${Math.max(...tileXs)}` : 'none',
+          yRange: tileImages.length > 0 ? `${Math.min(...tileYs)}-${Math.max(...tileYs)}` : 'none',
+          forceFullPage: forceFullPageTiles,
+          epoch: version,
+          currentEpoch: this.zoomStateManager.getEpoch(),
+          failedTiles: failedTiles.slice(0, 10).join(', ') + (failedTiles.length > 10 ? `... (${failedTiles.length} total)` : ''),
+        });
       }
 
       // Get text layer (non-blocking)
@@ -2339,7 +2903,11 @@ export class PdfInfiniteCanvas {
       }
 
       // BLANK PAGE FIX: Apply same pattern - if version stale but page blank, still render
-      if (this.renderVersion !== version && element.getIsRendered()) {
+      if (this.zoomStateManager.getEpoch() !== version && element.getIsRendered()) {
+        // DIAGNOSTIC: Log when tiles are discarded due to epoch change after text layer
+        if (zoom >= 4 && zoom <= 10) {
+          console.warn(`[TileDiscard] page=${page}: Discarding ${tileImages.length} tiles (epoch ${version} → ${this.zoomStateManager.getEpoch()})`);
+        }
         // CLEANUP: Close all collected ImageBitmaps before returning
         for (const { bitmap } of tileImages) {
           bitmap.close();
@@ -2355,7 +2923,7 @@ export class PdfInfiniteCanvas {
       // Use current render version to ensure we render something
       if (tileImages.length === 0) {
         console.warn(`[PdfInfiniteCanvas] All ${tiles.length} tiles failed to produce ImageBitmaps, falling back to full render`);
-        await this.renderPageFull(page, element, this.renderVersion);
+        await this.renderPageFull(page, element, this.zoomStateManager.getEpoch());
         return;
       }
 
@@ -2365,7 +2933,14 @@ export class PdfInfiniteCanvas {
       // The old cssStretch mechanism has been removed.
 
       // Render tiles to element with PDF dimensions for correct positioning
-      await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions);
+      // TRANSFORM SNAPSHOT FIX: Pass TransformSnapshot captured at request time
+      // This ensures CSS positioning uses request-time dimensions, not current dimensions
+      // EPOCH VALIDATION: Pass current epoch for validation in renderTiles.
+      // If zoom changed since tile request (version !== transformSnapshot.epoch),
+      // renderTiles will fall back to current dimensions instead of stale snapshot.
+      // FORCE FULL PAGE FIX: Pass forceFullPageTiles to prevent incorrect viewport-only
+      // canvas sizing when some tiles are aborted during continuous zoom.
+      await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions, transformSnapshot, this.zoomStateManager.getEpoch(), forceFullPageTiles);
       element.hideLoading();
 
       // STUCK TILE FIX: Track that this page was rendered with tiles
@@ -2393,7 +2968,14 @@ export class PdfInfiniteCanvas {
   }
 
   /**
-   * Get tile priority based on distance from viewport center
+   * Get tile priority based on distance from focal point (during zoom) or viewport center (during scroll).
+   *
+   * FOCAL-POINT-RADIAL PRIORITY FIX: During zoom gestures, tiles closest to the zoom
+   * focal point should render first. This ensures users see sharp content at their
+   * zoom target immediately, with quality radiating outward.
+   *
+   * During scroll (no zoom gesture active), we fall back to viewport center priority
+   * for optimal scroll experience.
    */
   private getTilePriority(
     tile: TileCoordinate,
@@ -2403,8 +2985,26 @@ export class PdfInfiniteCanvas {
     const screenRect = this.getViewportRect();
     // PHASE 1: Use mode-aware visibility calculation (V4 Architecture)
     const viewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
-    const viewportCenterX = viewport.x + viewport.width / 2;
-    const viewportCenterY = viewport.y + viewport.height / 2;
+
+    // FOCAL-POINT-RADIAL PRIORITY: Use zoom focal point if available, else viewport center.
+    // During zoom gestures, the focal point is where the user is zooming (cursor/pinch center).
+    // Prioritizing tiles near the focal point means users see sharpness at their zoom target first.
+    const zoomSnapshot = this.zoomStateMachine.getZoomSnapshot();
+    let priorityCenterX: number;
+    let priorityCenterY: number;
+
+    if (zoomSnapshot && this.zoomStateMachine.isZoomActive()) {
+      // ZOOM GESTURE ACTIVE: Use focal point in canvas coordinates
+      // Convert screen focal point to canvas coordinates
+      const focalCanvas = screenToCanvas(zoomSnapshot.focalPoint, zoomSnapshot.camera);
+      priorityCenterX = focalCanvas.x;
+      priorityCenterY = focalCanvas.y;
+      // console.log(`[FOCAL-RADIAL] Using zoom focal point: (${priorityCenterX.toFixed(0)}, ${priorityCenterY.toFixed(0)})`);
+    } else {
+      // NO ZOOM: Use viewport center for scroll-optimized priority
+      priorityCenterX = viewport.x + viewport.width / 2;
+      priorityCenterY = viewport.y + viewport.height / 2;
+    }
 
     // Calculate tile center in canvas coordinates
     const tileX = layout.x + tile.tileX * TILE_SIZE;
@@ -2412,10 +3012,10 @@ export class PdfInfiniteCanvas {
     const tileCenterX = tileX + TILE_SIZE / 2;
     const tileCenterY = tileY + TILE_SIZE / 2;
 
-    // Distance from viewport center
+    // Distance from priority center (focal point or viewport center)
     const distance = Math.sqrt(
-      Math.pow(tileCenterX - viewportCenterX, 2) +
-      Math.pow(tileCenterY - viewportCenterY, 2)
+      Math.pow(tileCenterX - priorityCenterX, 2) +
+      Math.pow(tileCenterY - priorityCenterY, 2)
     );
 
     // Priority based on distance
@@ -2433,9 +3033,14 @@ export class PdfInfiniteCanvas {
     element: PdfPageElement,
     version: number
   ): Promise<void> {
-    if (this.renderVersion !== version) return;
+    if (this.zoomStateManager.getEpoch() !== version) return;
 
     element.showLoading();
+
+    // PAGE SCALE STABILITY FIX: Immediately reset canvas CSS to container size
+    // before async operations start. This prevents the stretched/clipped appearance
+    // that occurs when old viewport-only tile CSS settings interact with new camera zoom.
+    element.prepareForFullPageRender();
 
     // Calculate zoom-aware render scale for sharp text at current zoom
     // Cap at max useful scale to avoid fetching unnecessarily large images
@@ -2443,7 +3048,29 @@ export class PdfInfiniteCanvas {
     const maxScale = this.getMaxUsefulScale();
     // zoomAwareScale * pixelRatio = desired scale for HiDPI quality
     // maxScale = absolute max (2048px / pageWidth) to avoid wasteful fetches
-    const targetScale = Math.min(zoomAwareScale * this.config.pixelRatio, maxScale);
+    let targetScale = Math.min(zoomAwareScale * this.config.pixelRatio, maxScale);
+
+    // FULL-PAGE FALLBACK SAFETY CAP: At extreme zoom (>4x), full-page rendering
+    // may be called as fallback when all tiles fail. Tiles typically fail due to
+    // memory constraints at high scales. To prevent the same failure, cap scale
+    // such that the largest dimension doesn't exceed 4096 pixels.
+    //
+    // Example: At 32x zoom on 612×792 PDF:
+    // - Uncapped: 612×32=19584 × 792×32=25344 pixels (496MP, impossible)
+    // - Capped: max dimension 4096 → scale = 4096/792 ≈ 5.17 (produces 3166×4096, feasible)
+    //
+    // This ensures full-page fallback produces SOMETHING rather than failing silently.
+    const MAX_FULL_PAGE_DIMENSION = 4096; // MuPDF's internal cap
+    const pageDims = this.tileEngine?.pageDimensions.get(page);
+    const pageWidth = pageDims?.width ?? 612;
+    const pageHeight = pageDims?.height ?? 792;
+    const maxPageDim = Math.max(pageWidth, pageHeight);
+    const safeMaxScale = MAX_FULL_PAGE_DIMENSION / maxPageDim;
+
+    if (targetScale > safeMaxScale) {
+      console.warn(`[PdfInfiniteCanvas] renderPageFull: Capping scale from ${targetScale.toFixed(2)} to ${safeMaxScale.toFixed(2)} (max dimension ${maxPageDim}×${targetScale.toFixed(0)}=${Math.round(maxPageDim * targetScale)}px exceeds ${MAX_FULL_PAGE_DIMENSION}px)`);
+      targetScale = safeMaxScale;
+    }
 
     try {
       // Use dual-resolution if provider supports it (preferred path)
@@ -2456,11 +3083,14 @@ export class PdfInfiniteCanvas {
 
         // BLANK PAGE FIX: If version changed but page has no content, still show what we have.
         // A stale render is better than a blank page. The next render will overwrite it.
-        const versionStale = this.renderVersion !== version;
+        const versionStale = this.zoomStateManager.getEpoch() !== version;
         const mustShowSomething = !element.getIsRendered();
 
         if (versionStale && !mustShowSomething) {
           // Page has content and version is stale - skip safely
+          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
+          element.showCanvas();
+          element.hideLoading();
           return;
         }
 
@@ -2475,7 +3105,12 @@ export class PdfInfiniteCanvas {
         }
 
         // Another version check for text layer await, but still show if page is blank
-        if (this.renderVersion !== version && element.getIsRendered()) return;
+        if (this.zoomStateManager.getEpoch() !== version && element.getIsRendered()) {
+          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
+          element.showCanvas();
+          element.hideLoading();
+          return;
+        }
 
         // Display initial (may be thumbnail or full quality)
         await element.render({ imageBlob: result.initial, textLayerData }, zoomAwareScale);
@@ -2499,7 +3134,7 @@ export class PdfInfiniteCanvas {
         if (!result.isFullQuality && result.upgradePromise) {
           result.upgradePromise.then(async (fullBlob) => {
             // Only upgrade if still visible and same render version
-            if (this.renderVersion !== version || !this.visiblePages.has(page)) {
+            if (this.zoomStateManager.getEpoch() !== version || !this.visiblePages.has(page)) {
               return;
             }
 
@@ -2522,10 +3157,15 @@ export class PdfInfiniteCanvas {
         const imageBlob = await this.getCachedPageImage(page);
 
         // BLANK PAGE FIX: Same pattern - show stale content if page has no content
-        const versionStale = this.renderVersion !== version;
+        const versionStale = this.zoomStateManager.getEpoch() !== version;
         const mustShowSomething = !element.getIsRendered();
 
-        if (versionStale && !mustShowSomething) return;
+        if (versionStale && !mustShowSomething) {
+          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
+          element.showCanvas();
+          element.hideLoading();
+          return;
+        }
 
         let textLayerData: TextLayerData | undefined;
         if (!versionStale) {
@@ -2536,7 +3176,12 @@ export class PdfInfiniteCanvas {
           }
         }
 
-        if (this.renderVersion !== version && element.getIsRendered()) return;
+        if (this.zoomStateManager.getEpoch() !== version && element.getIsRendered()) {
+          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
+          element.showCanvas();
+          element.hideLoading();
+          return;
+        }
 
         await element.render({ imageBlob, textLayerData }, zoomAwareScale);
         element.hideLoading();
@@ -2555,6 +3200,12 @@ export class PdfInfiniteCanvas {
         console.error(`Failed to render page ${page}:`, error);
       }
       element.hideLoading();
+
+      // BLANK PAGE FIX: prepareForFullPageRender() set canvas opacity=0.
+      // If render fails, we MUST show the canvas to avoid blank pages.
+      // Even stale/failed content is better than a completely hidden canvas.
+      element.showCanvas();
+      console.warn(`[PdfInfiniteCanvas] renderPageFull failed, restoring canvas visibility for page ${page}`);
     }
   }
 
@@ -2664,8 +3315,9 @@ export class PdfInfiniteCanvas {
     if (!cachedScale) return true; // Not cached, needs render
 
     // STUCK TILE FIX: Check if rendering mode should change
-    // Tiling threshold is zoom > 4.0 (see renderPage)
-    const TILING_THRESHOLD = 4.0;
+    // Use class-level TILING_THRESHOLD constant for consistency
+    // Note: Hysteresis only applies in zoomAtPoint() for mode transitions,
+    // not here for individual page rerender checks.
     // CRITICAL FIX: Use consistent zoom from snapshot (same pattern as other render calculations)
     // Priority: state machine snapshot > scroll snapshot > current camera
     const effectiveCamera = this.zoomStateMachine.getZoomSnapshot()?.camera ??
@@ -2673,7 +3325,8 @@ export class PdfInfiniteCanvas {
                             this.camera;
     const currentZoom = effectiveCamera.z;
     const wasTiled = this.pageWasTiled.get(page) ?? false;
-    const shouldBeTiled = currentZoom > TILING_THRESHOLD;
+    // EXTREME ZOOM FIX: Tiled rendering is only valid between TILING_THRESHOLD and MAX_TILED_ZOOM
+    const shouldBeTiled = currentZoom > this.TILING_THRESHOLD && currentZoom <= this.MAX_TILED_ZOOM;
 
     // Force re-render if mode changes (tiled ↔ full-page)
     if (wasTiled !== shouldBeTiled) {
@@ -2714,8 +3367,7 @@ export class PdfInfiniteCanvas {
     // Delegate to ZoomTransformLayer if available (centralized progressive rendering)
     if (this.zoomTransformLayer) {
       // FOCAL POINT FIX: Pass the focal point to ZoomTransformLayer
-      // Even though disableCssTransforms=true, the layer needs the focal point
-      // for internal calculations to maintain coordinate consistency
+      // The layer needs the focal point for coordinate consistency in progressive renders
       this.zoomTransformLayer.onZoomGesture(this.camera.z, this.lastZoomFocalPoint);
       return;
     }
@@ -2970,9 +3622,9 @@ export class PdfInfiniteCanvas {
    * @param newZoom - Target zoom level
    * @param focalPoint - Screen coordinates of zoom center (e.g., pinch midpoint)
    *
-   * TODO(Phase 2): This method is Phase 1 scaffolding. It will be integrated with
-   * gesture handlers in Phase 2 when the camera transform is simplified to translate-only.
-   * Current zoom handling uses the old cssStretch-based approach in gesture handlers.
+   * NOTE: This method was Phase 1 scaffolding. The cssStretch-based approach has been
+   * replaced with the unified coordinate space architecture (amnesia-c7w removed cssStretch
+   * tracking). This method is now fully integrated with gesture handlers via zoomAtPoint().
    */
   private handleZoomChange(newZoom: number, focalPoint: Point): void {
     const oldZoom = this.camera.z;
@@ -3120,6 +3772,11 @@ export class PdfInfiniteCanvas {
     // Notify ZoomTransformLayer that scale was rendered (for quality tracking)
     this.zoomTransformLayer?.onScaleRendered(scale);
 
+    // CRITICAL FIX: Also notify ZoomStateMachine so its renderState.renderScale stays in sync.
+    // Without this, the orchestrator's renderScale stays at initial value (2), causing
+    // cssStretch calculations to be wildly wrong (e.g., cssStretch=16 at zoom=16).
+    this.zoomStateMachine.onScaleRendered(scale);
+
     // Final phase completes the zoom gesture - reset animation state and state machine
     if (phase === 'final') {
       this.zoomTransformLayer?.onZoomGestureEnd();
@@ -3206,8 +3863,11 @@ export class PdfInfiniteCanvas {
       // ADJACENT TILE FIX: At high zoom in tiled mode, always re-render visible pages
       // to composite newly visible tiles as the user pans. Without this, tiles are
       // requested via triggerTilePrefetch() but never composited to the page canvas.
-      const TILING_THRESHOLD = 4.0;
-      const inTiledMode = snapshot.camera.z > TILING_THRESHOLD && this.useTiledRendering;
+      // Use class-level TILING_THRESHOLD constant for consistency
+      // EXTREME ZOOM FIX: Also respect MAX_TILED_ZOOM upper bound
+      const inTiledMode = snapshot.camera.z > this.TILING_THRESHOLD &&
+                          snapshot.camera.z <= this.MAX_TILED_ZOOM &&
+                          this.useTiledRendering;
 
       const pagesToRerender: number[] = [];
       for (const page of snapshotVisiblePages) {
@@ -3487,6 +4147,25 @@ export class PdfInfiniteCanvas {
     // Calculate target zoom based on gesture scale
     const targetZoom = this.gestureStartZoom * e.scale;
     const delta = 1 - targetZoom / this.camera.z;
+    const isZoomOut = delta > 0;
+    const isZoomIn = delta < 0;
+
+    // FIX (amnesia-7bg): Add rebound detection for Safari gesture events
+    // Same logic as handleWheel() - filter rebound events to prevent focal point drift
+    if (isZoomOut && this.zoomStateManager.isReboundZoomOut(600)) {
+      console.log('[PdfInfiniteCanvas] Safari: Filtered rebound zoom-out gesture (was at maxZoom)');
+      this.zoomStateMachine.signalOngoingActivity();
+      getTelemetry().trackReboundFilter('zoom-out', performance.now() - this.zoomStateManager.getGestureEndTime() || 0, true, false, true);
+      return;
+    }
+
+    if (isZoomIn && this.zoomStateManager.isReboundZoomIn(600)) {
+      console.log('[PdfInfiniteCanvas] Safari: Filtered rebound zoom-in gesture (was at minZoom)');
+      this.zoomStateMachine.signalOngoingActivity();
+      getTelemetry().trackReboundFilter('zoom-in', performance.now() - this.zoomStateManager.getGestureEndTime() || 0, false, true, true);
+      return;
+    }
+
     this.zoomAtPoint(point, delta);
   }
 
@@ -3519,12 +4198,40 @@ export class PdfInfiniteCanvas {
     if (isZoomGesture) {
       // Zoom gesture (pinch or Cmd+scroll)
       this.stopInertia();
+
+      // REBOUND DETECTION (amnesia-5so): Filter spurious zoom events from trackpad inertia.
+      // After hitting max zoom, trackpads send "rebound" zoom-out events that cause drift.
+      // We detect this by checking if we're in the rebound window after a gesture ended
+      // at a zoom boundary, and filter out opposing zoom events.
+      const delta = e.deltaY * 0.012;
+      const isZoomIn = delta < 0;
+      const isZoomOut = delta > 0;
+
+      if (isZoomOut && this.zoomStateManager.isReboundZoomOut(600)) {
+        // Rebound zoom-out after hitting max zoom - ignore to prevent drift
+        console.log('[PdfInfiniteCanvas] Filtered rebound zoom-out event (was at maxZoom)');
+        // FIX (amnesia-8pg): Use zoomStateMachine to reset gesture timer, not zoomStateManager (which is a no-op)
+        this.zoomStateMachine.signalOngoingActivity();
+        // Telemetry: Track rebound filter
+        getTelemetry().trackReboundFilter('zoom-out', performance.now() - this.zoomStateManager.getGestureEndTime() || 0, true, false, true);
+        return;
+      }
+
+      if (isZoomIn && this.zoomStateManager.isReboundZoomIn(600)) {
+        // Rebound zoom-in after hitting min zoom - ignore to prevent drift
+        console.log('[PdfInfiniteCanvas] Filtered rebound zoom-in event (was at minZoom)');
+        // FIX (amnesia-8pg): Use zoomStateMachine to reset gesture timer, not zoomStateManager (which is a no-op)
+        this.zoomStateMachine.signalOngoingActivity();
+        // Telemetry: Track rebound filter
+        getTelemetry().trackReboundFilter('zoom-in', performance.now() - this.zoomStateManager.getGestureEndTime() || 0, false, true, true);
+        return;
+      }
+
       // ZOOM SENSITIVITY: 0.012 gives ~12 wheel events from 1x to 16x
       // Formula: newZoom = oldZoom * (1 - delta), delta = deltaY * 0.012
       // At deltaY=-50: delta=-0.6, factor=1.6, so 1.6^7 ≈ 26 (reaches 16x in ~6-7 events)
       // This balances responsiveness with controllability.
       // Previous: 0.04 was too aggressive (3 events to max), 0.01 was too slow (14 events)
-      const delta = e.deltaY * 0.012;
       this.zoomAtPoint(point, delta);
     } else {
       // Pan gesture - direct 1:1 mapping for responsive scrolling
@@ -3745,6 +4452,18 @@ export class PdfInfiniteCanvas {
    * Zoom at a specific point
    */
   private zoomAtPoint(point: Point, delta: number): void {
+    // GESTURE ACTIVITY FIX: ALWAYS signal activity first - at the START of every zoom event.
+    // This prevents premature gesture-end timer expiration during rapid zoom gestures.
+    //
+    // Previously, signalOngoingActivity() was only called in the else branch (when zoom
+    // doesn't change, e.g., at max zoom limit). However, if gesture events come in bursts
+    // with >150ms gaps while zooming, the timer could fire mid-gesture.
+    //
+    // By signaling at the START, every gesture event resets the timer, ensuring:
+    // - Continuous pinch gestures are tracked as single gestures
+    // - Timer only fires after actual gesture end (no events for 150ms)
+    this.zoomStateMachine.signalOngoingActivity();
+
     // FOCAL POINT FIX: Track the focal point for ZoomTransformLayer
     // This ensures the zoom origin is consistent throughout the render pipeline,
     // preventing focus drift when ZoomTransformLayer calculates its transforms.
@@ -3772,18 +4491,24 @@ export class PdfInfiniteCanvas {
 
     this.camera = zoomCameraToPoint(this.camera, point, delta, constraints);
 
+    // ZOOM STATE MANAGER SYNC (amnesia-5so): Keep ZoomStateManager in sync with camera
+    // This enables epoch-based tile validation and rebound detection.
+    this.zoomStateManager.syncFromCamera(this.camera);
+
     if (this.camera.z !== oldZoom) {
       // Track zoom change for telemetry
       getTelemetry().trackZoomChange(oldZoom, this.camera.z);
 
-      // CRITICAL FIX: Apply position constraints BEFORE capturing snapshot.
-      // Previously, the snapshot was captured with unconstrained camera position,
-      // but the displayed camera was constrained. This caused tiles to be rendered
-      // for a position that didn't match what the user sees ("shifted zoom landing").
+      // FOCAL POINT PRESERVATION + SOFT CONSTRAINTS (amnesia-u9l):
+      // During gesture: apply SOFT constraints (rubber-band effect allows overscroll)
+      // After gesture: apply HARD constraints (snap back to valid bounds)
       //
-      // By constraining first, the snapshot matches the actual displayed position,
-      // ensuring tiles are rendered for the correct viewport.
-      this.constrainCameraPosition();
+      // The zoomCameraToPoint() function calculates a camera position that preserves
+      // the focal point (cursor/pinch center stays at same content position).
+      // Soft constraints allow slight overscroll during gesture for natural feel,
+      // then the gesture-end handler will apply hard constraints to snap back.
+      const isGestureActive = this.zoomStateMachine.getCurrentState() !== 'idle';
+      this.constrainCameraPositionPreservingFocalPoint(/* soft */ isGestureActive);
 
       // STATE MACHINE: Notify ZoomStateMachine of zoom change.
       // This replaces the old flag-based approach with centralized state management.
@@ -3794,19 +4519,64 @@ export class PdfInfiniteCanvas {
       // - After gesture ends + 200ms settling, trigger re-render callback
       //
       // NOTE: Snapshot now captures the CONSTRAINED camera position (matches display)
-      if (this.zoomStateMachine.getCurrentState() === 'idle') {
-        this.zoomStateMachine.startZoomGesture(
-          this.camera.z,
-          point,
-          { ...this.camera }
-        );
-      } else {
-        this.zoomStateMachine.updateZoomGesture(
-          this.camera.z,
-          point,
-          { ...this.camera }
-        );
+      //
+      // DRIFT FIX (amnesia-3of): Epoch increments on EVERY zoom change via syncFromCamera().
+      // This causes in-flight tiles (rendered for old zoom) to be discarded
+      // when they complete, preventing position mismatch/drift.
+      // The check at tile display time (epoch !== version) will reject them.
+      //
+      // CRITICAL: Epoch increments on EVERY zoom change via syncFromCamera() above.
+      // This invalidates in-flight tiles rendered at old zoom levels, preventing drift.
+      // During continuous pinch gestures, tiles rendered at zoom 1.5x would
+      // otherwise be accepted when we're at zoom 15.99x, causing drift.
+      console.log(`[PdfInfiniteCanvas] Zoom change: epoch=${this.zoomStateManager.getEpoch()}, zoom=${this.camera.z.toFixed(3)}`);
+
+      // Log gesture state for debugging
+      const currentState = this.zoomStateMachine.getCurrentState();
+
+      // MODE TRANSITION FIX with HYSTERESIS: executeModeTransition() increments epoch when zoom crosses threshold.
+      // This invalidates in-flight tiled renders when transitioning to full-page mode.
+      // Without this, old viewport-only tiles complete and display over the new full-page render,
+      // causing severe clipping because those tiles were rendered for a viewport-only region.
+      //
+      // HYSTERESIS: Prevents rapid mode switches when zoom fluctuates around threshold.
+      // - Currently in full-page mode: need zoom > 4.2 to switch to tiled
+      // - Currently in tiled mode: need zoom < 3.8 to switch to full-page
+      // This creates a 0.4 "sticky" zone where mode doesn't change, preventing:
+      // - Rapid zoom 3.9→4.1→3.8→4.0 causing 3 epoch bumps
+      // - Excessive invalidations and flicker at mode boundary
+      //
+      // EXTREME ZOOM FIX: Also respect MAX_TILED_ZOOM upper bound.
+      // At zoom > 16x, tiled rendering is disabled to prevent coordinate calculation issues.
+      const oldShouldTile = this.lastRenderMode === 'tiled';
+      const newShouldTile = this.lastRenderMode === 'full-page'
+        ? this.camera.z > (this.TILING_THRESHOLD + this.HYSTERESIS_BAND) && this.camera.z <= this.MAX_TILED_ZOOM
+        : this.camera.z > (this.TILING_THRESHOLD - this.HYSTERESIS_BAND) && this.camera.z <= this.MAX_TILED_ZOOM;
+      
+      // DEFERRED MODE TRANSITION (amnesia-z8v): Don't execute mode transitions during
+      // active gestures. Record the pending transition and execute it when gesture ends.
+      // This prevents blank frames when crossing the 4.0 threshold during pinch.
+      // Note: reusing isGestureActive from constraint logic above
+      
+      if (oldShouldTile !== newShouldTile) {
+        const targetMode = newShouldTile ? 'tiled' : 'full-page';
+        
+        if (isGestureActive) {
+          // During gesture: record pending transition, don't execute
+          this.pendingModeTransition = targetMode;
+          console.log(`[PdfInfiniteCanvas] Mode transition deferred: ${this.lastRenderMode} → ${targetMode} (gesture active)`);
+        } else {
+          // Gesture ended or not active: execute transition immediately
+          this.executeModeTransition(targetMode);
+        }
       }
+
+      // Delegate to ZoomStateMachine for state management (alias for ZoomOrchestrator)
+      this.zoomStateMachine.onZoomGesture(
+        this.camera.z,
+        point,
+        { ...this.camera }
+      );
 
       // NOTE: Removed abortAllPending() call - the ZoomStateMachine now handles this.
       // The state machine aborts pending renders in startZoomGesture() when transitioning
@@ -3891,6 +4661,9 @@ export class PdfInfiniteCanvas {
 
       this.onZoomChangeCallback?.(this.camera.z);
     }
+    // NOTE: Removed else branch that called signalOngoingActivity().
+    // Activity is now signaled at the START of zoomAtPoint() unconditionally,
+    // which handles both cases (zoom changed and zoom clamped at limit).
   }
 
   /**
@@ -4265,6 +5038,26 @@ export class PdfInfiniteCanvas {
   }
 
   /**
+   * Parse CSS transform string to extract scale and translate values
+   * Handles: scale(z) translate3d(x, y, 0) format
+   */
+  private parseTransform(css: string): { x: number; y: number; scale: number } | null {
+    // Match scale(z) translate3d(x, y, z) format
+    const scaleMatch = css.match(/scale\(([^)]+)\)/);
+    const translateMatch = css.match(/translate3d\(([^,]+)px,\s*([^,]+)px/);
+
+    if (!scaleMatch || !translateMatch) {
+      return null;
+    }
+
+    return {
+      scale: parseFloat(scaleMatch[1]),
+      x: parseFloat(translateMatch[1]),
+      y: parseFloat(translateMatch[2])
+    };
+  }
+
+  /**
    * Get page count
    */
   getPageCount(): number {
@@ -4315,7 +5108,7 @@ export class PdfInfiniteCanvas {
     }
     this.pageElements.clear();
     this.renderQueue = [];
-    this.renderVersion++;
+    this.zoomStateManager.incrementEpoch();
 
     // Setup initial view for new mode
     this.setupInitialView();
@@ -4392,7 +5185,7 @@ export class PdfInfiniteCanvas {
     }
     this.pageElements.clear();
     this.renderQueue = [];
-    this.renderVersion++;
+    this.zoomStateManager.incrementEpoch();
 
     // Center on current page
     this.fitPageInView(currentPage, false);
@@ -4459,6 +5252,11 @@ export class PdfInfiniteCanvas {
     // Destroy ZoomStateMachine
     if (this.zoomStateMachine) {
       this.zoomStateMachine.destroy();
+    }
+
+    // Destroy ZoomStateManager (amnesia-5so)
+    if (this.zoomStateManager) {
+      this.zoomStateManager.destroy();
     }
 
     // Destroy ZoomTransformLayer

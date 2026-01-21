@@ -40,6 +40,13 @@ export interface PdfPageElementConfig {
   useSvgTextLayer?: boolean;
   /** Debug mode for SVG text layer (makes text visible) */
   debugTextLayer?: boolean;
+  /**
+   * Native PDF page dimensions in points (e.g., 612×792 for letter).
+   * Used as fallback for tile coordinate calculations when pdfDimensions
+   * is not provided to renderTiles(). This prevents coordinate system
+   * mismatch when CSS pixel dimensions are used by mistake.
+   */
+  pdfDimensions?: { width: number; height: number };
 }
 
 export interface PageHighlight {
@@ -50,9 +57,39 @@ export interface PageHighlight {
 }
 
 /**
+ * Transform snapshot captured at tile REQUEST time.
+ * 
+ * Tiles take 100-300ms to render in workers. During this time, zoom may change,
+ * causing container dimensions to change. If we calculate transforms at DISPLAY
+ * time using current dimensions, the result will be wrong for tiles rendered
+ * for the previous dimensions.
+ * 
+ * Solution: Capture all transform-relevant values at REQUEST time and use
+ * these snapshot values at DISPLAY time.
+ * 
+ * @property containerWidth - Container width at request time
+ * @property containerHeight - Container height at request time
+ * @property pdfToElementScale - Scale from PDF to element coordinates at request time
+ * @property epoch - Zoom epoch for validating tile staleness
+ */
+export interface TransformSnapshot {
+  /** Container width at tile request time */
+  containerWidth: number;
+  /** Container height at tile request time */
+  containerHeight: number;
+  /** Scale from PDF to element coordinates: containerWidth / pdfWidth */
+  pdfToElementScale: number;
+  /** Zoom epoch from ZoomStateManager - used to detect stale tiles */
+  epoch: number;
+}
+
+/**
  * Individual PDF page element with all layers
  */
 export class PdfPageElement {
+  // DIAGNOSTIC: Global render sequence counter to track render ordering
+  private static renderSequence = 0;
+
   private container: HTMLDivElement;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
@@ -65,9 +102,22 @@ export class PdfPageElement {
   private offscreenCanvas: HTMLCanvasElement | null = null;
   private offscreenCtx: CanvasRenderingContext2D | null = null;
 
+  // DOUBLE-BUFFERING: Snapshot element for smooth mode transitions
+  // During full-page→tiled transitions, we capture the current canvas as an image
+  // and display it while new tiles render. This eliminates the "blank flash" that
+  // occurs when the canvas is hidden during mode transitions.
+  // PERF FIX: Use canvas instead of img for transition snapshot.
+  // drawImage() is a fast GPU copy (~1ms) vs toDataURL() which is CPU-bound (~100ms+).
+  private transitionSnapshot: HTMLCanvasElement | null = null;
+
   private config: Required<PdfPageElementConfig>;
   private currentWidth = 0;
   private currentHeight = 0;
+
+  // Native PDF dimensions in points (e.g., 612×792 for letter).
+  // Used as fallback for tile coordinate calculations when pdfDimensions
+  // parameter is not provided to renderTiles().
+  private storedPdfDimensions: { width: number; height: number } | null = null;
   private isRendered = false;
   private currentReadingMode: ReadingMode = 'light';
   private currentRenderMode: RenderMode = 'page';
@@ -98,10 +148,6 @@ export class PdfPageElement {
   private svgTextLayer: PdfSvgTextLayer | null = null;
   private useSvgTextLayer = true;
 
-  // CSS stretch tracking for zoom gesture freezing
-  // Tracks the current cssStretch applied to this page's transform
-  private currentCssStretch: number = 1;
-
   // UNIFIED COORDINATE SPACE: Final zoomed dimensions
   // In the new architecture, page elements are sized to their final displayed dimensions
   // rather than relying on camera scale transforms. This eliminates cssStretch compensation.
@@ -126,7 +172,14 @@ export class PdfPageElement {
       enableImageSmoothing: config.enableImageSmoothing ?? true,
       useSvgTextLayer: config.useSvgTextLayer ?? true,
       debugTextLayer: config.debugTextLayer ?? false,
+      // Note: pdfDimensions is stored separately in storedPdfDimensions
+      pdfDimensions: config.pdfDimensions ?? { width: 0, height: 0 }, // Default empty, real value in storedPdfDimensions
     };
+
+    // Store PDF dimensions for tile coordinate fallback
+    if (config.pdfDimensions) {
+      this.storedPdfDimensions = { ...config.pdfDimensions };
+    }
 
     // Set SVG text layer preference
     this.useSvgTextLayer = this.config.useSvgTextLayer;
@@ -139,17 +192,22 @@ export class PdfPageElement {
       position: relative;
       background: transparent;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-      overflow: hidden;
+      overflow: visible;
       flex-shrink: 0;
     `;
 
     // Create canvas
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'pdf-page-canvas';
+    // GPU COMPOSITING: Add will-change and translateZ(0) for GPU layer promotion.
+    // This ensures individual page canvases are composited on the GPU during zoom,
+    // preventing expensive software compositing and enabling 60fps performance.
     this.canvas.style.cssText = `
       display: block;
       width: 100%;
       height: 100%;
+      will-change: transform;
+      transform: translateZ(0);
     `;
     this.container.appendChild(this.canvas);
 
@@ -230,27 +288,8 @@ export class PdfPageElement {
   }
 
   /**
-   * Get the current cssStretch value applied to this page's transform.
-   * Used by PdfInfiniteCanvas to freeze cssStretch during zoom gestures.
-   */
-  getCurrentCssStretch(): number {
-    return this.currentCssStretch;
-  }
-
-  /**
-   * Reset cssStretch to 1 (exact scale).
-   *
-   * Called when zoom level changes significantly to prevent stale cssStretch
-   * values from persisting. Without this, cssStretch could stay inflated
-   * if fallback tiles are never fully replaced with exact tiles.
-   */
-  resetCssStretch(): void {
-    this.currentCssStretch = 1;
-  }
-
-  /**
    * Enable or disable CSS transitions on the canvas transform.
-   * Used to smoothly animate cssStretch changes when unfreezing after zoom.
+   * Used to smoothly animate mode transitions.
    *
    * @param enabled - Whether to enable smooth transitions
    */
@@ -274,6 +313,22 @@ export class PdfPageElement {
    */
   getIsRendered(): boolean {
     return this.isRendered;
+  }
+
+  /**
+   * Get current container width.
+   * DRIFT FIX: Used to capture snapshot at tile request time.
+   */
+  getCurrentWidth(): number {
+    return this.currentWidth;
+  }
+
+  /**
+   * Get current container height.
+   * DRIFT FIX: Used to capture snapshot at tile request time.
+   */
+  getCurrentHeight(): number {
+    return this.currentHeight;
   }
 
   /**
@@ -316,11 +371,16 @@ export class PdfPageElement {
    * This method will be removed once Phase 2 is complete.
    */
   setDimensions(width: number, height: number): void {
-    this.currentWidth = width;
-    this.currentHeight = height;
+    // H1 FIX: Round dimensions to integers for pixel-perfect alignment.
+    // This ensures container and canvas dimensions match exactly.
+    const roundedWidth = Math.round(width);
+    const roundedHeight = Math.round(height);
 
-    this.container.style.width = `${width}px`;
-    this.container.style.height = `${height}px`;
+    this.currentWidth = roundedWidth;
+    this.currentHeight = roundedHeight;
+
+    this.container.style.width = `${roundedWidth}px`;
+    this.container.style.height = `${roundedHeight}px`;
 
     // Update SVG text layer dimensions for proper scaling
     if (this.svgTextLayer) {
@@ -350,17 +410,22 @@ export class PdfPageElement {
    * @param zoom - Current zoom level (stored for tile rendering calculations)
    */
   setFinalDimensions(finalWidth: number, finalHeight: number, zoom: number): void {
-    this.finalWidth = finalWidth;
-    this.finalHeight = finalHeight;
+    // H1 FIX: Round dimensions to integers for pixel-perfect alignment.
+    // This ensures container and canvas dimensions match exactly.
+    const roundedWidth = Math.round(finalWidth);
+    const roundedHeight = Math.round(finalHeight);
+
+    this.finalWidth = roundedWidth;
+    this.finalHeight = roundedHeight;
     this.currentZoom = zoom;
 
     // Set DOM element size to final zoomed dimensions
-    this.container.style.width = `${finalWidth}px`;
-    this.container.style.height = `${finalHeight}px`;
+    this.container.style.width = `${roundedWidth}px`;
+    this.container.style.height = `${roundedHeight}px`;
 
     // Update internal tracking (currentWidth/Height used by rendering)
-    this.currentWidth = finalWidth;
-    this.currentHeight = finalHeight;
+    this.currentWidth = roundedWidth;
+    this.currentHeight = roundedHeight;
 
     // Update SVG text layer dimensions for proper scaling
     if (this.svgTextLayer) {
@@ -380,8 +445,9 @@ export class PdfPageElement {
       this.canvas.width = bufferWidth;
       this.canvas.height = bufferHeight;
       // Canvas CSS size matches final dimensions (DPR scaling done in buffer)
-      this.canvas.style.width = `${finalWidth}px`;
-      this.canvas.style.height = `${finalHeight}px`;
+      // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+      this.canvas.style.width = `${Math.round(finalWidth)}px`;
+      this.canvas.style.height = `${Math.round(finalHeight)}px`;
 
       // Clear any existing tile content - only needed when buffer actually resizes
       // This prevents unnecessary clearing during small zoom adjustments
@@ -408,6 +474,15 @@ export class PdfPageElement {
    */
   getFinalHeight(): number {
     return this.finalHeight;
+  }
+
+  /**
+   * Set native PDF page dimensions in points.
+   * Used as fallback for tile coordinate calculations when pdfDimensions
+   * parameter is not provided to renderTiles().
+   */
+  setPdfDimensions(width: number, height: number): void {
+    this.storedPdfDimensions = { width, height };
   }
 
   /**
@@ -452,8 +527,9 @@ export class PdfPageElement {
     this.canvas.style.backgroundRepeat = '';
 
     // Set canvas size for proper display (minimal operation)
-    this.canvas.style.width = `${this.currentWidth}px`;
-    this.canvas.style.height = `${this.currentHeight}px`;
+    // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+    this.canvas.style.width = `${Math.round(this.currentWidth)}px`;
+    this.canvas.style.height = `${Math.round(this.currentHeight)}px`;
   }
 
   /**
@@ -513,6 +589,13 @@ export class PdfPageElement {
 
     this.isRendered = true;
 
+    // Show canvas after render (may have been hidden during mode transition)
+    this.showCanvas();
+
+    // DOUBLE-BUFFERING: Remove transition snapshot now that new content is displayed.
+    // This completes the atomic swap - old content (snapshot) is replaced by new content (canvas).
+    this.clearTransitionSnapshot();
+
     // Track render time and scale
     const renderTime = performance.now() - startTime;
     telemetry.trackRenderTime(renderTime, 'page');
@@ -536,13 +619,104 @@ export class PdfPageElement {
     tiles: Array<{ tile: TileCoordinate; bitmap: ImageBitmap; cssStretch?: number }>,
     textLayerData: TextLayerData | undefined,
     zoom: number,
-    pdfDimensions?: { width: number; height: number }
+    pdfDimensions?: { width: number; height: number },
+    /**
+     * DRIFT FIX: Transform snapshot captured at tile REQUEST time.
+     *
+     * Tiles take 100-300ms to render in workers. During this time, zoom may change,
+     * causing container dimensions to change. Using current dimensions at DISPLAY time
+     * (for fitScale, pdfToElementScale calculations) when tiles were rendered for
+     * REQUEST time dimensions causes visual drift.
+     *
+     * Solution: Capture all transform-relevant values at REQUEST time (TransformSnapshot)
+     * and use those values at DISPLAY time.
+     *
+     * The epoch field allows validation: if current epoch !== snapshot.epoch,
+     * the zoom has changed since request and tiles may be stale.
+     */
+    transformSnapshot?: TransformSnapshot,
+    /**
+     * EPOCH VALIDATION: Current render epoch from the caller (pdf-infinite-canvas.renderVersion).
+     *
+     * When provided, validates that transformSnapshot.epoch matches currentEpoch.
+     * If mismatch detected (zoom changed since tile request), falls back to current
+     * dimensions instead of potentially stale snapshot dimensions.
+     */
+    currentEpoch?: number,
+    /**
+     * FORCE FULL PAGE FIX: When true, always use full-page canvas sizing regardless
+     * of how many tiles were actually received.
+     *
+     * During mode transition (full-page → tiled), getPageTileGrid() generates ALL
+     * tiles for the page. However, continuous zooming causes epoch changes that
+     * abort some tile renders. Only partial tiles reach renderTiles(), causing the
+     * isViewportOnly check to incorrectly size the canvas smaller than the full page.
+     *
+     * When forceFullPage=true (set during mode transition), we skip the isViewportOnly
+     * check and always use full-page dimensions, preventing blank areas.
+     */
+    forceFullPage?: boolean
   ): Promise<void> {
     const startTime = performance.now();
     const telemetry = getTelemetry();
 
-    // DEBUG: Log tile rendering call
-    console.log(`[PdfPageElement] renderTiles called: ${tiles.length} tiles, zoom=${zoom.toFixed(2)}, pdfDimensions=${JSON.stringify(pdfDimensions)}`);
+    // === TILE-RECEIVE-DEBUG === Log what tiles renderTiles actually receives
+    const renderSeq = ++PdfPageElement.renderSequence;
+    if (zoom >= 4 && tiles.length > 0) {
+      const tileXs = tiles.map(t => t.tile.tileX);
+      const tileYs = tiles.map(t => t.tile.tileY);
+      const minX = Math.min(...tileXs), maxX = Math.max(...tileXs);
+      const minY = Math.min(...tileYs), maxY = Math.max(...tileYs);
+      console.error(`[TILE-RECEIVE] seq=${renderSeq} page=${this.config.pageNumber} zoom=${zoom.toFixed(2)} tiles=${tiles.length}: X=[${minX}-${maxX}], Y=[${minY}-${maxY}], forceFullPage=${forceFullPage}`);
+    }
+
+    // DRIFT FIX: Use snapshot values (captured at request time) for CSS calculations.
+    // The container may have resized during the 100-300ms render window.
+    // Using current dimensions would cause position/size mismatch → visual drift.
+    const usedSnapshot = transformSnapshot !== undefined;
+
+    // EPOCH VALIDATION: Check if zoom has changed since tile request
+    // If snapshot.epoch !== currentEpoch, the zoom level has changed during the
+    // 100-300ms render window. In this case, the snapshot dimensions are stale
+    // and we should fall back to current dimensions to prevent coordinate drift.
+    const snapshotEpoch = transformSnapshot?.epoch ?? -1;
+    const epochValid = currentEpoch === undefined ||
+                       snapshotEpoch === -1 ||
+                       snapshotEpoch === currentEpoch;
+
+    // Use snapshot dimensions only if epoch is valid (no zoom change since request)
+    // Fall back to current dimensions if epoch mismatch detected
+    let effectiveWidth: number;
+    let effectiveHeight: number;
+
+    if (usedSnapshot && epochValid) {
+      // Epoch matches - safe to use snapshot dimensions
+      effectiveWidth = transformSnapshot!.containerWidth;
+      effectiveHeight = transformSnapshot!.containerHeight;
+    } else if (usedSnapshot && !epochValid) {
+      // GRACEFUL DEGRADATION (amnesia-g8d): Skip stale tiles, keep existing content visible.
+      // During rapid zoom gestures, epoch increments on every change, making in-flight
+      // tiles stale by the time they complete. Instead of rejecting and showing blank:
+      // 1. Close stale tile bitmaps (free memory)
+      // 2. Keep existing canvas content visible (user sees something)
+      // 3. Fresh tiles will be requested when gesture settles
+      //
+      // This matches iOS/macOS behavior: show degraded content while rendering,
+      // rather than showing nothing.
+      console.log(`[PDFPageElement] Skipping stale tiles (graceful degradation): epoch mismatch (snapshot.epoch=${snapshotEpoch}, currentEpoch=${currentEpoch})`);
+      // Close all bitmaps to prevent memory leak
+      for (const { bitmap } of tiles) {
+        bitmap.close();
+      }
+      return; // Keep existing content visible - NO BLANK SCREENS
+    } else {
+      // No snapshot provided - use current dimensions
+      effectiveWidth = this.currentWidth;
+      effectiveHeight = this.currentHeight;
+    }
+
+    const dimMismatch = usedSnapshot && Math.abs(transformSnapshot!.containerWidth - this.currentWidth) > 1;
+    console.log(`[TransformSnapshot] DISPLAY page=${this.config.pageNumber}: zoom=${zoom.toFixed(2)}, snapshot=${usedSnapshot ? `${transformSnapshot!.containerWidth.toFixed(0)}x${transformSnapshot!.containerHeight.toFixed(0)}, epoch=${snapshotEpoch}` : 'none'}, current=${this.currentWidth.toFixed(0)}x${this.currentHeight.toFixed(0)}, epochValid=${epochValid}, MISMATCH=${dimMismatch}`);
 
     // Guard: Return early if no tiles (prevents -Infinity in bounding box calculation)
     if (tiles.length === 0) {
@@ -553,9 +727,18 @@ export class PdfPageElement {
     // Clear CSS placeholder before drawing actual content
     this.clearPlaceholder();
 
-    // Get PDF dimensions for coordinate calculations
-    const pdfWidth = pdfDimensions?.width ?? this.currentWidth;
-    const pdfHeight = pdfDimensions?.height ?? this.currentHeight;
+    // Get PDF dimensions for coordinate calculations.
+    // CRITICAL: Use storedPdfDimensions (native PDF points, e.g., 612×792) as fallback,
+    // NOT currentWidth/Height (CSS pixels, e.g., 400×518). Using CSS pixels as PDF
+    // coordinates breaks tile calculations because tile coordinates are in PDF space.
+    const pdfWidth = pdfDimensions?.width ?? this.storedPdfDimensions?.width ?? this.currentWidth;
+    const pdfHeight = pdfDimensions?.height ?? this.storedPdfDimensions?.height ?? this.currentHeight;
+
+    // Debug: Log when falling back to stored or CSS dimensions
+    if (!pdfDimensions) {
+      const source = this.storedPdfDimensions ? 'storedPdfDimensions' : 'currentWidth/Height (WARNING: CSS pixels!)';
+      console.warn(`[PdfPageElement] renderTiles page=${this.config.pageNumber}: pdfDimensions not provided, using ${source}: ${pdfWidth}x${pdfHeight}`);
+    }
 
     // Get tile scale from first tile (all tiles in a render have same scale)
     // Fall back to valid tier from getTargetScaleTier if no tiles
@@ -568,6 +751,32 @@ export class PdfPageElement {
     // When useAdaptiveTileSize is enabled, tiles are 512px, not 256px (TILE_SIZE constant).
     const actualTileSize = getTileSize(zoom);
     const pdfTileSize = actualTileSize / tileScale;
+
+    // DEFENSIVE BOUNDS CHECK: Filter out tiles with invalid indices before processing.
+    // This catches tiles generated with mismatched tile sizes (e.g., 256px vs 512px grid).
+    // Tiles with indices beyond page bounds would cause blank areas and rendering issues.
+    const maxValidTileX = Math.ceil(pdfWidth / pdfTileSize);
+    const maxValidTileY = Math.ceil(pdfHeight / pdfTileSize);
+    const originalTileCount = tiles.length;
+    const validTiles = tiles.filter(({ tile }) => {
+      const isValid = tile.tileX >= 0 && tile.tileX < maxValidTileX &&
+                      tile.tileY >= 0 && tile.tileY < maxValidTileY;
+      if (!isValid) {
+        console.warn(`[PdfPageElement] FILTERED invalid tile: page=${this.config.pageNumber}, ` +
+          `tile=(${tile.tileX},${tile.tileY}), scale=${tile.scale}, ` +
+          `maxValid=(${maxValidTileX},${maxValidTileY}), pdfTileSize=${pdfTileSize.toFixed(1)}, ` +
+          `pdfSize=${pdfWidth.toFixed(1)}x${pdfHeight.toFixed(1)}`);
+      }
+      return isValid;
+    });
+
+    if (validTiles.length < originalTileCount) {
+      console.warn(`[PdfPageElement] Filtered ${originalTileCount - validTiles.length}/${originalTileCount} invalid tiles`);
+    }
+
+    // Use filtered tiles for the rest of processing
+    tiles = validTiles;
+
     let minTileX = Infinity, minTileY = Infinity, maxTileX = -Infinity, maxTileY = -Infinity;
     for (const { tile } of tiles) {
       minTileX = Math.min(minTileX, tile.tileX);
@@ -587,16 +796,47 @@ export class PdfPageElement {
     const tileBoundsWidth = Math.max(0, Math.min((maxTileX - minTileX + 1) * pdfTileSize, pdfWidth - tileBoundsX));
     const tileBoundsHeight = Math.max(0, Math.min((maxTileY - minTileY + 1) * pdfTileSize, pdfHeight - tileBoundsY));
 
-    // Guard: Skip if all tiles are outside page bounds (zero-size result)
+    // BLANK-AREA-DEBUG: Only log when there's a potential issue (bounds clamping or zero dimensions)
+    const boundsIssue = rawTileBoundsY > pdfHeight || tileBoundsWidth <= 0 || tileBoundsHeight <= 0;
+    if (boundsIssue) {
+      console.warn(`[BLANK-AREA-DEBUG] page=${this.config.pageNumber}: tiles=${tiles.length}, tileIndices=[${minTileX}-${maxTileX}, ${minTileY}-${maxTileY}], ` +
+        `pdfTileSize=${pdfTileSize.toFixed(1)}, scale=${tileScale}, rawBounds=(${rawTileBoundsX.toFixed(1)},${rawTileBoundsY.toFixed(1)}), ` +
+        `clampedBounds=(${tileBoundsX.toFixed(1)},${tileBoundsY.toFixed(1)} ${tileBoundsWidth.toFixed(1)}x${tileBoundsHeight.toFixed(1)}), ` +
+        `pdfSize=${pdfWidth.toFixed(1)}x${pdfHeight.toFixed(1)}, container=${this.currentWidth.toFixed(1)}x${this.currentHeight.toFixed(1)}`);
+    }
+
+    // Guard: If all tiles are outside page bounds (zero-size result), fall back to full page dimensions.
+    // This can happen at extreme zoom levels when tile coordinates are calculated for regions
+    // completely outside the visible page. Instead of returning (which leaves the page blank),
+    // we reset bounds to cover the full page so at least something renders.
+    let adjustedTileBoundsX = tileBoundsX;
+    let adjustedTileBoundsY = tileBoundsY;
+    let adjustedTileBoundsWidth = tileBoundsWidth;
+    let adjustedTileBoundsHeight = tileBoundsHeight;
+    let useContainerDimensionsDirectly = false;
+
     if (tileBoundsWidth <= 0 || tileBoundsHeight <= 0) {
-      console.warn(`[PdfPageElement] Skipping render: invalid tile bounds ${tileBoundsWidth.toFixed(1)}x${tileBoundsHeight.toFixed(1)} (tiles outside page)`);
-      return;
+      console.warn(`[PdfPageElement] Invalid tile bounds ${tileBoundsWidth.toFixed(1)}x${tileBoundsHeight.toFixed(1)} (tiles outside page), using container dimensions directly`);
+      adjustedTileBoundsX = 0;
+      adjustedTileBoundsY = 0;
+      adjustedTileBoundsWidth = pdfWidth;
+      adjustedTileBoundsHeight = pdfHeight;
+      // Flag to use container dimensions directly in CSS sizing to avoid 1px rounding mismatch
+      useContainerDimensionsDirectly = true;
     }
 
     // Check if we're rendering full page or viewport-only
-    const isViewportOnly = minTileX > 0 || minTileY > 0 ||
+    // FORCE FULL PAGE FIX: When forceFullPage=true (during mode transition), always
+    // use full-page sizing even if received tiles don't cover the full page.
+    // This prevents blank areas when some tiles are aborted during continuous zoom.
+    const tilesNotCoveringFullPage = minTileX > 0 || minTileY > 0 ||
                            (maxTileX + 1) * pdfTileSize < pdfWidth - pdfTileSize ||
                            (maxTileY + 1) * pdfTileSize < pdfHeight - pdfTileSize;
+    const isViewportOnly = tilesNotCoveringFullPage && !forceFullPage;
+
+    if (forceFullPage && tilesNotCoveringFullPage) {
+      console.log(`[PdfPageElement] forceFullPage=true but only got partial tiles (${tiles.length}), using full-page canvas sizing`);
+    }
 
     // CRITICAL FIX FOR VIEWPORT-ONLY RENDERING:
     // When rendering only visible tiles, size canvas to tile bounds, not full page.
@@ -604,13 +844,13 @@ export class PdfPageElement {
     let canvasWidth: number, canvasHeight: number;
     let canvasOffsetX = 0, canvasOffsetY = 0;
 
-    if (isViewportOnly && tiles.length > 0) {
-      // Viewport-only: canvas sized to tile bounds
-      canvasWidth = Math.ceil(tileBoundsWidth * tileScale);
-      canvasHeight = Math.ceil(tileBoundsHeight * tileScale);
-      canvasOffsetX = tileBoundsX;  // PDF coordinate offset
-      canvasOffsetY = tileBoundsY;
-      console.log(`[PdfPageElement] Viewport-only render: bounds=${tileBoundsX.toFixed(1)},${tileBoundsY.toFixed(1)} ${tileBoundsWidth.toFixed(1)}x${tileBoundsHeight.toFixed(1)}, canvas=${canvasWidth}x${canvasHeight}`);
+    if (isViewportOnly && tiles.length > 0 && tileBoundsWidth > 0 && tileBoundsHeight > 0) {
+      // Viewport-only: canvas sized to tile bounds (only if bounds are valid)
+      canvasWidth = Math.ceil(adjustedTileBoundsWidth * tileScale);
+      canvasHeight = Math.ceil(adjustedTileBoundsHeight * tileScale);
+      canvasOffsetX = adjustedTileBoundsX;  // PDF coordinate offset
+      canvasOffsetY = adjustedTileBoundsY;
+      console.log(`[PdfPageElement] Viewport-only render: bounds=${adjustedTileBoundsX.toFixed(1)},${adjustedTileBoundsY.toFixed(1)} ${adjustedTileBoundsWidth.toFixed(1)}x${adjustedTileBoundsHeight.toFixed(1)}, canvas=${canvasWidth}x${canvasHeight}`);
     } else {
       // Full page: canvas sized to full PDF dimensions
       canvasWidth = Math.ceil(pdfWidth * tileScale);
@@ -645,8 +885,42 @@ export class PdfPageElement {
 
     const offCtx = this.offscreenCtx!;
 
-    // Clear previous content (important when reusing canvas)
-    offCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+    // PROGRESSIVE RENDERING FIX (2026-01-21): Instead of clearing the canvas,
+    // PRESERVE existing content and draw tiles on top. This ensures:
+    // 1. Base layer (full-page render from lower zoom) remains visible
+    // 2. High-res tiles are drawn on top for crisp rendering
+    // 3. If some tiles fail, existing content prevents blank areas
+    //
+    // This mimics iOS CATiledLayer behavior where lower-res content shows
+    // while higher-res tiles load progressively.
+    if (needsOffscreenResize) {
+      // Canvas was just created or resized - start fresh
+      offCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+      // Copy existing main canvas content if available and dimensions are compatible
+      // This preserves the full-page render as a base layer
+      if (this.canvas.width > 0 && this.canvas.height > 0 && this.isRendered) {
+        try {
+          // Scale existing content to fit new canvas dimensions
+          offCtx.drawImage(this.canvas, 0, 0, canvasWidth, canvasHeight);
+        } catch {
+          // Ignore errors (e.g., if canvas is tainted or empty)
+        }
+      }
+    } else {
+      // Canvas same size - copy existing content from main canvas to preserve it
+      // Then tiles will be drawn on top
+      if (this.canvas.width === canvasWidth && this.canvas.height === canvasHeight && this.isRendered) {
+        try {
+          offCtx.drawImage(this.canvas, 0, 0);
+        } catch {
+          // Ignore errors - will just render tiles without base layer
+          offCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+        }
+      } else {
+        offCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+      }
+    }
 
     // Configure offscreen context
     offCtx.imageSmoothingEnabled = true;
@@ -655,6 +929,9 @@ export class PdfPageElement {
     // Draw each tile at its correct position (1:1 with tile resolution)
     // Each tile covers (TILE_SIZE / tileScale) PDF points and is TILE_SIZE pixels
     // For viewport-only rendering, positions are relative to canvasOffsetX/Y
+    let tilesDrawn = 0;
+    let tilesSkippedOutOfBounds = 0;
+
     for (const { tile, bitmap } of tiles) {
       // Position in PDF coordinates (absolute page position)
       const tilePdfX = tile.tileX * pdfTileSize;
@@ -663,6 +940,20 @@ export class PdfPageElement {
       // Canvas position: relative to canvas origin (which may be offset for viewport-only)
       const canvasX = Math.round((tilePdfX - canvasOffsetX) * tile.scale);
       const canvasY = Math.round((tilePdfY - canvasOffsetY) * tile.scale);
+
+      // OUT-OF-BOUNDS FIX: Skip tiles that would be drawn outside the canvas.
+      // This can happen when tiles are calculated for regions outside the page
+      // (detected by useContainerDimensionsDirectly=true). Even though we resize
+      // the canvas to full page, tiles still have their original coordinates.
+      if (canvasX >= canvasWidth || canvasY >= canvasHeight || canvasX < -4096 || canvasY < -4096) {
+        // DIAGNOSTIC: Log first out-of-bounds tile to understand coordinate mismatch
+        if (tilesSkippedOutOfBounds === 0) {
+          console.warn(`[PdfPageElement] OUT-OF-BOUNDS tile: page=${this.config.pageNumber}, tile=(${tile.tileX},${tile.tileY}), scale=${tile.scale}, pdfTileSize=${pdfTileSize.toFixed(2)}, tilePdfX=${tilePdfX.toFixed(1)}, tilePdfY=${tilePdfY.toFixed(1)}, canvasOffset=(${canvasOffsetX.toFixed(1)},${canvasOffsetY.toFixed(1)}), canvasPos=(${canvasX},${canvasY}), canvasSize=${canvasWidth}x${canvasHeight}, pdfSize=${pdfWidth.toFixed(1)}x${pdfHeight.toFixed(1)}`);
+        }
+        bitmap.close();
+        tilesSkippedOutOfBounds++;
+        continue;
+      }
 
       // Calculate next tile position to determine exact draw size (eliminates gaps at page edges)
       const nextPdfX = (tile.tileX + 1) * pdfTileSize;
@@ -689,12 +980,30 @@ export class PdfPageElement {
         drawHeight
       );
 
+      // COORDINATE DEBUG: Log first 3 tiles to trace positioning
+      if (tilesDrawn < 3) {
+        console.log(`[TILE-COORD-DEBUG] page=${this.config.pageNumber}, tile(${tile.tileX},${tile.tileY}): pdfPos=(${tilePdfX.toFixed(0)},${tilePdfY.toFixed(0)}), canvasPos=(${canvasX},${canvasY}), size=${drawWidth}x${drawHeight}, offset=(${canvasOffsetX.toFixed(0)},${canvasOffsetY.toFixed(0)})`);
+      }
+
       // Close bitmap to free memory - we own it (created fresh from cache)
       bitmap.close();
+      tilesDrawn++;
     }
 
-    // DEBUG: Log tiles drawn
-    console.log(`[PdfPageElement] Drew ${tiles.length} tiles to offscreen canvas ${canvasWidth}x${canvasHeight}`);
+    // DEBUG: Log tiles drawn with render sequence
+    if (tilesSkippedOutOfBounds > 0) {
+      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn}/${tiles.length} tiles, canvas=${canvasWidth}x${canvasHeight} (${tilesSkippedOutOfBounds} skipped: out of bounds), forceFullPage=${!isViewportOnly}`);
+    } else {
+      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn} tiles, canvas=${canvasWidth}x${canvasHeight}, forceFullPage=${!isViewportOnly}`);
+    }
+
+    // ALL-TILES-OUT-OF-BOUNDS FIX: If all tiles were skipped, throw an error
+    // to trigger fallback to full-page rendering in the caller.
+    // This can happen at extreme zoom when tile coordinates are calculated for
+    // regions entirely outside the visible page.
+    if (tilesDrawn === 0 && tiles.length > 0) {
+      throw new Error(`[PdfPageElement] All ${tiles.length} tiles were out of bounds (skipped ${tilesSkippedOutOfBounds}). Need full-page fallback.`);
+    }
 
     // Now atomically update the visible canvas
     // Resize main canvas if needed (this clears it, but we immediately redraw)
@@ -710,7 +1019,8 @@ export class PdfPageElement {
     // UNIFIED COORDINATE SPACE: Simplified tile positioning
     // In unified space, page elements are already at their final zoomed size.
     // Tiles are positioned exactly without CSS scale transforms.
-    const useUnifiedSpace = isFeatureEnabled('useUnifiedCoordinateSpace');
+    // NOTE: Unified space is disabled - use legacy mode.
+    const useUnifiedSpace: boolean = false;
 
     if (useUnifiedSpace) {
       // UNIFIED: Direct tile positioning without cssStretch
@@ -726,7 +1036,8 @@ export class PdfPageElement {
       // Calculate position in page element coordinates
       // Note: In unified space, page element is sized to zoom * PDF dimensions
       // So we scale from PDF coordinates to page element coordinates
-      const pageToElementScale = this.currentWidth / pdfWidth;
+      // TRANSFORM SNAPSHOT FIX: Use pdfToElementScale from snapshot when available.
+      const pageToElementScale = transformSnapshot?.pdfToElementScale ?? (effectiveWidth / pdfWidth);
       const elementOffsetX = canvasOffsetX * pageToElementScale;
       const elementOffsetY = canvasOffsetY * pageToElementScale;
 
@@ -734,155 +1045,111 @@ export class PdfPageElement {
       const cssWidth = canvasWidth / dpr;
       const cssHeight = canvasHeight / dpr;
 
-      // The tile bounds in element coordinates
-      const elementBoundsWidth = tileBoundsWidth * pageToElementScale;
-      const elementBoundsHeight = tileBoundsHeight * pageToElementScale;
+      // The tile bounds in element coordinates (use adjusted bounds for invalid tile edge case)
+      let elementBoundsWidth = adjustedTileBoundsWidth * pageToElementScale;
+      let elementBoundsHeight = adjustedTileBoundsHeight * pageToElementScale;
+
+      // DIMENSION MATCH FIX: When bounds were invalid, use container dimensions directly.
+      if (useContainerDimensionsDirectly) {
+        elementBoundsWidth = this.currentWidth;
+        elementBoundsHeight = this.currentHeight;
+      }
 
       // Scale to fit CSS-sized canvas into element bounds
-      // Calculate both X and Y scale to verify aspect ratio preservation
-      const scaleX = elementBoundsWidth / cssWidth;
-      const scaleY = elementBoundsHeight / cssHeight;
+      // PAGE SCALE STABILITY FIX (Remediation Plan 2026-01-19):
+      // UNIFIED mode: Canvas CSS size = tile bounds in element coordinates, NO scale transform.
+      // The high-res buffer provides crisp pixels when camera zooms.
 
-      // Verify aspect ratio matches (within tolerance for floating-point precision)
-      if (Math.abs(scaleX - scaleY) > 0.01) {
-        console.warn(`[PdfPageElement:UNIFIED] Aspect ratio mismatch: scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}`);
-      }
-
-      // Use uniform scale (prefer width-based as it's consistent with legacy path)
-      const fitScale = scaleX;
-
-      this.canvas.style.width = `${cssWidth}px`;
-      this.canvas.style.height = `${cssHeight}px`;
-      this.canvas.style.transform = `translate(${elementOffsetX}px, ${elementOffsetY}px) scale(${fitScale})`;
+      this.canvas.style.width = `${elementBoundsWidth}px`;
+      this.canvas.style.height = `${elementBoundsHeight}px`;
+      this.canvas.style.transform = `translate(${elementOffsetX}px, ${elementOffsetY}px)`; // NO scale
       this.canvas.style.transformOrigin = '0 0';
 
-      // No cssStretch tracking in unified space
-      this.currentCssStretch = 1;
-
-      console.log(`[PdfPageElement:UNIFIED] buffer=${canvasWidth}×${canvasHeight}, css=${cssWidth.toFixed(1)}×${cssHeight.toFixed(1)}, fitScale=${fitScale.toFixed(4)}, offset=${elementOffsetX.toFixed(1)},${elementOffsetY.toFixed(1)}`);
+      console.log(`[STABILITY-FIX] UNIFIED buffer=${canvasWidth}×${canvasHeight}, css=${elementBoundsWidth.toFixed(1)}×${elementBoundsHeight.toFixed(1)}, offset=${elementOffsetX.toFixed(1)},${elementOffsetY.toFixed(1)} (snapshot: ${usedSnapshot})`);
     } else {
-      // LEGACY: cssStretch-based positioning
-      // Calculate average cssStretch for compensating fallback tile resolution
-      // cssStretch > 1 means using a lower-res fallback tile (needs scale-up to match layout)
-      // cssStretch < 1 means using a higher-res tile (rare, during scale tier transitions)
-      let avgCssStretch = tiles.reduce((sum, t) => sum + (t.cssStretch ?? 1), 0) / tiles.length;
-
-      // Defensive validation: guard against invalid cssStretch values (NaN, Infinity, 0, negative)
-      if (!isFinite(avgCssStretch) || avgCssStretch <= 0) {
-        console.warn(`[PdfPageElement] Invalid avgCssStretch: ${avgCssStretch}, defaulting to 1`);
-        avgCssStretch = 1;
-      }
-
-      // Track current cssStretch for render pipeline debugging
-      const previousStretch = this.currentCssStretch;
-      this.currentCssStretch = avgCssStretch;
-
-      // Record cssStretch change for debugging the zoom bump
+      // LEGACY: Direct tile positioning (cssStretch tracking removed - amnesia-c7w)
       const coordDebugger = getCoordinateDebugger();
-      if (coordDebugger.isEnabled() && Math.abs(avgCssStretch - previousStretch) > 0.001) {
-        const tileScales = tiles.map(t => t.tile.scale);
-        const uniqueScales = [...new Set(tileScales)];
-        coordDebugger.recordCssStretchChange({
-          page: this.config.pageNumber,
-          previousStretch,
-          newStretch: avgCssStretch,
-          tileScales: uniqueScales,
-          requestedScale: tiles[0]?.tile.scale ?? 1,
-        });
-      }
 
       if (isViewportOnly) {
       // VIEWPORT-ONLY: Canvas covers only visible tiles, positioned at offset
       //
-      // SHARPNESS FIX: Apply same DPR-based sizing as full-page rendering.
-      // The canvas buffer (e.g., 1024×768) should map 1:1 to device pixels for crisp rendering.
-      // Without this fix, the canvas gets a tiny CSS size (58×43px) causing extreme blur
-      // when the buffer is stretched to fit.
+      // PAGE SCALE STABILITY FIX (Remediation Plan 2026-01-19):
+      // Eliminate fitScale CSS transform entirely. The camera transform is the ONLY zoom mechanism.
       //
       // Strategy:
-      // 1. CSS size = buffer / DPR (ensures 1:1 device pixel mapping)
-      // 2. Transform: translate to position + scale to fit the layout slot
-      // 3. Camera zoom handles final display scaling
+      // 1. Canvas CSS size = tile bounds in page coordinates (FIXED relative to container)
+      // 2. Canvas buffer = high resolution (provides crisp pixels when camera zooms)
+      // 3. Transform = translate only (position within container, NO scale)
+      // 4. Camera transform handles ALL visual zoom magnification
+      //
+      // This eliminates the "two transforms fighting" problem that caused focal point drift.
 
-      const dpr = window.devicePixelRatio || 2;
-      const cssWidth = canvasWidth / dpr;
-      const cssHeight = canvasHeight / dpr;
+      // Calculate the tile bounds in page element coordinates
+      // TRANSFORM SNAPSHOT FIX: Use pdfToElementScale from snapshot when available.
+      // The snapshot captures this value at tile REQUEST time.
+      // Using current dimensions (which may have changed during render) causes position mismatch.
+      // Fall back to calculation from effectiveWidth for backwards compatibility.
+      const pdfToElementScale = transformSnapshot?.pdfToElementScale ?? (effectiveWidth / pdfWidth);
+      let layoutBoundsWidth = adjustedTileBoundsWidth * pdfToElementScale;
+      let layoutBoundsHeight = adjustedTileBoundsHeight * pdfToElementScale;
 
-      // Calculate the PDF bounds this canvas covers, in layout coordinates (at zoom=1)
-      const pdfToElementScale = this.currentWidth / pdfWidth;
-      const layoutBoundsWidth = tileBoundsWidth * pdfToElementScale;
-      const layoutBoundsHeight = tileBoundsHeight * pdfToElementScale;
-
-      // Scale factor to fit the DPR-sized CSS canvas into the layout bounds
-      const fitScale = layoutBoundsWidth / cssWidth;
+      // DIMENSION MATCH FIX: When bounds were invalid (useContainerDimensionsDirectly=true),
+      // use container dimensions directly to avoid 1px mismatch from PDF aspect ratio calculation.
+      if (useContainerDimensionsDirectly) {
+        layoutBoundsWidth = this.currentWidth;
+        layoutBoundsHeight = this.currentHeight;
+      }
 
       // Position within page element coordinate system
-      const cssOffsetX = Math.floor(canvasOffsetX * pdfToElementScale);
-      const cssOffsetY = Math.floor(canvasOffsetY * pdfToElementScale);
+      const cssOffsetX = canvasOffsetX * pdfToElementScale;
+      const cssOffsetY = canvasOffsetY * pdfToElementScale;
 
-      this.canvas.style.width = `${cssWidth}px`;
-      this.canvas.style.height = `${cssHeight}px`;
-      // ZOOM BUMP FIX: Do NOT include cssStretch in the transform.
-      // Previously: scale(fitScale × cssStretch) caused visual jumps when cssStretch changed
-      // (e.g., 2.0 → 1.0 = 50% size change when exact tiles replace fallback tiles).
-      // Now: scale(fitScale) only - fallback tiles appear pixelated but correctly positioned.
-      // This eliminates the visual "bump" at the cost of temporary pixelation during zoom.
-      const transformStr = `translate(${cssOffsetX}px, ${cssOffsetY}px) scale(${fitScale})`;
+      // Canvas CSS size = tile bounds in page coordinates (FIXED, no fitScale)
+      // The high-res buffer provides oversampling for crisp rendering when camera zooms
+      // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+      this.canvas.style.width = `${Math.round(layoutBoundsWidth)}px`;
+      this.canvas.style.height = `${Math.round(layoutBoundsHeight)}px`;
+
+      // Transform = translate only (NO scale) - camera handles all zoom
+      const transformStr = `translate(${cssOffsetX}px, ${cssOffsetY}px)`;
       this.canvas.style.transform = transformStr;
       this.canvas.style.transformOrigin = '0 0';
 
-      // Record transform application for debugging the zoom bump
+      // Record transform application for debugging (cssStretch removed - amnesia-c7w)
       coordDebugger.recordTransformApply({
         page: this.config.pageNumber,
         transform: transformStr,
-        cssStretch: avgCssStretch,
-        fitScale,
+        cssStretch: 1, // Always 1 in unified coordinate space
+        fitScale: 1,
         offsetX: cssOffsetX,
         offsetY: cssOffsetY,
       });
 
-      console.log(`[PdfPageElement] Viewport-only CSS: buffer=${canvasWidth}×${canvasHeight}, css=${cssWidth.toFixed(1)}×${cssHeight.toFixed(1)}, fitScale=${fitScale.toFixed(4)}, cssStretch=${avgCssStretch.toFixed(3)}, offset=${cssOffsetX},${cssOffsetY}`);
+      console.log(`[STABILITY-FIX] VIEWPORT page=${this.config.pageNumber}: cssSize=${layoutBoundsWidth.toFixed(1)}x${layoutBoundsHeight.toFixed(1)}, offset=${cssOffsetX.toFixed(1)},${cssOffsetY.toFixed(1)}, transform="${transformStr}" (NO scale)`);
     } else {
-      // FULL-PAGE: Canvas uses buffer-proportional CSS size for crisp rendering
-      //
-      // SHARPNESS FIX: When canvas buffer >> CSS size, browser downscales
-      // with interpolation, causing blur. Fix: set CSS size = buffer / DPR,
-      // then scale to fit layout slot. This ensures buffer pixels match
-      // device pixels (1:1 for crisp rendering), then transform scales
-      // without quality loss.
-      //
-      // Example at 16x zoom with DPR 2:
-      //   - Buffer: 19,584px (612 × 32)
-      //   - CSS: 9,792px (19,584 / 2) = 1:1 with device pixels
-      //   - Transform: scale(0.0408) to fit 400px layout slot
-      //   - Camera zoom: 16x scales 400px → 6,400px final display
-      //   - Final ratio: 19,584 / 6,400 = 3.06 buffer per screen pixel (crisp!)
-      const dpr = window.devicePixelRatio || 2;
-      const cssWidth = canvasWidth / dpr;
-      const cssHeight = canvasHeight / dpr;
+      // FULL-PAGE: Canvas CSS size = container size (FIXED), NO fitScale transform.
+      // Canvas CSS size = container size (FIXED, no fitScale)
+      // DRIFT FIX: Use effectiveWidth/Height (from snapshot) instead of this.currentWidth/Height
+      // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+      // DIMENSION MATCH FIX: When bounds were invalid, use container dimensions directly.
+      const finalWidth = useContainerDimensionsDirectly ? this.currentWidth : effectiveWidth;
+      const finalHeight = useContainerDimensionsDirectly ? this.currentHeight : effectiveHeight;
+      this.canvas.style.width = `${Math.round(finalWidth)}px`;
+      this.canvas.style.height = `${Math.round(finalHeight)}px`;
 
-      // Scale factor to fit the high-res CSS size into the layout slot
-      const fitScale = this.currentWidth / cssWidth;
-
-      this.canvas.style.width = `${cssWidth}px`;
-      this.canvas.style.height = `${cssHeight}px`;
-      // ZOOM BUMP FIX: Do NOT include cssStretch in the transform.
-      // Previously: scale(fitScale × cssStretch) caused visual jumps when cssStretch changed.
-      // Now: scale(fitScale) only - fallback tiles appear pixelated but correctly positioned.
-      //
-      // TRANSITION FIX: Always use translate(0, 0) even for full-page rendering.
-      // This ensures CSS transitions between full-page and viewport-only modes
-      // can smoothly interpolate the translate values instead of jumping.
-      const transformStr = `translate(0px, 0px) scale(${fitScale})`;
+      // Transform = translate only (NO scale) - camera handles all zoom
+      const transformStr = `translate(0px, 0px)`;
       this.canvas.style.transform = transformStr;
       this.canvas.style.transformOrigin = '0 0';
 
-      // Record transform application for debugging the zoom bump
+      console.log(`[STABILITY-FIX] FULLPAGE page=${this.config.pageNumber}: cssSize=${effectiveWidth.toFixed(1)}x${effectiveHeight.toFixed(1)}, transform="${transformStr}" (snapshot: ${usedSnapshot})`);
+
+      // Record transform application for debugging (cssStretch removed - amnesia-c7w)
       coordDebugger.recordTransformApply({
         page: this.config.pageNumber,
         transform: transformStr,
-        cssStretch: avgCssStretch,
-        fitScale,
+        cssStretch: 1, // Always 1 in unified coordinate space
+        fitScale: 1,
         offsetX: 0,
         offsetY: 0,
       });
@@ -899,6 +1166,13 @@ export class PdfPageElement {
     }
 
     this.isRendered = true;
+
+    // Show canvas after render (may have been hidden during mode transition)
+    this.showCanvas();
+
+    // DOUBLE-BUFFERING: Remove transition snapshot now that new content is displayed.
+    // This completes the atomic swap - old content (snapshot) is replaced by new content (canvas).
+    this.clearTransitionSnapshot();
 
     // Track render time and scale
     const renderTime = performance.now() - startTime;
@@ -950,17 +1224,31 @@ export class PdfPageElement {
         this.canvas.width = result.naturalWidth;
         this.canvas.height = result.naturalHeight;
 
-        // SHARPNESS FIX: Set CSS size = buffer / DPR to prevent browser downscaling
-        // Then use transform to fit the layout slot
-        const dpr = window.devicePixelRatio || 2;
-        const cssWidth = result.naturalWidth / dpr;
-        const cssHeight = result.naturalHeight / dpr;
-        const fitScale = this.currentWidth / cssWidth;
+        // DIMENSION MATCH FIX: Use container dimensions directly for canvas CSS.
+        // Previously we derived CSS from buffer aspect ratio, but MuPDF's dimension
+        // capping (4096px max) creates slight aspect ratio differences:
+        // - PDF aspect: 612/792 = 0.7727
+        // - Buffer aspect: 3166/4096 = 0.7729
+        //
+        // This 0.02% difference causes Math.round to produce different values:
+        // - Container: Math.round(400/0.7727) = 518
+        // - Canvas: Math.round(400/0.7729) = 517
+        //
+        // The 1px gap causes visible clipping at the bottom of pages.
+        //
+        // FIX: Use container dimensions directly. The browser will scale the buffer
+        // to fit the CSS dimensions. The <0.2% aspect ratio distortion is imperceptible,
+        // but the 1px gap was very visible.
+        const cssWidth = Math.round(this.currentWidth);
+        const cssHeight = Math.round(this.currentHeight);
+        const bufferAspectRatio = result.naturalWidth / result.naturalHeight;
 
         this.canvas.style.width = `${cssWidth}px`;
         this.canvas.style.height = `${cssHeight}px`;
-        this.canvas.style.transform = `scale(${fitScale})`;
+        this.canvas.style.transform = ''; // NO scale transform - camera handles all zoom
         this.canvas.style.transformOrigin = '0 0';
+
+        console.log(`[DIMENSION-MATCH-FIX] renderCanvas: canvasCss=${cssWidth}x${cssHeight}, containerCss=${this.currentWidth}x${this.currentHeight} (buffer ${result.naturalWidth}x${result.naturalHeight}, aspect=${bufferAspectRatio.toFixed(4)})`);
 
         // Reset transform and draw at native resolution
         this.ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -998,17 +1286,18 @@ export class PdfPageElement {
           this.canvas.width = image.naturalWidth;
           this.canvas.height = image.naturalHeight;
 
-          // SHARPNESS FIX: Set CSS size = buffer / DPR to prevent browser downscaling
-          // Then use transform to fit the layout slot
-          const dpr = window.devicePixelRatio || 2;
-          const cssWidth = image.naturalWidth / dpr;
-          const cssHeight = image.naturalHeight / dpr;
-          const fitScale = this.currentWidth / cssWidth;
+          // DIMENSION MATCH FIX: Use container dimensions directly for canvas CSS.
+          // See renderCanvas() for full explanation of why this is needed.
+          const cssWidth = Math.round(this.currentWidth);
+          const cssHeight = Math.round(this.currentHeight);
+          const bufferAspectRatio = image.naturalWidth / image.naturalHeight;
 
           this.canvas.style.width = `${cssWidth}px`;
           this.canvas.style.height = `${cssHeight}px`;
-          this.canvas.style.transform = `scale(${fitScale})`;
+          this.canvas.style.transform = ''; // NO scale transform - camera handles all zoom
           this.canvas.style.transformOrigin = '0 0';
+
+          console.log(`[DIMENSION-MATCH-FIX] renderCanvasFallback: canvasCss=${cssWidth}x${cssHeight}, containerCss=${this.currentWidth}x${this.currentHeight} (buffer ${image.naturalWidth}x${image.naturalHeight}, aspect=${bufferAspectRatio.toFixed(4)})`);
 
           // Reset transform and draw at native resolution
           this.ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1622,6 +1911,282 @@ export class PdfPageElement {
   }
 
   /**
+   * Prepare for full-page rendering by resetting canvas CSS to container size.
+   *
+   * PAGE SCALE STABILITY FIX: During mode transitions (tiled → full-page),
+   * the old viewport-only canvas has CSS size = tile bounds and transform = translate(offset).
+   * This causes visual jarring when camera zoom changes during the async render wait.
+   *
+   * By immediately resetting CSS to container size and clearing transform,
+   * we ensure the canvas displays at correct proportions while waiting for the new render.
+   */
+  prepareForFullPageRender(): void {
+    // GOLDEN FRAME LOG (Protocol C): Capture all dimension-related values for hypothesis debugging
+    // This log is critical for diagnosing dimension mismatches during mode transitions
+    const containerRect = this.container.getBoundingClientRect();
+    const goldenFrameLog = {
+      mode: 'tiled→full-page transition',
+      page: this.config.pageNumber,
+      camera: { zoom: this.currentZoom },
+      // CSS dimensions from state (may be floats, rounded at source since H1 fix)
+      cssWidth: this.currentWidth,
+      cssHeight: this.currentHeight,
+      // Container measurements (Protocol C recommended)
+      containerBoundingRect: { w: containerRect.width, h: containerRect.height },
+      containerOffset: { w: this.container.offsetWidth, h: this.container.offsetHeight },
+      // Canvas buffer dimensions (integers via Math.ceil in renderTiles)
+      canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
+      // Parsed CSS style dimensions
+      canvasCss: {
+        w: parseFloat(this.canvas.style.width) || this.currentWidth,
+        h: parseFloat(this.canvas.style.height) || this.currentHeight,
+      },
+      // PDF coordinate system (native PDF points, e.g., 612×792)
+      storedPdfDimensions: this.storedPdfDimensions,
+      // Snapshot canvas dimensions (if exists)
+      snapshotCanvas: this.transitionSnapshot
+        ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
+        : null,
+      // Delta between buffer and CSS (H1 hypothesis target - should be 0 after fix)
+      heightDelta: this.canvas.height - (parseFloat(this.canvas.style.height) || this.currentHeight),
+    };
+    console.log('[GOLDEN-FRAME]', goldenFrameLog);
+
+    // MODE TRANSITION FIX (amnesia-8jm): Use double-buffering for tiled→full-page transition.
+    // The old viewport-only canvas buffer contains a small region of the page.
+    // Instead of hiding with opacity:0 (which shows blank), we capture a snapshot
+    // at the current CSS size/position, then change the canvas dimensions.
+    // The snapshot stays visible until new render completes.
+
+    // DOUBLE-BUFFERING: Capture current canvas content as a snapshot
+    // This is the same approach used in prepareForTiledRender() for consistency
+    if (this.canvas.width > 0 && this.canvas.height > 0) {
+      if (!this.transitionSnapshot) {
+        this.transitionSnapshot = document.createElement('canvas');
+        this.transitionSnapshot.className = 'pdf-transition-snapshot';
+        this.transitionSnapshot.style.cssText = `
+          position: absolute;
+          top: 0;
+          left: 0;
+          pointer-events: none;
+          z-index: 5;
+        `;
+      }
+
+      // MODE TRANSITION STRETCH FIX: Don't copy viewport-only dimensions from tiled mode.
+      // In tiled mode, canvas CSS size covers only visible tiles (e.g., 334px instead of 517px).
+      // Copying these dimensions causes the snapshot to appear stretched when transitioning
+      // to full-page mode where the container expects full page dimensions.
+      //
+      // Solution: Size the snapshot to match FULL page dimensions (currentWidth × currentHeight).
+      // The tiled content (which may be partial) is positioned at its original offset within
+      // the full-page-sized snapshot, preserving correct aspect ratio and position.
+
+      // Get the original tiled canvas position (translate transform)
+      const tiledTransform = this.canvas.style.transform;
+      const tiledWidth = parseFloat(this.canvas.style.width) || this.currentWidth;
+      const tiledHeight = parseFloat(this.canvas.style.height) || this.currentHeight;
+
+      // Extract translate offset from tiled transform (if any)
+      let offsetX = 0, offsetY = 0;
+      const translateMatch = tiledTransform.match(/translate\((-?\d+(?:\.\d+)?)px,\s*(-?\d+(?:\.\d+)?)px\)/);
+      if (translateMatch) {
+        offsetX = parseFloat(translateMatch[1]);
+        offsetY = parseFloat(translateMatch[2]);
+      }
+
+      // Size snapshot to FULL page dimensions (not viewport-only)
+      // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+      // This eliminates the 0.353px mismatch (e.g., 517.647 → 518) that causes mode transition stretch.
+      this.transitionSnapshot.style.width = `${Math.round(this.currentWidth)}px`;
+      this.transitionSnapshot.style.height = `${Math.round(this.currentHeight)}px`;
+      this.transitionSnapshot.style.transform = '';
+      this.transitionSnapshot.style.transformOrigin = '0 0';
+
+      // Copy canvas content to snapshot at the correct position
+      // Use full page buffer size to maintain aspect ratio
+      const dpr = window.devicePixelRatio || 2;
+      this.transitionSnapshot.width = Math.round(this.currentWidth * dpr);
+      this.transitionSnapshot.height = Math.round(this.currentHeight * dpr);
+      const snapshotCtx = this.transitionSnapshot.getContext('2d');
+      if (snapshotCtx) {
+        // Clear snapshot (transparent background)
+        snapshotCtx.clearRect(0, 0, this.transitionSnapshot.width, this.transitionSnapshot.height);
+
+        // Calculate where to draw the tiled content in the full-page snapshot
+        // The tiled canvas covered a region starting at (offsetX, offsetY) in page coordinates
+        // We need to draw it at the same relative position in the full-page snapshot
+        const scaleX = this.transitionSnapshot.width / this.currentWidth;
+        const scaleY = this.transitionSnapshot.height / this.currentHeight;
+        const drawX = offsetX * scaleX;
+        const drawY = offsetY * scaleY;
+
+        // Calculate destination dimensions using CSS-to-buffer scaling
+        // This ensures the tiled content is drawn at the correct size in the snapshot
+        const drawWidth = tiledWidth * scaleX;
+        const drawHeight = tiledHeight * scaleY;
+
+        // H3 DIAGNOSTIC: Log aspect ratio info during mode transitions
+        // The destination aspect should match the source CSS aspect (not buffer aspect)
+        // because drawImage scales the source to fit the destination
+        const sourceAspect = this.canvas.width / this.canvas.height;
+        const destAspect = drawWidth / drawHeight;
+        const cssAspect = tiledWidth / tiledHeight;
+        console.log(`[H3-DIAG] Mode transition: srcBuf=${this.canvas.width}x${this.canvas.height} (aspect=${sourceAspect.toFixed(4)}), dest=${drawWidth.toFixed(0)}x${drawHeight.toFixed(0)} (aspect=${destAspect.toFixed(4)}), css=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} (aspect=${cssAspect.toFixed(4)})`);
+
+        // Draw the tiled content at its original position within the full-page snapshot
+        snapshotCtx.drawImage(this.canvas, drawX, drawY, drawWidth, drawHeight);
+
+        // Insert snapshot into container
+        if (!this.transitionSnapshot.parentElement) {
+          this.container.appendChild(this.transitionSnapshot);
+        }
+        console.log(`[MODE-TRANSITION] Captured snapshot for tiled→full-page transition, page=${this.config.pageNumber}, tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} at (${offsetX},${offsetY}), fullPage=${this.currentWidth}x${this.currentHeight.toFixed(0)}`);
+      }
+    }
+
+    // Now hide the canvas and reset its CSS for full-page mode
+    // H1 FIX: Use Math.round() for CSS dimensions to match integer canvas buffer dimensions.
+    this.canvas.style.opacity = '0';
+    this.canvas.style.width = `${Math.round(this.currentWidth)}px`;
+    this.canvas.style.height = `${Math.round(this.currentHeight)}px`;
+    this.canvas.style.transform = '';
+    this.canvas.style.transformOrigin = '0 0';
+
+    // Clear the isRendered flag so the page shows loading state
+    this.isRendered = false;
+
+    // Show loading indicator (behind snapshot)
+    this.showLoading();
+
+    console.log(`[STABILITY-FIX] prepareForFullPageRender: page=${this.config.pageNumber}, cssSize=${this.currentWidth}x${this.currentHeight} (snapshot visible until render completes)`);
+  }
+
+  /**
+   * Prepare the canvas for tiled rendering (full-page → tiled transition).
+   *
+   * When transitioning from full-page to tiled mode, the canvas needs to be
+   * reset so that incoming tiles can set their own viewport-only transforms.
+   * Without this, the canvas CSS remains configured for full-page mode while
+   * tiles render for viewport-only regions → tile clipping.
+   *
+   * DOUBLE-BUFFERING: Instead of hiding the canvas (which causes blank transitions),
+   * we capture the current content as a snapshot image. This keeps the old content
+   * visible while new tiles render, then the snapshot is removed when tiles are ready.
+   *
+   * This is the symmetric counterpart to prepareForFullPageRender() which
+   * handles the tiled→full-page transition.
+   */
+  prepareForTiledRender(): void {
+    // GOLDEN FRAME LOG (Protocol C): Capture dimensions at full-page→tiled transition
+    const containerRect = this.container.getBoundingClientRect();
+    const goldenFrameLog = {
+      mode: 'full-page→tiled transition',
+      page: this.config.pageNumber,
+      camera: { zoom: this.currentZoom },
+      cssWidth: this.currentWidth,
+      cssHeight: this.currentHeight,
+      containerBoundingRect: { w: containerRect.width, h: containerRect.height },
+      containerOffset: { w: this.container.offsetWidth, h: this.container.offsetHeight },
+      canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
+      canvasCss: {
+        w: parseFloat(this.canvas.style.width) || this.currentWidth,
+        h: parseFloat(this.canvas.style.height) || this.currentHeight,
+      },
+      storedPdfDimensions: this.storedPdfDimensions,
+      snapshotCanvas: this.transitionSnapshot
+        ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
+        : null,
+      heightDelta: this.canvas.height - (parseFloat(this.canvas.style.height) || this.currentHeight),
+    };
+    console.log('[GOLDEN-FRAME]', goldenFrameLog);
+
+    // DOUBLE-BUFFERING: Capture current canvas content as a snapshot canvas.
+    // This keeps old content visible while new tiles render, eliminating blank flash.
+    // The snapshot will be removed in renderTiles() when new content is ready.
+    //
+    // PERF FIX: Use drawImage() instead of toDataURL() for 100x speedup.
+    // toDataURL() forces synchronous PNG encoding (100ms+), while drawImage()
+    // is a fast GPU copy (~1ms). This eliminates jank during mode transitions.
+    const startTime = performance.now();
+    try {
+      // Only create snapshot if canvas has content (removed isRendered check - race condition)
+      if (this.canvas.width > 0 && this.canvas.height > 0) {
+        // Create or reuse snapshot canvas element
+        if (!this.transitionSnapshot) {
+          this.transitionSnapshot = document.createElement('canvas');
+          this.transitionSnapshot.className = 'pdf-transition-snapshot';
+          this.transitionSnapshot.style.cssText = `
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            z-index: 5;
+          `;
+        }
+
+        // FAST SNAPSHOT: Use drawImage for GPU-accelerated copy
+        // This is ~100x faster than toDataURL() which does CPU PNG encoding
+        this.transitionSnapshot.width = this.canvas.width;
+        this.transitionSnapshot.height = this.canvas.height;
+        const ctx = this.transitionSnapshot.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(this.canvas, 0, 0);
+        }
+
+        // Match canvas CSS dimensions and transform
+        this.transitionSnapshot.style.width = this.canvas.style.width;
+        this.transitionSnapshot.style.height = this.canvas.style.height;
+        this.transitionSnapshot.style.transform = this.canvas.style.transform || '';
+        this.transitionSnapshot.style.transformOrigin = this.canvas.style.transformOrigin || '0 0';
+
+        // Add to container if not already present
+        if (!this.transitionSnapshot.parentElement) {
+          this.container.appendChild(this.transitionSnapshot);
+        }
+
+        const elapsed = performance.now() - startTime;
+        console.log(`[DOUBLE-BUFFER] Created transition snapshot: page=${this.config.pageNumber}, size=${this.canvas.width}x${this.canvas.height}, time=${elapsed.toFixed(1)}ms`);
+      }
+    } catch (e) {
+      // Snapshot creation failed (e.g., tainted canvas) - fall back to hiding
+      console.warn(`[DOUBLE-BUFFER] Snapshot creation failed: ${e}, falling back to hide`);
+      this.canvas.style.opacity = '0';
+    }
+
+    // Reset transform to base state (tiles will set their own transforms)
+    this.canvas.style.transform = '';
+    this.canvas.style.transformOrigin = '0 0';
+
+    // Mark as needing re-render
+    this.isRendered = false;
+
+    // Note: We don't hide the canvas anymore - the snapshot covers it
+    // We also don't show loading indicator since snapshot provides visual continuity
+
+    console.log(`[STABILITY-FIX] prepareForTiledRender: page=${this.config.pageNumber} (snapshot preserves old content)`);
+  }
+
+  /**
+   * Remove the transition snapshot after new content is rendered.
+   * Called by renderTiles() when tiles are successfully composited.
+   */
+  private clearTransitionSnapshot(): void {
+    if (this.transitionSnapshot) {
+      // Fade out for smoother transition (optional, can remove for instant swap)
+      this.transitionSnapshot.remove();
+      console.log(`[DOUBLE-BUFFER] Removed transition snapshot: page=${this.config.pageNumber}`);
+    }
+  }
+
+  /**
+   * Show the canvas after render completes
+   */
+  showCanvas(): void {
+    this.canvas.style.opacity = '1';
+  }
+
+  /**
    * Clear rendered content
    */
   clear(): void {
@@ -1657,6 +2222,12 @@ export class PdfPageElement {
       this.offscreenCanvas.height = 0;
       this.offscreenCanvas = null;
       this.offscreenCtx = null;
+    }
+
+    // Clean up transition snapshot
+    if (this.transitionSnapshot) {
+      this.transitionSnapshot.remove();
+      this.transitionSnapshot = null;
     }
 
     this.container.remove();

@@ -12,9 +12,38 @@
  */
 
 import { getTelemetry } from './pdf-telemetry';
+import type { TileRenderResult } from './wasm-renderer';
+import { isFeatureEnabled } from './feature-flags';
+import {
+  getAdaptiveTileSize,
+  MAX_SCALE_TIER,
+  getDynamicMaxScaleTier,
+} from './progressive-tile-renderer';
 
-/** Tile size in pixels (matches CATiledLayer default) */
+/** Default tile size in pixels (matches CATiledLayer default) */
 export const TILE_SIZE = 256;
+
+/**
+ * Get tile size based on zoom level and feature flags.
+ *
+ * Uses adaptive tile sizing when enabled for better performance.
+ * Returns 512px fixed size which avoids coordinate mismatch issues.
+ *
+ * @param zoom Current zoom level (optional)
+ * @returns Tile size in CSS pixels
+ */
+export function getTileSize(zoom?: number): number {
+  if (!zoom) {
+    return TILE_SIZE;
+  }
+
+  // Use adaptive tile sizing for better performance
+  if (isFeatureEnabled('useAdaptiveTileSize')) {
+    return getAdaptiveTileSize(zoom);
+  }
+
+  return TILE_SIZE;
+}
 
 /**
  * Tile scale factor for rendering resolution.
@@ -69,17 +98,31 @@ export interface Rect {
  * Tile Render Engine
  */
 export class TileRenderEngine {
-  private readonly tileSize = TILE_SIZE;
+  private readonly defaultTileSize = TILE_SIZE;
 
   // Callbacks for tile rendering (injected by provider)
   private renderTileCallback:
-    | ((tile: TileCoordinate, docId: string) => Promise<Blob>)
+    | ((tile: TileCoordinate, docId: string) => Promise<TileRenderResult | Blob>)
     | null = null;
 
   // Current document info
   private documentId: string | null = null;
   private pageCount = 0;
   public pageDimensions: Map<number, { width: number; height: number }> = new Map();
+
+  /**
+   * Get the tile size for a given zoom level.
+   *
+   * Uses adaptive tile sizing when feature is enabled:
+   * - High zoom: smaller tiles (faster individual renders)
+   * - Low zoom: larger tiles (fewer total tiles)
+   *
+   * @param zoom Current zoom level (optional)
+   * @returns Tile size in pixels
+   */
+  getTileSizeForZoom(zoom?: number): number {
+    return getTileSize(zoom);
+  }
 
   /**
    * Set the document for tile rendering
@@ -98,7 +141,7 @@ export class TileRenderEngine {
    * Set the tile render callback (provided by hybrid-pdf-provider)
    */
   setRenderCallback(
-    callback: (tile: TileCoordinate, docId: string) => Promise<Blob>
+    callback: (tile: TileCoordinate, docId: string) => Promise<TileRenderResult | Blob>
   ): void {
     this.renderTileCallback = callback;
   }
@@ -106,17 +149,25 @@ export class TileRenderEngine {
   /**
    * Get tile grid for a page at a given scale.
    * For crisp rendering, scale should be zoom * pixelRatio.
+   *
+   * @param page Page number
+   * @param scale Render scale (zoom × pixelRatio)
+   * @param zoom Optional zoom level for adaptive tile sizing
+   * @returns Array of tile coordinates covering the page
    */
-  getPageTileGrid(page: number, scale: TileScale = 1): TileCoordinate[] {
+  getPageTileGrid(page: number, scale: TileScale = 1, zoom?: number): TileCoordinate[] {
     const dims = this.pageDimensions.get(page);
     if (!dims) return [];
+
+    // Use adaptive tile size when zoom is provided
+    const tileSize = this.getTileSizeForZoom(zoom);
 
     const tiles: TileCoordinate[] = [];
     const scaledWidth = dims.width * scale;
     const scaledHeight = dims.height * scale;
 
-    const tilesX = Math.ceil(scaledWidth / this.tileSize);
-    const tilesY = Math.ceil(scaledHeight / this.tileSize);
+    const tilesX = Math.ceil(scaledWidth / tileSize);
+    const tilesY = Math.ceil(scaledHeight / tileSize);
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
@@ -130,6 +181,11 @@ export class TileRenderEngine {
   /**
    * Get tiles visible within a viewport.
    * For crisp rendering, scale should be zoom * pixelRatio.
+   *
+   * @param viewport Viewport rectangle in world coordinates
+   * @param pageLayouts Array of page layout information
+   * @param zoom Current zoom level (used for adaptive tile sizing)
+   * @param scale Optional render scale (defaults to Math.ceil(zoom))
    */
   getVisibleTiles(
     viewport: Rect,
@@ -139,10 +195,37 @@ export class TileRenderEngine {
   ): TileCoordinate[] {
     const tiles: TileCoordinate[] = [];
     // Use provided scale, or default to zoom for basic HiDPI support
-    const effectiveScale: TileScale = scale ?? Math.max(1, Math.ceil(zoom));
+    // DYNAMIC MAX SCALE FIX: Use getDynamicMaxScaleTier() instead of hardcoded MAX_SCALE_TIER.
+    // High-end devices (8GB+ RAM) can render at scale 32 for crisp text at 16x zoom.
+    // Previously hardcoded to 16, causing blurry rendering even on capable hardware.
+    //
+    // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), high scales produce
+    // tiles that exceed GPU limits. Cap scale so tile pixels ≤ 4096.
+    // Example: At scale 32 with 512px tiles = 16384px (impossible)
+    //          With cap: max scale = 4096/512 = 8 → 4096px tiles (OK)
+    const MAX_TILE_PIXELS = 4096;
+    const tileSize = this.getTileSizeForZoom(zoom);
+    const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
+    const rawScale = scale ?? Math.max(1, Math.ceil(zoom));
+    const dynamicMaxScale = Math.min(getDynamicMaxScaleTier(), maxScaleForTileSize);
+    const effectiveScale: TileScale = Math.min(rawScale, dynamicMaxScale);
 
     for (const layout of pageLayouts) {
-      if (!this.rectsOverlap(viewport, layout)) continue;
+      if (!this.rectsOverlap(viewport, layout)) {
+        // DIAGNOSTIC LOGGING: Log when overlap check FAILS
+        // This helps debug why tiles aren't generated for visible pages
+        console.warn(`[TileRenderEngine] NO OVERLAP for page ${layout.page}:`, {
+          viewport: `x=${viewport.x.toFixed(1)}, y=${viewport.y.toFixed(1)}, w=${viewport.width.toFixed(1)}, h=${viewport.height.toFixed(1)}`,
+          layout: `x=${layout.x.toFixed(1)}, y=${layout.y.toFixed(1)}, w=${layout.width.toFixed(1)}, h=${layout.height.toFixed(1)}`,
+          // Show why overlap failed (which edge is outside)
+          failReason: viewport.x + viewport.width < layout.x ? 'viewport too far left'
+            : layout.x + layout.width < viewport.x ? 'viewport too far right'
+            : viewport.y + viewport.height < layout.y ? 'viewport above layout'
+            : layout.y + layout.height < viewport.y ? 'viewport below layout'
+            : 'unknown',
+        });
+        continue;
+      }
 
       const intersection = this.intersectRects(viewport, layout);
 
@@ -157,7 +240,39 @@ export class TileRenderEngine {
         height: intersection.height * pdfScale,
       };
 
-      const pageTiles = this.getTilesInRect(pdfRect, layout.page, effectiveScale);
+      // DEBUG: Log when pdfRect exceeds page dimensions
+      const pageDims = this.pageDimensions.get(layout.page);
+      if (pageDims && (pdfRect.y > pageDims.height || pdfRect.y + pdfRect.height > pageDims.height * 1.5)) {
+        console.warn(`[TileRenderEngine] DEBUG page ${layout.page}: pdfRect.y=${pdfRect.y.toFixed(1)} exceeds pdfHeight=${pageDims.height}`);
+        console.warn(`[TileRenderEngine] DEBUG: viewport=(${viewport.x.toFixed(1)},${viewport.y.toFixed(1)} ${viewport.width.toFixed(1)}x${viewport.height.toFixed(1)})`);
+        console.warn(`[TileRenderEngine] DEBUG: layout=(${layout.x},${layout.y} ${layout.width}x${layout.height}), pdfScale=${pdfScale.toFixed(3)}`);
+        console.warn(`[TileRenderEngine] DEBUG: intersection=(${intersection.x.toFixed(1)},${intersection.y.toFixed(1)} ${intersection.width.toFixed(1)}x${intersection.height.toFixed(1)})`);
+      }
+
+      // Pass zoom for adaptive tile sizing
+      const pageTiles = this.getTilesInRect(pdfRect, layout.page, effectiveScale, zoom);
+
+      // DIAGNOSTIC: Log tile calculation at mid-zoom (4-8x) to debug blank area bug
+      if (zoom >= 4 && zoom <= 10) {
+        let tileRangeStr = '(none)';
+        if (pageTiles.length > 0) {
+          const tileXs = pageTiles.map(t => t.tileX);
+          const tileYs = pageTiles.map(t => t.tileY);
+          const minTileX = Math.min(...tileXs);
+          const maxTileX = Math.max(...tileXs);
+          const minTileY = Math.min(...tileYs);
+          const maxTileY = Math.max(...tileYs);
+          tileRangeStr = `X=[${minTileX}-${maxTileX}], Y=[${minTileY}-${maxTileY}]`;
+        }
+        console.log(`[TileCalc] page=${layout.page} zoom=${zoom.toFixed(2)} scale=${effectiveScale}`, {
+          viewport: `(${viewport.x.toFixed(0)},${viewport.y.toFixed(0)}) ${viewport.width.toFixed(0)}x${viewport.height.toFixed(0)}`,
+          layout: `(${layout.x.toFixed(0)},${layout.y.toFixed(0)}) ${layout.width.toFixed(0)}x${layout.height.toFixed(0)}`,
+          intersection: `(${intersection.x.toFixed(0)},${intersection.y.toFixed(0)}) ${intersection.width.toFixed(0)}x${intersection.height.toFixed(0)}`,
+          pdfRect: `(${pdfRect.x.toFixed(0)},${pdfRect.y.toFixed(0)}) ${pdfRect.width.toFixed(0)}x${pdfRect.height.toFixed(0)}`,
+          pdfScale: pdfScale.toFixed(3),
+          tiles: `${pageTiles.length} tiles: ${tileRangeStr}`,
+        });
+      }
 
       tiles.push(...pageTiles);
     }
@@ -167,10 +282,29 @@ export class TileRenderEngine {
     const centerY = viewport.y + viewport.height / 2;
 
     tiles.sort((a, b) => {
-      const distA = this.tileDistanceFromCenter(a, pageLayouts, centerX, centerY);
-      const distB = this.tileDistanceFromCenter(b, pageLayouts, centerX, centerY);
+      const distA = this.tileDistanceFromCenter(a, pageLayouts, centerX, centerY, zoom);
+      const distB = this.tileDistanceFromCenter(b, pageLayouts, centerX, centerY, zoom);
       return distA - distB;
     });
+
+    // TILE GAP FIX: Return ALL visible tiles, let priority system handle batching.
+    // The previous MAX_VISIBLE_TILES=32 slice caused permanent tile gaps because:
+    // 1. Tiles were sorted by distance from center
+    // 2. Outer tiles (indices 32+) were dropped completely
+    // 3. No progressive rendering existed for dropped tiles
+    //
+    // Now: Return all tiles sorted by distance. The caller (triggerTilePrefetch)
+    // assigns priorities: first ~32 = 'critical', rest = 'medium'/'low'.
+    // RenderCoordinator's semaphore (4 permits) naturally limits concurrency,
+    // and the priority queue ensures central tiles render first.
+    //
+    // OOM concerns at high zoom (380+ tiles) are mitigated by:
+    // 1. Semaphore limiting concurrent WASM allocations to 4
+    // 2. Progressive rendering via priority queue (critical first)
+    // 3. Session-based abort clearing stale requests on scroll
+    if (tiles.length > 64) {
+      console.log(`[TileRenderEngine] ${tiles.length} visible tiles (sorted by distance from center)`);
+    }
 
     return tiles;
   }
@@ -202,7 +336,7 @@ export class TileRenderEngine {
   /**
    * Render a single tile
    */
-  async renderTile(tile: TileCoordinate): Promise<Blob | null> {
+  async renderTile(tile: TileCoordinate): Promise<TileRenderResult | Blob | null> {
     if (!this.renderTileCallback || !this.documentId) {
       console.warn('[TileRenderEngine] No render callback or document set');
       return null;
@@ -211,10 +345,10 @@ export class TileRenderEngine {
     const startTime = performance.now();
 
     try {
-      const blob = await this.renderTileCallback(tile, this.documentId);
+      const result = await this.renderTileCallback(tile, this.documentId);
       const duration = performance.now() - startTime;
       getTelemetry().trackRenderTime(duration, 'tile');
-      return blob;
+      return result;
     } catch (error) {
       console.error('[TileRenderEngine] Tile render failed:', error);
       return null;
@@ -238,9 +372,13 @@ export class TileRenderEngine {
 
   /**
    * Get the bounding box of a tile in page coordinates
+   *
+   * @param tile Tile coordinate
+   * @param zoom Optional zoom level for adaptive tile sizing
    */
-  getTileBounds(tile: TileCoordinate): Rect {
-    const size = this.tileSize / tile.scale;
+  getTileBounds(tile: TileCoordinate, zoom?: number): Rect {
+    const tileSize = this.getTileSizeForZoom(zoom);
+    const size = tileSize / tile.scale;
     return {
       x: tile.tileX * size,
       y: tile.tileY * size,
@@ -256,8 +394,8 @@ export class TileRenderEngine {
     ctx: CanvasRenderingContext2D,
     x: number,
     y: number,
-    width: number = this.tileSize,
-    height: number = this.tileSize
+    width: number = this.defaultTileSize,
+    height: number = this.defaultTileSize
   ): void {
     const checkSize = 16;
     ctx.fillStyle = '#f5f5f5';
@@ -334,19 +472,63 @@ export class TileRenderEngine {
   private getTilesInRect(
     rect: Rect,
     page: number,
-    scale: TileScale
+    scale: TileScale,
+    zoom?: number
   ): TileCoordinate[] {
     const tiles: TileCoordinate[] = [];
-    const tileSize = this.tileSize / scale;
+    const baseTileSize = this.getTileSizeForZoom(zoom);
+    const tileSize = baseTileSize / scale;
 
-    const startX = Math.floor(rect.x / tileSize);
-    const startY = Math.floor(rect.y / tileSize);
-    const endX = Math.ceil((rect.x + rect.width) / tileSize);
-    const endY = Math.ceil((rect.y + rect.height) / tileSize);
+    // RACE CONDITION FIX: If pageDimensions are not yet available, return empty array.
+    // This can happen when tiles are requested before setupTileEngine() completes.
+    // Returning empty ensures no invalid tiles are generated; the canvas will retry
+    // after dimensions are populated via setupTileEngine().
+    const pageDims = this.pageDimensions.get(page);
+    if (!pageDims) {
+      console.warn(`[TileRenderEngine] getTilesInRect: No dimensions for page ${page}, skipping tile generation`);
+      return tiles;  // Empty array
+    }
+
+    // BLANK-AREA-FIX (v2): Properly compute rect intersection with page bounds.
+    // The previous clamping logic had a bug where rects entirely off the left/top edge
+    // (e.g., rect.x=-600, rect.width=200 → spans -600 to -400, entirely before page)
+    // would incorrectly get positive width/height. This caused blank areas because
+    // tiles were generated for regions that don't overlap the actual page content.
+    //
+    // The fix uses standard rect intersection: clamp edges then compute size from edges.
+    const clampedLeft = Math.max(0, rect.x);
+    const clampedTop = Math.max(0, rect.y);
+    const clampedRight = Math.min(pageDims.width, rect.x + rect.width);
+    const clampedBottom = Math.min(pageDims.height, rect.y + rect.height);
+
+    const clampedRect: Rect = {
+      x: clampedLeft,
+      y: clampedTop,
+      width: Math.max(0, clampedRight - clampedLeft),
+      height: Math.max(0, clampedBottom - clampedTop),
+    };
+
+    // Early return if clamped rect has zero area (rect is completely outside page bounds)
+    if (clampedRect.width <= 0 || clampedRect.height <= 0) {
+      console.log(`[TileRenderEngine] getTilesInRect: rect completely outside page bounds for page ${page}, ` +
+        `originalRect=(${rect.x.toFixed(1)},${rect.y.toFixed(1)} ${rect.width.toFixed(1)}x${rect.height.toFixed(1)}), ` +
+        `pageDims=${pageDims.width.toFixed(1)}x${pageDims.height.toFixed(1)}`);
+      return tiles;  // Empty array
+    }
+
+    const startX = Math.floor(clampedRect.x / tileSize);
+    const startY = Math.floor(clampedRect.y / tileSize);
+    const endX = Math.ceil((clampedRect.x + clampedRect.width) / tileSize);
+    const endY = Math.ceil((clampedRect.y + clampedRect.height) / tileSize);
+
+    // Calculate max tile indices from page dimensions
+    const maxTileX = Math.ceil(pageDims.width / tileSize);
+    const maxTileY = Math.ceil(pageDims.height / tileSize);
 
     for (let ty = startY; ty < endY; ty++) {
       for (let tx = startX; tx < endX; tx++) {
-        if (tx >= 0 && ty >= 0) {
+        // Additional bounds check (should be redundant after clamping, but kept for safety)
+        if (tx >= 0 && ty >= 0 && tx < maxTileX && ty < maxTileY) {
           tiles.push({ page, tileX: tx, tileY: ty, scale });
         }
       }
@@ -359,12 +541,14 @@ export class TileRenderEngine {
     tile: TileCoordinate,
     pageLayouts: PageLayout[],
     centerX: number,
-    centerY: number
+    centerY: number,
+    zoom?: number
   ): number {
     const layout = pageLayouts.find((p) => p.page === tile.page);
     if (!layout) return Infinity;
 
-    const tileSize = this.tileSize / tile.scale;
+    const baseTileSize = this.getTileSizeForZoom(zoom);
+    const tileSize = baseTileSize / tile.scale;
     const tileCenterX = layout.x + tile.tileX * tileSize + tileSize / 2;
     const tileCenterY = layout.y + tile.tileY * tileSize + tileSize / 2;
 
