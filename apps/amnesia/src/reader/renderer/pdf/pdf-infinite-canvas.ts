@@ -3124,22 +3124,21 @@ export class PdfInfiniteCanvas {
           zoomParam: zoom.toFixed(4),
         });
 
-        // TILE GENERATION STRATEGY (amnesia-d9f):
+        // TILE GENERATION STRATEGY (amnesia-d9f + amnesia-e4i):
         //
-        // HIGH ZOOM (>16x): Use viewport-only tiles.
-        // - With 256px tiles at zoom 32: 56×84 = 4704 tiles for full page!
-        // - Queue would drop 96%+ of tiles
-        // - Viewport-only: ~20-50 tiles for visible area
+        // DYNAMIC THRESHOLD based on gesture state:
+        // - During active gestures: Low threshold (2-4x) = viewport-only almost always
+        // - During settling: Medium threshold (4-8x)
+        // - During rendering/idle: Higher threshold (8-16x)
         //
-        // MID ZOOM (4-16x): Use full-page tiles BUT only for VISIBLE pages.
-        // - The queue overflow happened because we were rendering ALL pages
-        // - FIX: Only render tiles for pages that overlap viewport (done elsewhere)
-        // - Viewport-only at mid-zoom causes severe coordinate bugs (overlapping text)
+        // This prevents queue overflow during active gestures while allowing
+        // full-page rendering when the user is idle (for smooth panning).
         //
-        // The key insight: the queue overflow wasn't from too many tiles per page,
-        // it was from rendering too many PAGES. The fix is to be more aggressive
-        // about skipping non-visible pages, not to switch to viewport-only.
-        const useViewportOnlyTiles = zoom > 16;
+        // The key insight: viewport-only during gestures is FINE because:
+        // 1. Tiles become stale in milliseconds anyway
+        // 2. Fallback tiles provide acceptable visual quality
+        // 3. Queue overflow causes WORSE visual artifacts than viewport-only
+        const useViewportOnlyTiles = this.renderCoordinator?.shouldUseViewportOnlyTiles(zoom) ?? (zoom > 16);
         
         if (useViewportOnlyTiles) {
           // Viewport-only: get tiles that intersect the expanded viewport
@@ -4465,6 +4464,9 @@ export class PdfInfiniteCanvas {
     // Step 5: Schedule tile rendering at new zoom level
     this.scheduleZoomRerender();
 
+    // amnesia-e4i: Update render coordinator's zoom for policy decisions
+    this.renderCoordinator?.setCurrentZoom(newZoom);
+
     // Notify callbacks
     this.onZoomChangeCallback?.(newZoom);
 
@@ -4516,6 +4518,17 @@ export class PdfInfiniteCanvas {
       // Notify state machine that render is complete
       // This clears the snapshot and transitions back to 'idle'
       this.zoomStateMachine.completeRenderPhase();
+      
+      // amnesia-e4i: Also notify ZoomScaleService to complete render phase
+      this.zoomScaleService.completeRenderPhase();
+      
+      // amnesia-e4i: Process retry queue for any tiles that were dropped during gesture
+      // Schedule with small delay to let current render batch settle
+      setTimeout(() => {
+        this.renderCoordinator?.processRetryQueue().catch(err => {
+          console.warn('[PdfInfiniteCanvas] Retry queue processing failed:', err);
+        });
+      }, 100);
     }
   }
 

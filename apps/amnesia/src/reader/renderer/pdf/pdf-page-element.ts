@@ -1547,7 +1547,32 @@ export class PdfPageElement {
       });
     } catch { /* ignore if overlay not initialized */ }
 
+    // amnesia-e4i: Build set of tile positions that have target-scale tiles
+    // A target-scale tile has cssStretch close to 1.0 (within tolerance)
+    // We'll skip drawing fallback tiles if a target-scale tile exists for the same position
+    const TARGET_STRETCH_TOLERANCE = 0.1;
+    const targetScalePositions = new Set<string>();
+    for (const { tile, cssStretch } of tiles) {
+      const effectiveStretch = cssStretch ?? (tileScale / tile.scale);
+      if (Math.abs(effectiveStretch - 1.0) <= TARGET_STRETCH_TOLERANCE) {
+        targetScalePositions.add(`${tile.tileX},${tile.tileY}`);
+      }
+    }
+    
+    let fallbacksSkipped = 0;
+    
     for (const { tile, bitmap, cssStretch } of tiles) {
+      // amnesia-e4i: Skip fallback tiles if target-scale tile exists for this position
+      const tilePositionKey = `${tile.tileX},${tile.tileY}`;
+      const effectiveStretch = cssStretch ?? (tileScale / tile.scale);
+      const isFallbackTile = Math.abs(effectiveStretch - 1.0) > TARGET_STRETCH_TOLERANCE;
+      
+      if (isFallbackTile && targetScalePositions.has(tilePositionKey)) {
+        // Skip this fallback - we have a better tile for this position
+        fallbacksSkipped++;
+        continue;
+      }
+      
       // MULTI-SCALE FIX (amnesia-d9f): Use CONSISTENT target scale for ALL tile positions.
       //
       // BUG: When tiles arrive at different scales (e.g., scale 6 and scale 16), using
@@ -1696,8 +1721,13 @@ export class PdfPageElement {
     }
 
     // DEBUG: Log tiles drawn with render sequence
-    if (tilesSkippedOutOfBounds > 0) {
-      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn}/${tiles.length} tiles, canvas=${canvasWidth}x${canvasHeight} (${tilesSkippedOutOfBounds} skipped: out of bounds), forceFullPage=${!isViewportOnly}`);
+    const skipInfo = [
+      tilesSkippedOutOfBounds > 0 ? `${tilesSkippedOutOfBounds} OOB` : '',
+      fallbacksSkipped > 0 ? `${fallbacksSkipped} fallbacks replaced` : '',
+    ].filter(Boolean).join(', ');
+    
+    if (skipInfo) {
+      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn}/${tiles.length} tiles, canvas=${canvasWidth}x${canvasHeight} (${skipInfo}), forceFullPage=${!isViewportOnly}`);
     } else {
       console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn} tiles, canvas=${canvasWidth}x${canvasHeight}, forceFullPage=${!isViewportOnly}`);
     }

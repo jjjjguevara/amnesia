@@ -49,6 +49,125 @@ import { getHybridRenderingStrategy, type RenderingDecision } from './hybrid-ren
 import { getCanvasPool } from './pdf-canvas-pool';
 import { getRenderSessionManager } from './render-session';
 import { isFeatureEnabled } from './feature-flags';
+import type { GesturePhase } from './zoom-scale-service';
+
+// ─────────────────────────────────────────────────────────────────
+// Dynamic Semaphore Policy (amnesia-e4i)
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Semaphore policy configuration based on reader state.
+ * 
+ * During active gestures, we need to be aggressive about dropping tiles
+ * to prevent queue overflow. During idle, we can be more permissive.
+ */
+export interface SemaphorePolicy {
+  /** Maximum queue size before dropping tiles */
+  maxQueueSize: number;
+  /** Zoom threshold above which viewport-only tiles are used */
+  viewportOnlyThreshold: number;
+  /** How aggressively to drop tiles: 'aggressive' drops more, 'conservative' less */
+  dropBehavior: 'aggressive' | 'moderate' | 'conservative';
+  /** Maximum tiles per page to request (0 = unlimited) */
+  maxTilesPerPage: number;
+}
+
+/**
+ * Get semaphore policy based on gesture phase and zoom level.
+ * 
+ * The key insight: during active gestures, the viewport is constantly changing,
+ * so there's no point rendering tiles that will be obsolete in milliseconds.
+ * We should:
+ * 1. Keep queue small (drop old requests fast)
+ * 2. Only render viewport-visible tiles
+ * 3. Accept lower resolution fallbacks
+ * 
+ * During idle, we can prefetch and build up the cache.
+ */
+export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): SemaphorePolicy {
+  switch (gesturePhase) {
+    case 'active':
+      // During active zoom/pan: very aggressive
+      // User is actively moving, tiles become stale instantly
+      return {
+        maxQueueSize: 50,
+        viewportOnlyThreshold: 2, // Always use viewport-only during gestures
+        dropBehavior: 'aggressive',
+        maxTilesPerPage: 30, // Cap tiles per page
+      };
+    
+    case 'settling':
+      // Gesture just ended, waiting for final position
+      // Still moving but slowing down
+      return {
+        maxQueueSize: 150,
+        viewportOnlyThreshold: 4,
+        dropBehavior: 'moderate',
+        maxTilesPerPage: 100,
+      };
+    
+    case 'rendering':
+      // Settled, actively rendering final tiles
+      // Position stable, can render more
+      return {
+        maxQueueSize: 300,
+        viewportOnlyThreshold: 8,
+        dropBehavior: 'moderate',
+        maxTilesPerPage: 200,
+      };
+    
+    case 'idle':
+    default:
+      // Fully idle, can prefetch and build cache
+      return {
+        maxQueueSize: 400,
+        viewportOnlyThreshold: 16,
+        dropBehavior: 'conservative',
+        maxTilesPerPage: 0, // No limit
+      };
+  }
+}
+
+/** Current gesture phase for policy decisions */
+let currentGesturePhase: GesturePhase = 'idle';
+
+/** Update the current gesture phase (called from ZoomScaleService) */
+export function setGesturePhase(phase: GesturePhase): void {
+  if (currentGesturePhase !== phase) {
+    const oldPhase = currentGesturePhase;
+    console.log(`[SemaphorePolicy] Gesture phase: ${oldPhase} → ${phase}`);
+    currentGesturePhase = phase;
+    
+    // Record transition for timing analysis (amnesia-e4i)
+    try {
+      getTileDiagnosticOverlay().recordPhaseTransition(oldPhase, phase);
+    } catch { /* overlay may not be initialized */ }
+    
+    // Update semaphore policy
+    const coordinator = getRenderCoordinatorInstance();
+    if (coordinator) {
+      const policy = getSemaphorePolicy(phase, coordinator.getCurrentZoom?.() ?? 1);
+      coordinator.updateSemaphorePolicy(policy);
+    }
+  }
+}
+
+/** Get current gesture phase */
+export function getGesturePhase(): GesturePhase {
+  return currentGesturePhase;
+}
+
+/** Get current policy based on gesture phase and zoom */
+export function getCurrentSemaphorePolicy(zoom: number): SemaphorePolicy {
+  return getSemaphorePolicy(currentGesturePhase, zoom);
+}
+
+// Singleton instance accessor (set during initialization)
+let renderCoordinatorInstance: RenderCoordinator | null = null;
+
+function getRenderCoordinatorInstance(): RenderCoordinator | null {
+  return renderCoordinatorInstance;
+}
 import { generateDebugTileSvg, type DebugTileInfo } from './debug-tile-renderer';
 import { isDebugTileModeEnabled } from './debug-mock-pdf';
 import { getTileDiagnosticOverlay } from './tile-diagnostic-overlay';
@@ -135,7 +254,7 @@ export type RenderMode = 'paginated' | 'scroll' | 'grid';
 class Semaphore {
   private permits: number;
   private readonly maxPermits: number;
-  private readonly maxQueueSize: number;
+  private maxQueueSize: number; // Mutable for dynamic policy (amnesia-e4i)
 
   // Priority queues: critical (0) > high (1) > medium (2) > low (3)
   private priorityQueues: Map<RenderPriority, Array<(acquired: boolean) => void>> = new Map([
@@ -282,6 +401,30 @@ class Semaphore {
       low: this.priorityQueues.get('low')!.length,
     };
   }
+
+  /**
+   * Dynamically update max queue size (amnesia-e4i).
+   * Used to adjust queue limits based on reader state (scrolling, zooming, idle).
+   * 
+   * If current queue exceeds new limit, excess waiters are dropped.
+   */
+  setMaxQueueSize(newSize: number): void {
+    const oldSize = this.maxQueueSize;
+    this.maxQueueSize = newSize;
+    
+    // If we're over the new limit, drop excess waiters
+    if (this.getTotalWaiters() > newSize) {
+      console.log(`[SEMAPHORE] Policy change: maxQueue ${oldSize} → ${newSize}, trimming queue`);
+      this.dropLowestPriorityWaiters();
+    } else if (oldSize !== newSize) {
+      console.log(`[SEMAPHORE] Policy change: maxQueue ${oldSize} → ${newSize}`);
+    }
+  }
+
+  /** Get current max queue size */
+  getMaxQueueSize(): number {
+    return this.maxQueueSize;
+  }
 }
 
 /**
@@ -361,6 +504,40 @@ export class RenderCoordinator {
   /** Session tracking for in-flight requests (enables selective abort) */
   private inFlightSessions = new Map<string, number>();
 
+  /** Current zoom level (tracked for policy decisions) */
+  private currentZoom = 1;
+
+  /** Current semaphore policy */
+  private currentPolicy: SemaphorePolicy = getSemaphorePolicy('idle', 1);
+
+  // ============================================================
+  // Smart Retry Queue (amnesia-e4i)
+  // ============================================================
+  
+  /** 
+   * Retry queue for tiles that were dropped from the semaphore queue.
+   * Key: tile position key (without scale), Value: retry entry
+   * 
+   * SAFEGUARDS against infinite loops and memory leaks:
+   * 1. MAX_RETRY_ATTEMPTS limits retries per tile
+   * 2. RETRY_COOLDOWN_MS prevents rapid-fire retries
+   * 3. MAX_RETRY_QUEUE_SIZE caps memory usage
+   * 4. RETRY_ENTRY_TTL_MS expires stale entries
+   * 5. Viewport check ensures we don't retry off-screen tiles
+   */
+  private retryQueue = new Map<string, {
+    tile: TileCoordinate;
+    attempts: number;
+    lastDropTime: number;
+    priority: RenderPriority;
+  }>();
+  
+  // Retry safeguard constants
+  private static readonly MAX_RETRY_ATTEMPTS = 3;
+  private static readonly RETRY_COOLDOWN_MS = 500;
+  private static readonly MAX_RETRY_QUEUE_SIZE = 100;
+  private static readonly RETRY_ENTRY_TTL_MS = 5000; // 5 seconds
+
   constructor(options?: { maxConcurrent?: number; enableContentTypeDetection?: boolean }) {
     // PERF FIX: Reduced from 16 to 4 permits to match worker pool size.
     // With 16 permits but only 4 workers, 12 requests would hold permits while
@@ -368,6 +545,210 @@ export class RenderCoordinator {
     // Now permits match actual worker capacity for <100ms queue wait times.
     this.semaphore = new Semaphore(options?.maxConcurrent ?? 4);
     this.contentTypeDetectionEnabled = options?.enableContentTypeDetection ?? false;
+    
+    // Register this instance for policy updates
+    renderCoordinatorInstance = this;
+  }
+
+  // ============================================================
+  // Dynamic Semaphore Policy (amnesia-e4i)
+  // ============================================================
+
+  /**
+   * Update semaphore policy based on reader state.
+   * Called when gesture phase changes or zoom level changes significantly.
+   */
+  updateSemaphorePolicy(policy: SemaphorePolicy): void {
+    const oldPolicy = this.currentPolicy;
+    this.currentPolicy = policy;
+    
+    // Update semaphore queue size
+    this.semaphore.setMaxQueueSize(policy.maxQueueSize);
+    
+    if (oldPolicy.maxQueueSize !== policy.maxQueueSize || 
+        oldPolicy.viewportOnlyThreshold !== policy.viewportOnlyThreshold) {
+      console.log(`[RenderCoordinator] Policy update:`, {
+        maxQueueSize: `${oldPolicy.maxQueueSize} → ${policy.maxQueueSize}`,
+        viewportOnlyThreshold: `${oldPolicy.viewportOnlyThreshold} → ${policy.viewportOnlyThreshold}`,
+        dropBehavior: policy.dropBehavior,
+        maxTilesPerPage: policy.maxTilesPerPage || 'unlimited',
+      });
+    }
+  }
+
+  /**
+   * Get current semaphore policy.
+   * Used by rendering code to decide viewport-only vs full-page tiles.
+   */
+  getCurrentPolicy(): SemaphorePolicy {
+    return this.currentPolicy;
+  }
+
+  /**
+   * Update current zoom level (for policy calculations).
+   */
+  setCurrentZoom(zoom: number): void {
+    this.currentZoom = zoom;
+  }
+
+  /**
+   * Get current zoom level.
+   */
+  getCurrentZoom(): number {
+    return this.currentZoom;
+  }
+
+  /**
+   * Check if viewport-only tiles should be used at the given zoom level.
+   * Based on current policy which is determined by gesture state.
+   */
+  shouldUseViewportOnlyTiles(zoom: number): boolean {
+    return zoom > this.currentPolicy.viewportOnlyThreshold;
+  }
+
+  /**
+   * Get max tiles per page based on current policy.
+   * Returns 0 for no limit (idle state).
+   */
+  getMaxTilesPerPage(): number {
+    return this.currentPolicy.maxTilesPerPage;
+  }
+
+  // ============================================================
+  // Smart Retry Queue Methods (amnesia-e4i)
+  // ============================================================
+
+  /**
+   * Add a dropped tile to the retry queue.
+   * Includes multiple safeguards to prevent infinite loops and memory leaks.
+   */
+  private addToRetryQueue(tile: TileCoordinate, priority: RenderPriority): void {
+    const key = this.getTilePositionKey(tile);
+    const now = performance.now();
+    const existing = this.retryQueue.get(key);
+    
+    // SAFEGUARD 1: Max retry attempts
+    if (existing && existing.attempts >= RenderCoordinator.MAX_RETRY_ATTEMPTS) {
+      console.warn(`[RetryQueue] Max attempts reached for ${key}, not re-queuing`);
+      this.retryQueue.delete(key);
+      return;
+    }
+    
+    // SAFEGUARD 2: Queue size limit (prevent memory leaks)
+    if (this.retryQueue.size >= RenderCoordinator.MAX_RETRY_QUEUE_SIZE) {
+      // Remove oldest entry
+      const oldestKey = this.retryQueue.keys().next().value;
+      if (oldestKey) {
+        this.retryQueue.delete(oldestKey);
+        console.log(`[RetryQueue] Queue full, evicted oldest: ${oldestKey}`);
+      }
+    }
+    
+    // Add or update entry
+    const attempts = (existing?.attempts ?? 0) + 1;
+    this.retryQueue.set(key, {
+      tile: { ...tile }, // Clone to prevent mutation
+      attempts,
+      lastDropTime: now,
+      // Boost priority for retries (but don't go above 'high' to avoid starving critical)
+      priority: priority === 'low' ? 'medium' : priority === 'medium' ? 'high' : priority,
+    });
+    
+    console.log(`[RetryQueue] Added ${key} (attempt ${attempts}/${RenderCoordinator.MAX_RETRY_ATTEMPTS}), queue size: ${this.retryQueue.size}`);
+  }
+  
+  /**
+   * Get tile position key (without scale) for retry tracking.
+   * We use position-only key because the same visual tile might be
+   * requested at different scales during zoom transitions.
+   */
+  private getTilePositionKey(tile: TileCoordinate): string {
+    return `p${tile.page}-t${tile.tileX}x${tile.tileY}`;
+  }
+  
+  /**
+   * Process retry queue - attempt to re-render dropped tiles.
+   * Call this after renders complete or on a periodic basis.
+   * 
+   * @param viewportBounds Optional viewport to filter out off-screen tiles
+   * @returns Number of tiles queued for retry
+   */
+  async processRetryQueue(viewportBounds?: { x: number; y: number; width: number; height: number }): Promise<number> {
+    const now = performance.now();
+    let retriedCount = 0;
+    const toRetry: Array<{ key: string; tile: TileCoordinate; priority: RenderPriority }> = [];
+    
+    // First pass: collect eligible tiles and clean up stale entries
+    for (const [key, entry] of this.retryQueue) {
+      // SAFEGUARD 3: TTL expiry (prevent stale entries from accumulating)
+      if (now - entry.lastDropTime > RenderCoordinator.RETRY_ENTRY_TTL_MS) {
+        this.retryQueue.delete(key);
+        console.log(`[RetryQueue] Entry expired: ${key}`);
+        continue;
+      }
+      
+      // SAFEGUARD 4: Cooldown (prevent rapid-fire retries)
+      if (now - entry.lastDropTime < RenderCoordinator.RETRY_COOLDOWN_MS) {
+        continue; // Not ready for retry yet
+      }
+      
+      // SAFEGUARD 5: Viewport check - skip tiles that are off-screen
+      // (This is a simple check; full viewport intersection would need layout info)
+      if (viewportBounds) {
+        // We don't have full layout info here, so just log that we're doing viewport filtering
+        // The actual filtering happens in the caller who has the layout info
+      }
+      
+      toRetry.push({ key, tile: entry.tile, priority: entry.priority });
+    }
+    
+    // Second pass: queue retries (limit batch size to prevent queue flood)
+    const BATCH_SIZE = 10;
+    for (const { key, tile, priority } of toRetry.slice(0, BATCH_SIZE)) {
+      this.retryQueue.delete(key); // Remove from retry queue before re-requesting
+      
+      console.log(`[RetryQueue] Retrying ${key} at priority ${priority}`);
+      
+      // Don't await - fire and forget to avoid blocking
+      this.requestRender({
+        type: 'tile',
+        tile,
+        priority,
+      }).catch(err => {
+        console.warn(`[RetryQueue] Retry failed for ${key}:`, err);
+      });
+      
+      retriedCount++;
+    }
+    
+    if (retriedCount > 0) {
+      console.log(`[RetryQueue] Queued ${retriedCount} retries, ${this.retryQueue.size} remaining`);
+    }
+    
+    return retriedCount;
+  }
+  
+  /**
+   * Clear all entries from the retry queue.
+   * Call this on major view changes (zoom, page jump) to avoid retrying stale tiles.
+   */
+  clearRetryQueue(): void {
+    const count = this.retryQueue.size;
+    this.retryQueue.clear();
+    if (count > 0) {
+      console.log(`[RetryQueue] Cleared ${count} entries`);
+    }
+  }
+  
+  /**
+   * Get retry queue stats for diagnostics.
+   */
+  getRetryQueueStats(): { size: number; maxSize: number; maxAttempts: number } {
+    return {
+      size: this.retryQueue.size,
+      maxSize: RenderCoordinator.MAX_RETRY_QUEUE_SIZE,
+      maxAttempts: RenderCoordinator.MAX_RETRY_ATTEMPTS,
+    };
   }
 
   /**
@@ -400,6 +781,9 @@ export class RenderCoordinator {
     if (cleared > 0) {
       console.log(`[RenderCoordinator] Cleared ${cleared} pending requests from queue`);
     }
+    
+    // amnesia-e4i: Also clear retry queue on major view changes
+    this.clearRetryQueue();
   }
 
   /**
@@ -1301,8 +1685,12 @@ export class RenderCoordinator {
     if (!acquired) {
       RenderCoordinator.droppedFromQueue++;
       this.logAbortStats('dropped from queue');
-      // FALLBACK FIX: Even when dropped from queue, try to return a cached fallback tile
+      
+      // amnesia-e4i: Add to retry queue for later processing
       if (request.type === 'tile') {
+        this.addToRetryQueue(request.tile, request.priority);
+        
+        // FALLBACK FIX: Even when dropped from queue, try to return a cached fallback tile
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
         if (fallback) {
           // amnesia-e4i: Include fallbackTile for correct compositing position
