@@ -259,6 +259,7 @@ export class ScrollStrategy {
       if (!this.rectsOverlap(predictedViewport, layout)) continue;
 
       const intersection = this.getIntersection(predictedViewport, layout);
+      // amnesia-e4i FIX: Pass zoom for adaptive tile sizing
       const pageTiles = this.getTilesInPageRect(
         {
           x: intersection.x - layout.x,
@@ -269,7 +270,8 @@ export class ScrollStrategy {
         layout.page,
         prefetchScale, // Use velocity-based scale directly
         layout.width,
-        layout.height
+        layout.height,
+        zoom
       );
 
       for (const tile of pageTiles) {
@@ -442,6 +444,7 @@ export class ScrollStrategy {
       if (!this.rectsOverlap(expandedViewport, layout)) continue;
 
       const intersection = this.getIntersection(expandedViewport, layout);
+      // amnesia-e4i FIX: Pass zoom for adaptive tile sizing
       const pageTiles = this.getTilesInPageRect(
         {
           x: intersection.x - layout.x,
@@ -452,7 +455,8 @@ export class ScrollStrategy {
         layout.page,
         scale,
         layout.width,
-        layout.height
+        layout.height,
+        zoom
       );
 
       for (const tile of pageTiles) {

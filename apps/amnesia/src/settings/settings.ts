@@ -402,6 +402,93 @@ export type PdfRenderDpi = 72 | 96 | 150 | 200 | 300;
 export type PdfImageFormat = 'png' | 'jpeg' | 'webp';
 
 /**
+ * PDF performance preset names
+ */
+export type PdfPerformancePreset = 'balanced' | 'performance' | 'memory-saver' | 'quality' | 'custom';
+
+/**
+ * PDF tile rendering performance settings
+ * These settings control the WASM-based tile renderer performance characteristics.
+ * Used by performance presets and can be individually customized.
+ */
+export interface PdfTilePerformanceSettings {
+  /** L1 (memory) cache max size in MB. Default: 50 */
+  l1CacheSizeMB: number;
+  /** L2 (IndexedDB) cache max size in MB. Default: 200 */
+  l2CacheSizeMB: number;
+  /** Number of WASM workers (0 = auto based on CPU cores). Default: 0 */
+  workerCount: number;
+  /** Scroll render debounce in ms. Lower = more responsive. Default: 32 */
+  scrollDebounceMsOverride: number;
+  /** Zoom render debounce in ms. Lower = faster zoom response. Default: 150 */
+  zoomDebounceMs: number;
+  /** Number of viewports to prefetch during scroll (1-4). Default: 2 */
+  prefetchViewports: number;
+  /** Maximum tile scale for high-zoom rendering. Default: 32 */
+  maxTileScale: number;
+  /** Quality reduction during fast scroll (0.0-1.0). Default: 0.5 */
+  fastScrollQuality: number;
+  /** Enable progressive multi-resolution zoom. Default: true */
+  enableProgressiveZoom: boolean;
+  /** Enable hybrid rendering (full-page at low zoom, tiles at high zoom). Default: true */
+  enableHybridRendering: boolean;
+}
+
+/**
+ * Default tile performance settings for each preset
+ */
+export const PDF_PERFORMANCE_PRESETS: Record<Exclude<PdfPerformancePreset, 'custom'>, PdfTilePerformanceSettings> = {
+  balanced: {
+    l1CacheSizeMB: 50,
+    l2CacheSizeMB: 200,
+    workerCount: 0, // auto
+    scrollDebounceMsOverride: 32,
+    zoomDebounceMs: 150,
+    prefetchViewports: 2,
+    maxTileScale: 32,
+    fastScrollQuality: 0.5,
+    enableProgressiveZoom: true,
+    enableHybridRendering: true,
+  },
+  performance: {
+    l1CacheSizeMB: 100,
+    l2CacheSizeMB: 300,
+    workerCount: 4,
+    scrollDebounceMsOverride: 16,
+    zoomDebounceMs: 50,
+    prefetchViewports: 3,
+    maxTileScale: 32,
+    fastScrollQuality: 0.75,
+    enableProgressiveZoom: true,
+    enableHybridRendering: true,
+  },
+  'memory-saver': {
+    l1CacheSizeMB: 30,
+    l2CacheSizeMB: 100,
+    workerCount: 1,
+    scrollDebounceMsOverride: 64,
+    zoomDebounceMs: 250,
+    prefetchViewports: 1,
+    maxTileScale: 16,
+    fastScrollQuality: 0.5,
+    enableProgressiveZoom: false,
+    enableHybridRendering: true,
+  },
+  quality: {
+    l1CacheSizeMB: 80,
+    l2CacheSizeMB: 250,
+    workerCount: 0, // auto
+    scrollDebounceMsOverride: 50,
+    zoomDebounceMs: 200,
+    prefetchViewports: 2,
+    maxTileScale: 32,
+    fastScrollQuality: 0.9,
+    enableProgressiveZoom: true,
+    enableHybridRendering: true,
+  },
+};
+
+/**
  * PDF renderer settings
  */
 export interface PdfSettings {
@@ -496,6 +583,15 @@ export interface PdfSettings {
   scrollPrefetchViewports: number;
   /** Fast scroll velocity threshold for switching to low-res tiles (px/s). Default: 500 */
   fastScrollThreshold: number;
+
+  // ==========================================================================
+  // Performance Presets (WASM Tile Renderer)
+  // ==========================================================================
+
+  /** Selected performance preset. Default: 'balanced' */
+  performancePreset: PdfPerformancePreset;
+  /** Custom tile performance settings (used when preset is 'custom'). */
+  tilePerformance: PdfTilePerformanceSettings;
 }
 
 // ==========================================================================
@@ -935,6 +1031,10 @@ export const DEFAULT_SETTINGS: LibrosSettings = {
     tileSize: 256,                    // 256px tiles for finer granularity (matches Preview.app)
     scrollPrefetchViewports: 2,       // Prefetch 2 viewports ahead during scroll
     fastScrollThreshold: 500,         // Switch to low-res tiles when scrolling > 500px/s
+
+    // Performance Presets (WASM Tile Renderer)
+    performancePreset: 'balanced',    // Default to balanced preset
+    tilePerformance: PDF_PERFORMANCE_PRESETS.balanced,  // Use balanced preset values
   },
 
   // ==========================================================================

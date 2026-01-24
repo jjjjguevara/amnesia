@@ -189,7 +189,7 @@
 
           <div class="setting-item mod-slider">
             <div class="setting-item-control" style="width: 100%;">
-              <input class="slider" type="range" min="0.25" max="4" step="0.05" value={settings.scale} on:input={handleScaleChange} data-ignore-swipe="true" />
+              <input class="slider" type="range" min="0.1" max="32" step="0.1" value={settings.scale} on:input={handleScaleChange} data-ignore-swipe="true" />
             </div>
           </div>
 
@@ -205,7 +205,7 @@
           </div>
 
           <div class="zoom-presets">
-            {#each [50, 75, 100, 125, 150, 200, 300] as preset}
+            {#each [50, 75, 100, 150, 200, 400, 800, 1600] as preset}
               <button class="preset-btn" class:active={scalePercent === preset} on:click={() => handleScalePreset(preset)}>
                 {preset}%
               </button>

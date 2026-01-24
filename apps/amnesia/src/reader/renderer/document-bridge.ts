@@ -26,7 +26,7 @@ type PendingRequest = {
 };
 
 // Static plugin path for worker loading - set by the plugin on startup
-let pluginBasePath: string | null = null;
+export let pluginBasePath: string | null = null;
 let cachedWorkerBlobUrl: string | null = null;
 
 /**
@@ -62,9 +62,51 @@ async function getWorkerBlobUrl(): Promise<string> {
 }
 
 /**
+ * Interface for document bridge implementations.
+ * Allows for different backends (single worker, worker pool, etc.)
+ */
+export interface IDocumentBridge {
+  initialize(): Promise<void>;
+  loadDocument(data: ArrayBuffer, filename?: string): Promise<ParsedDocument>;
+  loadDocumentWithId(
+    data: ArrayBuffer,
+    filename?: string
+  ): Promise<{ id: string; document: ParsedDocument }>;
+  renderItem(
+    docId: string,
+    itemIndex: number,
+    scale: number
+  ): Promise<{ data: Uint8Array; width: number; height: number }>;
+  renderTile(
+    docId: string,
+    itemIndex: number,
+    tileX: number,
+    tileY: number,
+    tileSize: number,
+    scale: number
+  ): Promise<{ data: Uint8Array; width: number; height: number }>;
+  getStructuredText(docId: string, itemIndex: number): Promise<StructuredText>;
+  search(
+    docId: string,
+    query: string,
+    maxHits?: number,
+    includeContext?: boolean
+  ): Promise<SearchResult[]>;
+  getItemCount(docId: string): Promise<number>;
+  getItemDimensions(
+    docId: string,
+    itemIndex: number
+  ): Promise<{ width: number; height: number }>;
+  getEpubChapter(docId: string, chapterIndex: number): Promise<string>;
+  unloadDocument(docId: string): Promise<void>;
+  terminate(): void;
+  readonly ready: boolean;
+}
+
+/**
  * Bridge to communicate with Document Web Worker
  */
-export class DocumentBridge {
+export class DocumentBridge implements IDocumentBridge {
   private worker: Worker | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private requestIdCounter = 0;

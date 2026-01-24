@@ -21,9 +21,31 @@
  * ```
  */
 
-import { MuPDFBridge, getSharedMuPDFBridge, destroySharedMuPDFBridge } from './mupdf-bridge';
+import { getSharedMuPDFBridge, destroySharedMuPDFBridge, type RenderFormat, type IMuPDFBridge } from './mupdf-bridge';
 import type { TextLayerData, TextItem, CharPosition, SearchResult, TocEntry } from './mupdf-worker';
 import type { PdfTextLayerData, PdfRenderOptions, PdfSearchResult } from '../types';
+import { createPipelineTimer, type PipelineTimerBuilder } from './pdf-telemetry';
+import { isFeatureEnabled } from './feature-flags';
+
+/**
+ * Result from tile/page rendering - can be PNG Blob or raw RGBA pixels
+ */
+export interface TileRenderResult {
+  format: RenderFormat;
+  /** PNG blob (when format === 'png') */
+  blob?: Blob;
+  /** Raw RGBA pixel data (when format === 'rgba') */
+  rgba?: Uint8Array;
+  /** Rendered width in pixels */
+  width: number;
+  /** Rendered height in pixels */
+  height: number;
+  /**
+   * Scale epoch at render time (INV-6: Scale/Layout Atomicity).
+   * Used to validate tiles at display time - stale epochs are discarded.
+   */
+  scaleEpoch?: number;
+}
 
 /**
  * Configuration for WASM renderer
@@ -50,7 +72,7 @@ interface CachedPage {
  * WASM-based PDF renderer using MuPDF
  */
 export class WasmPdfRenderer {
-  private bridge: MuPDFBridge | null = null;
+  private bridge: IMuPDFBridge | null = null;
   private documentId: string | null = null;
   private pageCount: number = 0;
   private config: Required<WasmRendererConfig>;
@@ -77,8 +99,10 @@ export class WasmPdfRenderer {
     if (this.bridge) return;
 
     const startTime = performance.now();
+    console.log('[WasmRenderer] initialize() - calling getSharedMuPDFBridge()...');
 
     this.bridge = await getSharedMuPDFBridge();
+    console.log('[WasmRenderer] Bridge obtained, type:', this.bridge?.constructor?.name);
 
     if (this.config.debug) {
       console.log(`[WasmRenderer] Initialized in ${(performance.now() - startTime).toFixed(1)}ms`);
@@ -116,6 +140,32 @@ export class WasmPdfRenderer {
   }
 
   /**
+   * Load document on all workers for maximum parallel rendering
+   * Call this after loadDocument() when expecting heavy batch rendering
+   *
+   * @param data Original document data (will be cloned for each worker)
+   */
+  async loadDocumentOnAllWorkers(data: ArrayBuffer): Promise<void> {
+    if (!this.bridge || !this.documentId) {
+      throw new Error('Document not loaded. Call loadDocument() first.');
+    }
+
+    // Check if bridge supports loading on all workers (PooledMuPDFBridge)
+    const bridgeWithPool = this.bridge as IMuPDFBridge & {
+      loadDocumentOnAllWorkers?: (docId: string, data: ArrayBuffer) => Promise<void>;
+      getWorkerCount?: () => number;
+    };
+
+    if (typeof bridgeWithPool.loadDocumentOnAllWorkers === 'function') {
+      const workerCount = bridgeWithPool.getWorkerCount?.() ?? 1;
+      console.log(`[WasmRenderer] Loading document on all ${workerCount} workers for parallel rendering`);
+      await bridgeWithPool.loadDocumentOnAllWorkers(this.documentId, data);
+    } else {
+      console.log('[WasmRenderer] Bridge does not support multi-worker loading');
+    }
+  }
+
+  /**
    * Render a page to PNG blob
    *
    * @param pageNumber 1-indexed page number
@@ -141,17 +191,54 @@ export class WasmPdfRenderer {
       }
     }
 
+    // Create pipeline timer for telemetry tracking
+    const enableTelemetry = isFeatureEnabled('enablePipelineTelemetry');
+    let timer: PipelineTimerBuilder | null = null;
+    if (enableTelemetry) {
+      const requestId = `page-${pageNumber}-${Date.now()}`;
+      timer = createPipelineTimer(requestId, {
+        page: pageNumber,
+        scale,
+        transferFormat: 'png',
+      });
+    }
+
     // Render via worker
     const result = await this.bridge.renderPage(this.documentId, pageNumber, scale);
 
-    // Convert Uint8Array PNG to Blob
-    // Create a new Uint8Array to ensure we have a clean copy
+    // Record worker timing if available
+    if (timer && result.workerTiming) {
+      timer
+        .setStage('pageLoad', result.workerTiming.pageLoad)
+        .setStage('render', result.workerTiming.render)
+        .setStage('encode', result.workerTiming.encode);
+    }
+
+    // Record transfer time if available
+    if (timer && result.transferTime !== undefined) {
+      timer.setStage('transfer', result.transferTime);
+    }
+
+    // Convert Uint8Array PNG to Blob (decode stage)
+    const decodeStart = performance.now();
     const pngData = new Uint8Array(result.data);
     const blob = new Blob([pngData], { type: 'image/png' });
+    if (timer) {
+      timer.setStage('decode', performance.now() - decodeStart);
+    }
 
-    // Cache the result
+    // Cache the result (cache stage)
+    const cacheStart = performance.now();
     if (this.config.enableCache) {
       this.setCachedPage(pageNumber, scale, blob);
+    }
+    if (timer) {
+      timer.setStage('cache', performance.now() - cacheStart);
+    }
+
+    // Finalize and record telemetry
+    if (timer) {
+      timer.complete();
     }
 
     if (this.config.debug) {
@@ -165,13 +252,93 @@ export class WasmPdfRenderer {
   }
 
   /**
+   * Render multiple pages in batch across all workers
+   * Uses parallel rendering when PooledMuPDFBridge is available
+   *
+   * @param pageNumbers Array of 1-indexed page numbers to render
+   * @param options Render options (scale)
+   * @param onProgress Optional progress callback
+   * @returns Map of page number to PNG blob
+   */
+  async renderPageBatch(
+    pageNumbers: number[],
+    options?: PdfRenderOptions,
+    onProgress?: (completed: number, total: number, pageNum: number) => void
+  ): Promise<Map<number, Blob>> {
+    if (!this.bridge || !this.documentId) {
+      throw new Error('No document loaded');
+    }
+
+    const scale = options?.scale ?? 1.5;
+    const results = new Map<number, Blob>();
+
+    // Check if bridge supports batch rendering (PooledMuPDFBridge)
+    const bridgeWithBatch = this.bridge as IMuPDFBridge & {
+      renderPageBatch?: (
+        docId: string,
+        pageNums: number[],
+        scale: number,
+        format?: string,
+        onProgress?: (completed: number, total: number, pageNum: number) => void
+      ) => Promise<Map<number, { data: Uint8Array; width: number; height: number; format: string }>>;
+    };
+
+    if (typeof bridgeWithBatch.renderPageBatch === 'function') {
+      // Use batch rendering for parallel execution
+      const startTime = performance.now();
+      console.log(`[WasmRenderer] Starting batch render: ${pageNumbers.length} pages at scale ${scale}`);
+
+      const batchResults = await bridgeWithBatch.renderPageBatch(
+        this.documentId,
+        pageNumbers,
+        scale,
+        'png',
+        onProgress
+      );
+
+      // Convert Uint8Array to Blobs
+      for (const [pageNum, result] of batchResults) {
+        // Ensure we have a regular ArrayBuffer (not SharedArrayBuffer) for Blob creation
+        const dataArray = new Uint8Array(result.data);
+        const blob = new Blob([dataArray], { type: 'image/png' });
+        results.set(pageNum, blob);
+
+        // Cache the result
+        if (this.config.enableCache) {
+          this.setCachedPage(pageNum, scale, blob);
+        }
+      }
+
+      console.log(
+        `[WasmRenderer] Batch render complete: ${results.size}/${pageNumbers.length} in ${(performance.now() - startTime).toFixed(0)}ms`
+      );
+    } else {
+      // Fall back to sequential rendering
+      console.log(`[WasmRenderer] Batch rendering not available, falling back to sequential`);
+      let completed = 0;
+      for (const pageNum of pageNumbers) {
+        try {
+          const blob = await this.renderPage(pageNum, options);
+          results.set(pageNum, blob);
+          completed++;
+          onProgress?.(completed, pageNumbers.length, pageNum);
+        } catch (err) {
+          console.error(`[WasmRenderer] Batch render failed for page ${pageNum}:`, err);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Render a specific tile (256x256 region) of a page
    *
    * @param pageNumber 1-indexed page number
    * @param tileX Tile X coordinate (0-indexed)
    * @param tileY Tile Y coordinate (0-indexed)
    * @param options Render options (scale, tileSize)
-   * @returns PNG blob of the tile
+   * @returns PNG blob of the tile (for legacy compatibility)
    */
   async renderTile(
     pageNumber: number,
@@ -179,13 +346,82 @@ export class WasmPdfRenderer {
     tileY: number,
     options?: { scale?: number; tileSize?: number }
   ): Promise<Blob> {
+    // Use raw RGBA if feature flag is enabled, but convert to blob for compatibility
+    const result = await this.renderTileWithFormat(pageNumber, tileX, tileY, options);
+
+    if (result.blob) {
+      return result.blob;
+    }
+
+    // If raw RGBA, convert to PNG blob for legacy callers
+    // This shouldn't normally happen since renderTileWithFormat auto-selects format
+    if (result.rgba) {
+      // Copy to a regular ArrayBuffer to ensure compatibility with ImageData
+      const rgbaArray = new Uint8ClampedArray(result.rgba.length);
+      rgbaArray.set(result.rgba);
+      const imageData = new ImageData(rgbaArray, result.width, result.height);
+      const bitmap = await createImageBitmap(imageData);
+
+      // Convert to blob using canvas (slower path, but maintains API compatibility)
+      const canvas = document.createElement('canvas');
+      canvas.width = result.width;
+      canvas.height = result.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+
+      return new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error('Failed to convert to blob'));
+        }, 'image/png');
+      });
+    }
+
+    throw new Error('No render data available');
+  }
+
+  /**
+   * Render a tile with explicit format control
+   *
+   * @param pageNumber 1-indexed page number
+   * @param tileX Tile X coordinate (0-indexed)
+   * @param tileY Tile Y coordinate (0-indexed)
+   * @param options Render options (scale, tileSize, format)
+   * @returns RenderResult with either PNG blob or raw RGBA data
+   */
+  async renderTileWithFormat(
+    pageNumber: number,
+    tileX: number,
+    tileY: number,
+    options?: { scale?: number; tileSize?: number; format?: RenderFormat }
+  ): Promise<TileRenderResult> {
     if (!this.bridge || !this.documentId) {
       throw new Error('No document loaded');
     }
 
     const scale = options?.scale ?? 2;
     const tileSize = options?.tileSize ?? 256;
+
+    // Determine format: use provided format, or check feature flag for auto-selection
+    const useRawRGBA = isFeatureEnabled('useRawRGBA');
+    const format: RenderFormat = options?.format ?? (useRawRGBA ? 'rgba' : 'png');
+
     const startTime = performance.now();
+
+    // Create pipeline timer for telemetry tracking
+    const enableTelemetry = isFeatureEnabled('enablePipelineTelemetry');
+    let timer: PipelineTimerBuilder | null = null;
+    if (enableTelemetry) {
+      const requestId = `tile-${pageNumber}-${tileX}-${tileY}-${Date.now()}`;
+      timer = createPipelineTimer(requestId, {
+        page: pageNumber,
+        scale,
+        tileX,
+        tileY,
+        transferFormat: format,
+      });
+    }
 
     // Note: Tile caching is handled by TileCacheManager at a higher level
     // This method just renders the tile
@@ -196,21 +432,64 @@ export class WasmPdfRenderer {
       tileX,
       tileY,
       tileSize,
-      scale
+      scale,
+      format
     );
 
-    // Convert Uint8Array PNG to Blob
-    const pngData = new Uint8Array(result.data);
-    const blob = new Blob([pngData], { type: 'image/png' });
+    // Record worker timing if available
+    if (timer && result.workerTiming) {
+      timer
+        .setStage('pageLoad', result.workerTiming.pageLoad)
+        .setStage('render', result.workerTiming.render)
+        .setStage('encode', result.workerTiming.encode);
+    }
+
+    // Record transfer time if available
+    if (timer && result.transferTime !== undefined) {
+      timer.setStage('transfer', result.transferTime);
+    }
+
+    // Process result based on format
+    const decodeStart = performance.now();
+    let renderResult: TileRenderResult;
+
+    if (result.format === 'rgba') {
+      // Raw RGBA - no decode needed, just wrap the data
+      renderResult = {
+        format: 'rgba',
+        rgba: new Uint8Array(result.data),
+        width: result.width,
+        height: result.height,
+      };
+    } else {
+      // PNG - convert to Blob
+      const pngData = new Uint8Array(result.data);
+      const blob = new Blob([pngData], { type: 'image/png' });
+      renderResult = {
+        format: 'png',
+        blob,
+        width: result.width,
+        height: result.height,
+      };
+    }
+
+    if (timer) {
+      timer.setStage('decode', performance.now() - decodeStart);
+    }
+
+    // Finalize and record telemetry
+    if (timer) {
+      timer.complete();
+    }
 
     if (this.config.debug) {
       console.log(
         `[WasmRenderer] Rendered tile (${pageNumber}, ${tileX}, ${tileY}) @ ${scale}x ` +
-          `(${result.width}x${result.height}) in ${(performance.now() - startTime).toFixed(1)}ms`
+          `format=${format} (${result.width}x${result.height}) in ${(performance.now() - startTime).toFixed(1)}ms`
       );
     }
 
-    return blob;
+    return renderResult;
   }
 
   /**

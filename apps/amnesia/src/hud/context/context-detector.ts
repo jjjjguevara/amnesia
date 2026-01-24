@@ -37,6 +37,8 @@ export interface BookContext {
   series?: string;
   bookPath?: string;
   notePath?: string;
+  /** File format detected from the reader (pdf or epub) */
+  fileFormat?: 'pdf' | 'epub';
 }
 
 /**
@@ -240,6 +242,11 @@ export class ContextDetector {
       return this.detectReaderContext(view);
     }
 
+    // Check if it's the book sidebar (associated with a reader)
+    if (viewType === 'amnesia-book-sidebar') {
+      return this.detectSidebarContext(view);
+    }
+
     // Check if it's a markdown view
     if (viewType === 'markdown') {
       return this.detectMarkdownContext(view);
@@ -247,6 +254,41 @@ export class ContextDetector {
 
     // If active leaf is not reader or markdown (e.g., sidebar panel),
     // check if there are any open reader leaves
+    return this.detectFromReaderLeaves();
+  }
+
+  /**
+   * Detect context from sidebar view
+   * The sidebar is associated with a specific reader/book
+   */
+  private detectSidebarContext(view: any): HUDContext {
+    // Try to get book path from sidebar's Svelte component context
+    const component = view.component;
+    if (component?.$$.ctx) {
+      const ctx = component.$$.ctx;
+      // Look for book path in context (typically at index 2 based on component structure)
+      for (let i = 0; i < Math.min(ctx.length, 10); i++) {
+        const val = ctx[i];
+        if (typeof val === 'string' && (val.includes('.epub') || val.includes('.pdf'))) {
+          const title = this.extractBookTitle(val);
+          // Detect format from path
+          const lowerPath = val.toLowerCase();
+          const fileFormat: 'pdf' | 'epub' | undefined = lowerPath.endsWith('.pdf')
+            ? 'pdf'
+            : lowerPath.endsWith('.epub')
+              ? 'epub'
+              : undefined;
+          return {
+            type: 'book',
+            bookPath: val,
+            title,
+            fileFormat,
+          };
+        }
+      }
+    }
+
+    // Fallback to checking reader leaves
     return this.detectFromReaderLeaves();
   }
 
@@ -283,14 +325,53 @@ export class ContextDetector {
       // Try to extract a better title from the path
       const title = this.extractBookTitle(bookPath, stateTitle);
 
+      // Extract file format from component context or path
+      const fileFormat = this.detectFileFormat(view, bookPath);
+
       return {
         type: 'book',
         bookPath,
         title,
+        fileFormat,
       };
     }
 
     return { type: 'none' };
+  }
+
+  /**
+   * Detect file format from reader view component or path
+   */
+  private detectFileFormat(view: any, bookPath: string): 'pdf' | 'epub' | undefined {
+    // Try to get format from Svelte component context
+    try {
+      const component = view.component;
+      if (component?.$$.ctx) {
+        const ctx = component.$$.ctx;
+        // Look for format type in context (typically at index 3)
+        for (let i = 0; i < Math.min(ctx.length, 10); i++) {
+          const val = ctx[i];
+          if (val && typeof val === 'object' && 'type' in val) {
+            const formatType = val.type;
+            if (formatType === 'pdf' || formatType === 'epub') {
+              return formatType;
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore errors accessing component context
+    }
+
+    // Fallback to path-based detection
+    const lowerPath = bookPath.toLowerCase();
+    if (lowerPath.endsWith('.pdf')) {
+      return 'pdf';
+    } else if (lowerPath.endsWith('.epub')) {
+      return 'epub';
+    }
+
+    return undefined;
   }
 
   /**

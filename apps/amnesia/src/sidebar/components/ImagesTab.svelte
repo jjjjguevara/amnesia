@@ -151,28 +151,19 @@
   }
 
   function getImageTitle(image: BookImage, index: number): string {
-    // Priority: title > alt > originalHref filename > spineHref derived > "Image N"
+    // Priority: title > alt > originalHref filename > "Chapter N"
     if (image.title) return image.title;
-    if (image.alt) return image.alt;
+    if (image.alt && image.alt.trim()) return image.alt;
 
     // Try to extract filename from original EPUB path
-    if (image.originalHref && !image.originalHref.startsWith('blob:')) {
+    if (image.originalHref && !image.originalHref.startsWith('blob:') && !image.originalHref.startsWith('data:')) {
       const filename = image.originalHref.split('/').pop() || '';
       const cleanName = filename.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
-      if (cleanName) return cleanName;
+      if (cleanName && cleanName.length > 0) return cleanName;
     }
 
-    // Try to derive from spineHref (chapter name)
-    if (image.spineHref) {
-      const chapterName = image.spineHref.split('/').pop() || '';
-      const cleanChapter = chapterName.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
-      if (cleanChapter && cleanChapter.length < 30) {
-        return `${cleanChapter} - Image`;
-      }
-    }
-
-    // Final fallback: numbered image
-    return `Image ${index + 1}`;
+    // Fallback: "Chapter N" (1-indexed for user display)
+    return `Chapter ${image.spineIndex + 1}`;
   }
 
   function setIconEl(node: HTMLElement, icon: string) {

@@ -321,3 +321,119 @@ export function resetGridStrategy(config?: Partial<GridStrategyConfig>): void {
 export function updateGridStrategyConfig(updates: Partial<GridStrategyConfig>): void {
   getGridStrategy().updateConfig(updates);
 }
+
+/**
+ * Priority level for thumbnail generation
+ */
+export type ThumbnailPriority = 'critical' | 'high' | 'medium' | 'low';
+
+/**
+ * Page with priority information for thumbnail generation
+ */
+export interface ThumbnailPriorityPage {
+  page: number;
+  priority: ThumbnailPriority;
+  numericPriority: number; // 0-100, higher = more important
+}
+
+/**
+ * Generate ripple order for thumbnail generation.
+ *
+ * Unlike grid-based ripple which uses 2D grid coordinates,
+ * this uses linear page distance from center for simpler thumbnail ordering.
+ *
+ * Priority bands:
+ * - Critical: Center ± 2 pages (visible immediately)
+ * - High: Center ± 10 pages (likely to scroll to)
+ * - Medium: Center ± 30 pages (probable viewing)
+ * - Low: Everything else (background loading)
+ *
+ * @param centerPage The starting page (1-indexed)
+ * @param pageCount Total number of pages
+ * @returns Pages ordered by priority (critical first)
+ */
+export function getThumbnailRippleOrder(
+  centerPage: number,
+  pageCount: number
+): ThumbnailPriorityPage[] {
+  const pages: ThumbnailPriorityPage[] = [];
+  const visited = new Set<number>();
+
+  // Start from center and expand outward
+  let ring = 0;
+  while (pages.length < pageCount) {
+    // Add pages at this distance from center
+    const before = centerPage - ring;
+    const after = centerPage + ring;
+
+    if (ring === 0) {
+      // Center page
+      if (centerPage >= 1 && centerPage <= pageCount) {
+        pages.push({
+          page: centerPage,
+          priority: 'critical',
+          numericPriority: 100,
+        });
+        visited.add(centerPage);
+      }
+    } else {
+      // Add before and after pages
+      if (before >= 1 && !visited.has(before)) {
+        pages.push({
+          page: before,
+          ...getPriorityForDistance(ring),
+        });
+        visited.add(before);
+      }
+      if (after <= pageCount && !visited.has(after)) {
+        pages.push({
+          page: after,
+          ...getPriorityForDistance(ring),
+        });
+        visited.add(after);
+      }
+    }
+
+    ring++;
+
+    // Safety check to prevent infinite loop
+    if (ring > pageCount) break;
+  }
+
+  return pages;
+}
+
+/**
+ * Get priority level based on distance from center
+ */
+function getPriorityForDistance(distance: number): { priority: ThumbnailPriority; numericPriority: number } {
+  if (distance <= 2) {
+    return { priority: 'critical', numericPriority: 100 - distance * 5 };
+  } else if (distance <= 10) {
+    return { priority: 'high', numericPriority: 80 - (distance - 2) * 5 };
+  } else if (distance <= 30) {
+    return { priority: 'medium', numericPriority: 50 - (distance - 10) * 1 };
+  } else {
+    return { priority: 'low', numericPriority: Math.max(10, 30 - (distance - 30) * 0.5) };
+  }
+}
+
+/**
+ * Group pages by priority level for batch processing
+ */
+export function groupPagesByPriority(
+  pages: ThumbnailPriorityPage[]
+): Record<ThumbnailPriority, number[]> {
+  const groups: Record<ThumbnailPriority, number[]> = {
+    critical: [],
+    high: [],
+    medium: [],
+    low: [],
+  };
+
+  for (const { page, priority } of pages) {
+    groups[priority].push(page);
+  }
+
+  return groups;
+}

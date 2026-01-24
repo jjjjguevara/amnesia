@@ -28,7 +28,7 @@ import type {
 } from './renderer/types';
 import type { Highlight } from '../library/types';
 import { DEFAULT_RENDERER_CONFIG } from './renderer/types';
-import type { ContentProvider } from './renderer/renderer';
+import type { ContentProvider } from './renderer/content-provider';
 import { ShadowDOMView } from './shadow-dom-view';
 import {
   createNavigator,

@@ -103,7 +103,7 @@ export interface StatusBarContent {
  * Required for Doc Doctor's dynamic status bar to work.
  */
 export interface DocDoctorStatusBarContent {
-  /** Primary text (e.g., "4 Projects" or "Reading: Moby Dick") */
+  /** Primary text (e.g., "4 Projects" or "| 17 hl") - shown after titleText if provided */
   primaryText: Readable<string>;
 
   /** Health/status indicator color */
@@ -114,6 +114,12 @@ export interface DocDoctorStatusBarContent {
 
   /** Tooltip text on hover */
   tooltip: Readable<string>;
+
+  /** File format badge (e.g., "PDF", "EPUB") - styled like Obsidian's .nav-file-tag */
+  formatBadge?: Readable<string | null>;
+
+  /** Title text for ticker animation (e.g., book title) - scrolls on hover, Amnesia only */
+  titleText?: Readable<string | null>;
 }
 
 // =============================================================================

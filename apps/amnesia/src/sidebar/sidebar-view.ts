@@ -8,6 +8,7 @@ import { ItemView, WorkspaceLeaf } from 'obsidian';
 import type AmnesiaPlugin from '../main';
 import Sidebar from './components/Sidebar.svelte';
 import type { TocEntry } from '../reader/renderer/types';
+import type { Locator } from '../reader/navigator/navigator-interface';
 
 export const BOOK_SIDEBAR_VIEW_TYPE = 'amnesia-book-sidebar';
 
@@ -68,6 +69,15 @@ export class BookSidebarView extends ItemView {
   updateSearchIndexState(ready: boolean, progress: number, total: number): void {
     if (this.component && typeof (this.component as any).updateSearchIndexState === 'function') {
       (this.component as any).updateSearchIndexState(ready, progress, total);
+    }
+  }
+
+  /**
+   * Update the current reading location for progress tracking.
+   */
+  updateLocation(locator: Locator): void {
+    if (this.component && typeof (this.component as any).updateLocation === 'function') {
+      (this.component as any).updateLocation(locator);
     }
   }
 }

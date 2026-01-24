@@ -121,7 +121,8 @@ export class DarkModeRenderer {
       canvas.width = imageBitmap.width;
       canvas.height = imageBitmap.height;
 
-      const ctx = canvas.getContext('2d');
+      // willReadFrequently optimization: we'll call getImageData in applyCanvasDarkMode
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) {
         throw new Error('Failed to get 2D context');
       }
@@ -129,7 +130,7 @@ export class DarkModeRenderer {
       // Draw image
       ctx.drawImage(imageBitmap, 0, 0);
 
-      // Apply dark mode
+      // Apply dark mode (will use getImageData)
       this.applyCanvasDarkMode(canvas);
 
       // Convert back to blob
@@ -387,7 +388,8 @@ export class DarkModeRenderer {
       canvas.width = Math.floor(imageBitmap.width * scale);
       canvas.height = Math.floor(imageBitmap.height * scale);
 
-      const ctx = canvas.getContext('2d');
+      // willReadFrequently optimization: we call getImageData for variance analysis
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) return false;
 
       ctx.drawImage(imageBitmap, 0, 0, canvas.width, canvas.height);

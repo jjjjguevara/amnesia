@@ -52,12 +52,23 @@ import {
 // Server Management
 import { ServerManager, type ServerState } from './server/server-manager';
 
-// PDF WASM Worker Path Configuration
-import { setMuPDFPluginPath } from './reader/renderer/pdf/mupdf-bridge';
+// PDF WASM Worker Path Configuration (supports single-worker and multi-worker pool)
+import { setPooledBridgePluginPath } from './reader/renderer/pdf/pooled-mupdf-bridge';
+import { prewarmWorkerPool, destroyWorkerPool } from './reader/renderer/pdf/worker-pool-manager';
 // Document WASM Worker Path Configuration (for unified document provider)
-import { setDocumentPluginPath } from './reader/renderer/document-bridge';
+import { setDocumentPluginPath, destroySharedDocumentBridge } from './reader/renderer/document-bridge';
+import { destroyDocumentWorkerPool } from './reader/renderer/document-worker-pool-manager';
 import { getTelemetry } from './reader/renderer/pdf/pdf-telemetry';
 import { initializeTestHarness } from './reader/renderer/pdf/mcp-test-harness';
+import { getBenchmarkSuite } from './reader/renderer/pdf/benchmark-suite';
+import { getFeatureFlags, initializeFeatureFlags } from './reader/renderer/pdf/feature-flags';
+import { toggleDebugTileMode, isDebugTileModeEnabled } from './reader/renderer/pdf/debug-mock-pdf';
+import { 
+	initializeResourceDetector, 
+	resetResourceDetector, 
+	getPreferenceStore,
+	type ResourceDetector 
+} from './reader/renderer/pdf/resource-detector';
 
 // HUD System
 import { AmnesiaHUD, AmnesiaHUDProvider, isDocDoctorAvailable, getDocDoctorRegistry, onDocDoctorHUDReady } from './hud';
@@ -131,6 +142,9 @@ export default class AmnesiaPlugin extends Plugin {
 	// Doc Doctor Integration
 	docDoctorBridge: DocDoctorBridge | null = null;
 
+	// Resource Detector for PDF performance optimization (Phase R2)
+	resourceDetector: ResourceDetector | null = null;
+
 	// Active book context tracking
 	private activeLeafChangeRef: import('obsidian').EventRef | null = null;
 
@@ -139,10 +153,18 @@ export default class AmnesiaPlugin extends Plugin {
 
 		// Configure WASM worker paths for PDF and document rendering
 		// Must be done before any PDF/document operations
+		// setPooledBridgePluginPath sets both single-worker and multi-worker pool paths
 		const vaultPath = (this.app.vault.adapter as { basePath?: string }).basePath;
 		if (vaultPath) {
-			setMuPDFPluginPath(vaultPath);
+			setPooledBridgePluginPath(vaultPath);
 			setDocumentPluginPath(vaultPath);
+
+			// Pre-warm worker pool in background (non-blocking)
+			// This eliminates cold start latency when first PDF is opened
+			// Workers will be ready before user opens a PDF
+			prewarmWorkerPool().catch(err => {
+				console.warn('[Amnesia] Worker pool pre-warm failed:', err);
+			});
 		}
 
 		// Initialize PDF telemetry for performance monitoring
@@ -422,6 +444,16 @@ export default class AmnesiaPlugin extends Plugin {
 
 		// Expose API globally for Templater/QuickAdd
 		(window as any).Amnesia = this.api;
+
+		// Expose PDF performance benchmarks and feature flags
+		(window as any).Amnesia.benchmarks = getBenchmarkSuite();
+		(window as any).Amnesia.featureFlags = getFeatureFlags();
+		(window as any).Amnesia.telemetry = getTelemetry();
+
+		// Initialize feature flags in background (non-blocking, fire-and-forget)
+		initializeFeatureFlags(3000).then(() => {
+			console.log('[Amnesia] Feature flags initialized:', getFeatureFlags().getSummary());
+		});
 
 		// Emit ready event for other plugins (e.g., Doc Doctor)
 		this.app.workspace.trigger('amnesia:ready', {
@@ -1102,6 +1134,20 @@ export default class AmnesiaPlugin extends Plugin {
 			}
 		});
 
+		// Command to toggle debug tile mode (for visual debugging of tile composition)
+		this.addCommand({
+			id: 'toggle-debug-tiles',
+			name: 'Toggle Debug Tiles (amnesia-d9f)',
+			callback: () => {
+				const nowEnabled = toggleDebugTileMode();
+				if (nowEnabled) {
+					new Notice('Debug tiles ENABLED. Scroll or zoom to see colored debug tiles.');
+				} else {
+					new Notice('Debug tiles DISABLED. Scroll or zoom to see normal content.');
+				}
+			}
+		});
+
 		// Add modal styles
 		addRegenerateModalStyles(document);
 
@@ -1168,6 +1214,33 @@ export default class AmnesiaPlugin extends Plugin {
 			} else {
 				console.log('[Amnesia] Reader ↔ Vault Sync disabled in settings');
 			}
+
+			// Initialize Resource Detector for PDF performance optimization (Phase R2)
+			try {
+				const savedData = await this.loadData();
+				this.resourceDetector = await initializeResourceDetector(
+					this.app,
+					savedData?.resourceDetectorPreferences
+				);
+				
+				// Wire preference persistence callback (Phase R2.3)
+				// Preferences are saved whenever they change (rule suppression, preset application, etc.)
+				getPreferenceStore().setPersistCallback(async (preferences) => {
+					const existingData = await this.loadData() || {};
+					await this.saveData({
+						...existingData,
+						resourceDetectorPreferences: preferences,
+					});
+				});
+				
+				console.log('[Amnesia] Resource Detector initialized');
+			} catch (error) {
+				console.warn('[Amnesia] Resource Detector initialization failed:', error);
+				// Clean up partial initialization
+				resetResourceDetector();
+				this.resourceDetector = null;
+				// Continue without resource detector - it's optional
+			}
 		};
 
 		// Check if layout is already ready (e.g., during hot reload)
@@ -1208,8 +1281,28 @@ export default class AmnesiaPlugin extends Plugin {
 		}
 
 		if (this.hudProvider) {
+			// Unregister from Doc Doctor's HUD registry to clean up store subscriptions
+			try {
+				const registry = getDocDoctorRegistry(this.app);
+				if (registry?.unregister) {
+					registry.unregister(this.hudProvider.id);
+					console.log('[Amnesia] Unregistered from Doc Doctor HUD');
+				}
+			} catch (e) {
+				// Ignore errors during cleanup
+			}
 			this.hudProvider.destroy();
 			this.hudProvider = null;
+		}
+
+		// ==========================================================================
+		// Cleanup Resource Detector (Phase R2)
+		// ==========================================================================
+		if (this.resourceDetector) {
+			this.resourceDetector.stop();
+			// Note: Preferences are already saved via setPersistCallback on every change
+			resetResourceDetector();
+			this.resourceDetector = null;
 		}
 
 		// ==========================================================================
@@ -1306,6 +1399,13 @@ export default class AmnesiaPlugin extends Plugin {
 			this.networkMonitor.stop();
 			this.networkMonitor = null;
 		}
+
+		// ==========================================================================
+		// Cleanup Document Bridge (WASM workers)
+		// ==========================================================================
+		destroyWorkerPool(); // Clean up PDF worker pool (Phase 2)
+		destroySharedDocumentBridge();
+		destroyDocumentWorkerPool();
 
 		// ==========================================================================
 		// Cleanup existing services
@@ -2544,10 +2644,15 @@ export default class AmnesiaPlugin extends Plugin {
 
 		// Extract book info from the reader view
 		const readerView = view as any;
-		const bookPath = readerView.bookPath || readerView.state?.bookPath;
+		let bookPath = readerView.bookPath || readerView.state?.bookPath;
 		const bookTitle = readerView.bookTitle || readerView.state?.bookTitle;
 
-		if (bookPath) {
+		// Handle case where bookPath is a TFile object instead of string
+		if (bookPath && typeof bookPath === 'object' && bookPath.path) {
+			bookPath = bookPath.path;
+		}
+
+		if (bookPath && typeof bookPath === 'string') {
 			// CRITICAL: Use bookPath as the bookId since that's how highlights are stored.
 			// The highlight service and reader component use the full path as the key,
 			// NOT a hash. Using a hash here caused highlights to disappear when clicking

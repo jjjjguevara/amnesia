@@ -786,7 +786,7 @@ export class CoordinateDebugger {
     if (recentFailures.length >= this.autoDisableThreshold) {
       console.error(
         `[CoordinateDebugger] ${recentFailures.length} validation failures in ${this.autoDisableWindowMs}ms. ` +
-        'Consider disabling unified mode: window.pdfFeatureFlags.setFlag("useUnifiedCoordinateSpace", false)'
+        'Review coordinate calculations for potential issues.'
       );
     }
   }

@@ -11,7 +11,7 @@
  * - Chapter-level caching for performance
  */
 
-import type { ContentProvider } from '../renderer';
+import type { ContentProvider } from '../content-provider';
 import type {
   ParsedBook,
   ChapterContent,
@@ -209,9 +209,16 @@ export class MuPDFEpubContentProvider implements ContentProvider {
     // Get chapter content from MuPDF
     const epubContent = await bridge.getChapterHtml(bookId, chapterIndex);
 
+    // Get the actual chapter file path in the EPUB ZIP for resolving relative paths
+    // This returns paths like "OPS/chapter1.xhtml" instead of "chapter:0"
+    const chapterFilePath = bridge.getChapterFilePath(bookId, chapterIndex);
+
+    // Process images: replace relative URLs with data URLs
+    const processedHtml = await this.processChapterResources(bookId, epubContent.html, chapterFilePath);
+
     // Convert to ChapterContent format
     const content: ChapterContent = {
-      html: epubContent.html,
+      html: processedHtml,
       href: href,
       spineIndex: chapterIndex,
       highlights: [], // Highlights are managed separately by Shadow DOM renderer
@@ -253,25 +260,102 @@ export class MuPDFEpubContentProvider implements ContentProvider {
   }
 
   /**
+   * Process chapter HTML to replace resource URLs with data URLs
+   *
+   * Finds all <img> tags and replaces their src attributes with
+   * data URLs loaded from the EPUB ZIP.
+   */
+  private async processChapterResources(
+    bookId: string,
+    html: string,
+    chapterHref?: string
+  ): Promise<string> {
+    // Find all img tags with src attributes
+    const imgRegex = /<img([^>]*)\ssrc=["']([^"']+)["']([^>]*)>/gi;
+    const matches: Array<{ full: string; src: string }> = [];
+
+    let match;
+    while ((match = imgRegex.exec(html)) !== null) {
+      const src = match[2];
+      // Skip data URLs and absolute URLs
+      if (!src.startsWith('data:') && !src.startsWith('http://') && !src.startsWith('https://')) {
+        matches.push({ full: match[0], src });
+      }
+    }
+
+    if (matches.length === 0) {
+      return html;
+    }
+
+    console.log(`[MuPDF EPUB ContentProvider] Processing ${matches.length} images in chapter`);
+
+    // Load all images in parallel
+    const replacements = await Promise.all(
+      matches.map(async ({ full, src }) => {
+        try {
+          const dataUrl = await this.getResourceAsDataUrl(bookId, src, chapterHref);
+          // Rebuild the img tag with data URL
+          const newTag = full.replace(
+            /src=["'][^"']+["']/i,
+            `src="${dataUrl}"`
+          );
+          return { original: full, replacement: newTag };
+        } catch (error) {
+          console.warn(`[MuPDF EPUB ContentProvider] Failed to load image: ${src}`, error);
+          // Return original tag if loading fails
+          return { original: full, replacement: full };
+        }
+      })
+    );
+
+    // Apply replacements
+    let processedHtml = html;
+    for (const { original, replacement } of replacements) {
+      processedHtml = processedHtml.replace(original, replacement);
+    }
+
+    return processedHtml;
+  }
+
+  /**
    * Get resource as data URL
    *
    * For embedded images and stylesheets in EPUB.
-   * Currently not implemented - MuPDF HTML extraction includes inline styles.
+   * Uses direct ZIP extraction to get resources.
+   *
+   * @param bookId Book identifier
+   * @param href Resource path
+   * @param chapterHref Optional chapter href for resolving relative paths
    */
-  async getResourceAsDataUrl(bookId: string, href: string): Promise<string> {
+  async getResourceAsDataUrl(bookId: string, href: string, chapterHref?: string): Promise<string> {
     // Check cache first
+    const cacheKey = chapterHref ? `${chapterHref}:${href}` : href;
     const bookResources = this.resourceCache.get(bookId);
     if (bookResources) {
-      const cached = bookResources.get(href);
+      const cached = bookResources.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < this.maxResourceCacheAge) {
         return cached.dataUrl;
       }
     }
 
-    // TODO: Implement resource extraction via MuPDF
-    // For now, return empty data URL
-    console.warn(`[MuPDF EPUB ContentProvider] Resource not available: ${href}`);
-    return 'data:application/octet-stream;base64,';
+    try {
+      const bridge = await this.ensureBridge();
+      const dataUrl = await bridge.getResourceAsDataUrl(bookId, href, chapterHref);
+
+      // Cache the result
+      if (!this.resourceCache.has(bookId)) {
+        this.resourceCache.set(bookId, new Map());
+      }
+      this.resourceCache.get(bookId)!.set(cacheKey, {
+        dataUrl,
+        timestamp: Date.now(),
+      });
+
+      return dataUrl;
+    } catch (error) {
+      console.warn(`[MuPDF EPUB ContentProvider] Resource not available: ${href}`, error);
+      return 'data:application/octet-stream;base64,';
+    }
   }
 
   // ============================================================================

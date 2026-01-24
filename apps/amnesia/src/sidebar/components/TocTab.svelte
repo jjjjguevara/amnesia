@@ -136,17 +136,6 @@
           </button>
         </div>
       </div>
-      {#if bookProgress.totalProgression > 0}
-        <div class="toc-book-progress">
-          <div class="toc-book-progress-bar">
-            <div
-              class="toc-book-progress-fill"
-              style:width="{bookProgress.totalProgression}%"
-            ></div>
-          </div>
-          <span class="toc-book-progress-text">{bookProgress.totalProgression}%</span>
-        </div>
-      {/if}
     </div>
 
     <div class="toc-tree" role="tree">
@@ -233,34 +222,6 @@
   .toc-header-btn:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
-  }
-
-  .toc-book-progress {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .toc-book-progress-bar {
-    flex: 1;
-    height: 4px;
-    background: var(--background-modifier-border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .toc-book-progress-fill {
-    height: 100%;
-    background: var(--interactive-accent);
-    border-radius: 2px;
-    transition: width 300ms ease;
-  }
-
-  .toc-book-progress-text {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    min-width: 32px;
-    text-align: right;
   }
 
   .toc-tree {

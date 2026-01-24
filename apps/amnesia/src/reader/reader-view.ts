@@ -64,7 +64,12 @@ export class ReaderView extends ItemView {
   async setState(state: ReaderViewState, result: { history: boolean }): Promise<void> {
     console.log('[ReaderView] setState called with bookPath:', state?.bookPath, 'file:', state?.file);
     // Handle both bookPath (our state) and file (Obsidian's state when opening via registerExtensions)
-    this.bookPath = state.bookPath || state.file || '';
+    // Also handle TFile objects by extracting the .path property
+    let rawPath = state.bookPath || state.file || '';
+    if (rawPath && typeof rawPath === 'object' && 'path' in rawPath) {
+      rawPath = (rawPath as { path: string }).path;
+    }
+    this.bookPath = typeof rawPath === 'string' ? rawPath : '';
     console.log('[ReaderView] bookPath set to:', this.bookPath);
     this.bookTitle = state.bookTitle || '';
 

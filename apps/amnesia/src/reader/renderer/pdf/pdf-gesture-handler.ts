@@ -17,9 +17,9 @@ export interface GestureCallbacks {
 }
 
 export interface GestureHandlerConfig {
-  /** Minimum zoom scale. Default: 0.25 */
+  /** Minimum zoom scale. Default: 0.1 */
   minScale?: number;
-  /** Maximum zoom scale. Default: 5.0 */
+  /** Maximum zoom scale. Default: 16.0 */
   maxScale?: number;
   /** Zoom sensitivity for wheel events. Default: 0.002 */
   wheelSensitivity?: number;
@@ -34,8 +34,8 @@ export interface GestureHandlerConfig {
 }
 
 const DEFAULT_CONFIG: Required<GestureHandlerConfig> = {
-  minScale: 0.25,
-  maxScale: 5.0,
+  minScale: 0.1,
+  maxScale: 16.0, // Match infinite canvas maxZoom for high zoom capability
   wheelSensitivity: 0.002,
   pinchSensitivity: 1.0,
   smoothZoom: true,

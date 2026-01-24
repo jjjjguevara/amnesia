@@ -22,7 +22,6 @@
   $: isExpanded = expandedItems.has(entry.id);
   $: isCurrent = entry.isCurrent;
   $: isAncestor = entry.isAncestorOfCurrent;
-  $: progress = entry.progress;
 
   function handleClick() {
     dispatch('navigate', { href: entry.href });
@@ -88,15 +87,7 @@
     {/if}
     <div class="toc-entry-content">
       <span class="toc-entry-label">{entry.label}</span>
-      {#if progress > 0}
-        <div class="toc-progress-bar">
-          <div class="toc-progress-fill" style:width="{progress}%"></div>
-        </div>
-      {/if}
     </div>
-    {#if isCurrent}
-      <span class="toc-progress-text">{progress}%</span>
-    {/if}
   </div>
 
   {#if hasChildren && isExpanded}
@@ -182,9 +173,6 @@
   .toc-entry-content {
     flex: 1;
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
   }
 
   .toc-entry-label {
@@ -194,28 +182,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .toc-progress-bar {
-    height: 3px;
-    background: var(--background-modifier-border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .toc-progress-fill {
-    height: 100%;
-    background: var(--interactive-accent);
-    border-radius: 2px;
-    transition: width 200ms ease;
-  }
-
-  .toc-progress-text {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    flex-shrink: 0;
-    min-width: 32px;
-    text-align: right;
   }
 
   .toc-children {

@@ -3,10 +3,10 @@
  *
  * Provides automatic scrolling functionality for the EPUB reader.
  * Supports smooth continuous scrolling with configurable speed.
- * Works with the custom EpubRenderer (not epub.js).
+ * Works with the Shadow DOM-based renderer.
  */
 
-import type { EpubRenderer } from './renderer';
+import type { ShadowDOMRenderer } from './shadow-dom-renderer';
 
 export interface AutoScrollOptions {
   /** Initial speed (1-10) */
@@ -48,7 +48,7 @@ const SPEED_MAP: Record<number, { pixels: number; interval: number }> = {
 };
 
 export class AutoScroller {
-  private renderer: EpubRenderer | null = null;
+  private renderer: ShadowDOMRenderer | null = null;
   private intervalId: number | null = null;
   private options: AutoScrollOptions;
   private state: AutoScrollState;
@@ -64,9 +64,9 @@ export class AutoScroller {
   }
 
   /**
-   * Attach to an EpubRenderer
+   * Attach to a ShadowDOMRenderer
    */
-  attach(renderer: EpubRenderer): void {
+  attach(renderer: ShadowDOMRenderer): void {
     this.renderer = renderer;
     this.updateScrollableElements();
 

@@ -369,6 +369,17 @@ export class PdfRenderer implements DocumentRenderer {
       isTileRenderingAvailable: 'isTileRenderingAvailable' in this.provider && typeof (this.provider as any).isTileRenderingAvailable === 'function'
         ? () => (this.provider as any).isTileRenderingAvailable()
         : undefined,
+      // Thumbnail suspension methods for smooth scroll/zoom
+      suspendThumbnailGeneration: 'suspendThumbnailGeneration' in this.provider && typeof (this.provider as any).suspendThumbnailGeneration === 'function'
+        ? () => (this.provider as any).suspendThumbnailGeneration()
+        : undefined,
+      resumeThumbnailGeneration: 'resumeThumbnailGeneration' in this.provider && typeof (this.provider as any).resumeThumbnailGeneration === 'function'
+        ? () => (this.provider as any).resumeThumbnailGeneration()
+        : undefined,
+      // Document ID for cross-document isolation in global singletons (RenderCoordinator)
+      getDocumentId: 'getDocumentId' in this.provider && typeof (this.provider as any).getDocumentId === 'function'
+        ? () => (this.provider as any).getDocumentId()
+        : undefined,
     };
 
     this.infiniteCanvas = new PdfInfiniteCanvas(
@@ -378,7 +389,7 @@ export class PdfRenderer implements DocumentRenderer {
         gap: 20,
         padding: this.config.margin ?? 20,
         minZoom: 0.1,
-        maxZoom: 16, // Increased from 5 to 16 for high zoom capability
+        maxZoom: 32, // Increased to 32 for very high zoom capability (amnesia-pi0)
         pageWidth: 612,
         pageHeight: 792,
         renderScale: this.config.scale ?? 1.5,
@@ -397,7 +408,7 @@ export class PdfRenderer implements DocumentRenderer {
 
     this.infiniteCanvas.setOnZoomChange((zoom) => {
       this.config.scale = zoom;
-      // Could emit zoom change event here if needed
+      this.emit('zoomed', zoom);
     });
 
     this.infiniteCanvas.setOnSelection((page, text, rects) => {
@@ -1164,6 +1175,19 @@ export class PdfRenderer implements DocumentRenderer {
 
     // Store the scale for reference
     this.config.scale = scale;
+  }
+
+  /**
+   * Get the current zoom level
+   */
+  getZoom(): number {
+    if (this.infiniteCanvas) {
+      return this.infiniteCanvas.getZoom();
+    }
+    if (this.multiPageContainer) {
+      return this.multiPageContainer.getZoom();
+    }
+    return this.config.scale ?? 1;
   }
 
   /**

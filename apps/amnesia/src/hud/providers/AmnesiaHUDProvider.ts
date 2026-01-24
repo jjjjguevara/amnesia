@@ -60,33 +60,61 @@ const TAB_COMPONENTS: Record<string, typeof ReadingTab> = {
 export class AmnesiaHUDProvider implements HUDContentProvider {
   readonly id = 'amnesia-reading';
   readonly displayName = 'Reading';
-  readonly icon = 'book-open';
   readonly priority = 100;
+
+  // Dynamic icon based on current file type
+  private currentFileExtension: string | null = null;
+
+  /**
+   * Icon property for HUD provider identification.
+   * Returns empty string to hide the icon - format is shown as text tag instead.
+   */
+  get icon(): string {
+    return '';
+  }
 
   /**
    * Determines if Amnesia should be the active HUD provider.
    * Returns true when user is in a reading-related context.
    *
    * This is called by Doc Doctor's registry to decide which provider to show.
+   * Also updates the current file extension for dynamic icon display.
    */
   isActiveForContext(context: DocDoctorHUDContext): boolean {
     // Active when viewing EPUB files
     if (context.fileExtension === 'epub') {
+      this.currentFileExtension = 'epub';
       return true;
     }
 
     // Active when viewing PDF files
     if (context.fileExtension === 'pdf') {
+      this.currentFileExtension = 'pdf';
       return true;
     }
 
     // Active when in the Amnesia reader view
     if (context.leafType === 'amnesia-reader') {
+      // Try to get file extension from the active file path
+      if (context.activeFile) {
+        const ext = context.activeFile.split('.').pop()?.toLowerCase();
+        if (ext === 'pdf' || ext === 'epub') {
+          this.currentFileExtension = ext;
+        }
+      }
       return true;
     }
 
     // Active when viewing a book note (check frontmatter metadata)
     if (context.metadata?.['amnesia-book-id'] || context.metadata?.['calibre-id']) {
+      // Check for associated book file extension in metadata
+      const bookPath = context.metadata?.['epub-path'] || context.metadata?.['pdf-path'] || context.metadata?.['calibre-path'];
+      if (typeof bookPath === 'string') {
+        const ext = bookPath.split('.').pop()?.toLowerCase();
+        if (ext === 'pdf' || ext === 'epub') {
+          this.currentFileExtension = ext;
+        }
+      }
       return true;
     }
 
@@ -113,6 +141,8 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
   private indicatorColorStore: Writable<'green' | 'yellow' | 'red' | 'blue' | 'muted'> = writable('muted');
   private secondaryBadgeStore: Writable<{ text: string; variant: 'warning' | 'info' | 'success' } | null> = writable(null);
   private tooltipStore: Writable<string> = writable('');
+  private formatBadgeStore: Writable<string | null> = writable(null);
+  private titleTextStore: Writable<string | null> = writable(null);
 
   constructor(plugin: AmnesiaPlugin) {
     this.plugin = plugin;
@@ -137,6 +167,20 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     const contextUnsub = this.contextDetector.subscribe((event) => {
       this.currentContext = event.current;
       this.notifyContextSubscribers(event.current);
+
+      // Use file format from context when available (detected from component context)
+      if (event.current.type === 'book') {
+        if (event.current.fileFormat) {
+          this.currentFileExtension = event.current.fileFormat;
+        } else if (event.current.bookPath) {
+          // Fallback to path-based detection
+          const ext = event.current.bookPath.split('.').pop()?.toLowerCase();
+          if (ext === 'pdf' || ext === 'epub') {
+            this.currentFileExtension = ext;
+          }
+        }
+      }
+
       this.notifySubscribers(); // Also trigger general update
 
       // Fetch book health when context changes to a book
@@ -276,24 +320,31 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     const context = this.currentContext;
     const bookHealth = this.currentBookHealth;
 
-    // Build primary text - context-aware
+    // Format tag (PDF/EPUB) displayed via formatBadge field (styled like .nav-file-tag)
+    const formatTag = this.currentFileExtension?.toUpperCase() || null;
+
+    // Build title text (for ticker) and primary text (stats) - context-aware
+    let titleText: string | null = null;
     let primaryText = '';
+
     if (context.type === 'book') {
+      // For book context: title in ticker, stats in primary text
       const title = context.title || 'Book';
-      const shortTitle = title.length > 20 ? title.slice(0, 20) + '…' : title;
-      // Include book health percentage if available
+      titleText = title; // Full title for ticker animation
+
+      // Stats go in primary text
       if (bookHealth) {
         const healthPct = Math.round(bookHealth.overall * 100);
-        primaryText = `📖 ${shortTitle} | ${healthPct}% | ${stats.totalHighlights} hl`;
+        primaryText = `| ${healthPct}% | ${stats.totalHighlights} hl`;
       } else {
-        primaryText = `📖 ${shortTitle} | ${stats.totalHighlights} hl`;
+        primaryText = `| ${stats.totalHighlights} hl`;
       }
     } else if (context.type === 'author') {
-      primaryText = `👤 ${context.authorName} | ${stats.totalHighlights} hl`;
+      primaryText = `${context.authorName} | ${stats.totalHighlights} hl`;
     } else if (context.type === 'series') {
-      primaryText = `📚 ${context.seriesName} | ${stats.totalHighlights} hl`;
+      primaryText = `${context.seriesName} | ${stats.totalHighlights} hl`;
     } else if (context.type === 'highlight') {
-      primaryText = `✨ Highlight | ${stats.totalHighlights} hl`;
+      primaryText = `Highlight | ${stats.totalHighlights} hl`;
     } else {
       primaryText = `${stats.currentlyReading} reading | ${stats.totalHighlights} hl`;
     }
@@ -331,7 +382,9 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     this.primaryTextStore.set(primaryText);
     this.indicatorColorStore.set(indicatorColor);
     this.secondaryBadgeStore.set(badge);
-    this.tooltipStore.set(this.generateTooltip(stats, bookHealth));
+    this.formatBadgeStore.set(formatTag);
+    this.titleTextStore.set(titleText);
+    // Tooltip intentionally left empty - users can click to open HUD for details
   }
 
   /**
@@ -359,6 +412,13 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
    */
   getCurrentContext(): HUDContext {
     return this.currentContext;
+  }
+
+  /**
+   * Get current file extension (pdf, epub, or null)
+   */
+  getCurrentFileExtension(): string | null {
+    return this.currentFileExtension;
   }
 
   /**
@@ -428,7 +488,9 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
       primaryText: this.primaryTextStore,
       indicatorColor: this.indicatorColorStore,
       secondaryBadge: this.secondaryBadgeStore,
-      tooltip: this.tooltipStore,
+      tooltip: this.tooltipStore, // Empty store - users can click to open HUD for details
+      formatBadge: this.formatBadgeStore,
+      titleText: this.titleTextStore, // Book title for ticker animation
     };
   }
 
@@ -447,18 +509,24 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     // Build status text - context-aware
     const parts: string[] = [];
 
+    // Format tag (PDF/EPUB) shown as prefix when in book context
+    const formatTag = this.currentFileExtension?.toUpperCase() || null;
+    if (formatTag && context.type === 'book') {
+      parts.push(formatTag);
+    }
+
     // Show context-specific info if available
     if (context.type === 'book') {
       // Show current book info
       const title = context.title || 'Book';
       const shortTitle = title.length > 20 ? title.slice(0, 20) + '…' : title;
-      parts.push(`📖 ${shortTitle}`);
+      parts.push(shortTitle);
     } else if (context.type === 'author') {
-      parts.push(`👤 ${context.authorName}`);
+      parts.push(context.authorName);
     } else if (context.type === 'series') {
-      parts.push(`📚 ${context.seriesName}`);
+      parts.push(context.seriesName);
     } else if (context.type === 'highlight') {
-      parts.push(`✨ Highlight`);
+      parts.push('Highlight');
     } else {
       // Default: show reading stats
       parts.push(`${stats.currentlyReading} reading`);
@@ -467,10 +535,10 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     parts.push(`${stats.totalHighlights} hl`);
 
     return {
-      icon: 'book-open',
+      icon: this.icon, // Uses dynamic getter based on file format
       text: parts.join(' | '),
       color: healthColor,
-      tooltip: this.generateTooltip(stats),
+      // Tooltip removed - click to open HUD instead
       serverStatus: {
         indicator: serverStatus.indicator,
         color: serverStatus.color,
@@ -989,48 +1057,7 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     return activity;
   }
 
-  private generateTooltip(stats: ReadingStats, bookHealth?: BookHealth | null): string {
-    const lines: string[] = [
-      'Amnesia Reading Activity',
-      '━'.repeat(24),
-      `Currently reading: ${stats.currentlyReading} books`,
-      `Total highlights: ${stats.totalHighlights}`,
-    ];
-
-    // Add book health section if available
-    if (bookHealth) {
-      lines.push('');
-      lines.push('Book Health (Doc Doctor)');
-      lines.push('─'.repeat(20));
-      const healthPct = Math.round(bookHealth.overall * 100);
-      lines.push(`Overall: ${healthPct}%`);
-      lines.push(`Highlights: ${bookHealth.breakdown.highlightCount}`);
-      lines.push(`Stubs: ${bookHealth.breakdown.stubCount} (${bookHealth.breakdown.resolvedStubCount} resolved)`);
-      const coveragePct = Math.round(bookHealth.breakdown.annotationCoverage * 100);
-      lines.push(`Coverage: ${coveragePct}%`);
-    }
-
-    lines.push('');
-
-    if (stats.lastReadDate) {
-      const diff = Date.now() - stats.lastReadDate.getTime();
-      const hours = Math.floor(diff / (60 * 60 * 1000));
-      if (hours < 1) {
-        lines.push('Last read: Just now');
-      } else if (hours < 24) {
-        lines.push(`Last read: ${hours} hour${hours === 1 ? '' : 's'} ago`);
-      } else {
-        const days = Math.floor(hours / 24);
-        lines.push(`Last read: ${days} day${days === 1 ? '' : 's'} ago`);
-      }
-    } else {
-      lines.push('Last read: Never');
-    }
-
-    lines.push('', 'Click to open HUD');
-
-    return lines.join('\n');
-  }
+  // Note: generateTooltip removed - tooltip no longer used in favor of ticker animation on hover
 
   // ===========================================================================
   // Formatting Utilities

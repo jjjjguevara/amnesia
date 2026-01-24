@@ -71,6 +71,11 @@
   --amnesia-card-hover-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 
+/* ============================================
+   Doc Doctor HUD Integration Styles
+   Customizes Amnesia's appearance in Doc Doctor's status bar
+   ============================================ */
+
 /* Override default view-content padding for sidebar */
 .view-content.amnesia-book-sidebar {
   padding: 8px 0 0 !important;
@@ -567,6 +572,34 @@ settings:
 @keyframes amnesia-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
+}
+
+/* Doc Doctor HUD ticker overrides for Amnesia provider
+   Makes the book title container auto-size to content, preventing
+   duplicate titles from showing when the title is short.
+   Uses !important to override Doc Doctor's styles. */
+.status-bar-item.provider-amnesia-reading .status-ticker-wrapper {
+  /* Use intrinsic width - shrinks to fit short titles */
+  width: fit-content !important;
+  max-width: 140px !important;
+}
+
+.status-bar-item.provider-amnesia-reading .status-ticker-content {
+  width: fit-content !important;
+}
+
+/* Hide the duplicate title text when not animating */
+.status-bar-item.provider-amnesia-reading .status-ticker-text:nth-child(2) {
+  display: none !important;
+}
+
+/* When hovering (animation active), show both and use fixed width for smooth scroll */
+.status-bar-item.provider-amnesia-reading:hover .status-ticker-wrapper {
+  width: 140px !important;
+}
+
+.status-bar-item.provider-amnesia-reading:hover .status-ticker-text:nth-child(2) {
+  display: inline !important;
 }
 
 /* Link target blinking animation - highlights navigation targets */

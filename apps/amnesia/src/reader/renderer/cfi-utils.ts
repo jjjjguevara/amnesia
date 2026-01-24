@@ -1,24 +1,21 @@
 /**
- * CFI Utilities
+ * CFI Utilities (Simplified)
  *
- * Provides proper EPUB CFI (Canonical Fragment Identifier) generation and resolution.
- * Uses epub-cfi-resolver for the heavy lifting.
+ * Provides basic EPUB CFI (Canonical Fragment Identifier) handling.
+ * Full CFI generation/resolution has been replaced with TextQuote-based anchoring
+ * which is more reliable across EPUB implementations.
  *
- * A full CFI has the format:
- *   epubcfi(/6/{spinePosition}!{documentPath}:{characterOffset})
+ * A spine-only CFI has the format:
+ *   epubcfi(/6/{spinePosition}!/4/1:0)
  *
  * Where:
  * - /6 is the package document root
  * - /{spinePosition} is the even-numbered spine position (spine index * 2 + 2)
  * - ! marks the document boundary
- * - {documentPath} is the path within the XHTML document
- * - :{characterOffset} is the character offset within a text node
+ * - /4/1:0 is a minimal placeholder (actual position determined via TextQuote)
  *
  * @see https://www.w3.org/TR/epub-33/#sec-epubcfi
  */
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const CFI = require('epub-cfi-resolver');
 
 /**
  * Result of CFI resolution
@@ -29,43 +26,28 @@ export interface CfiResolution {
 }
 
 /**
- * Generate a full EPUB CFI for a position in a chapter
+ * Generate a spine-only EPUB CFI for a position in a chapter.
+ *
+ * Note: This returns a minimal CFI with spine position only.
+ * Actual position anchoring is handled by TextQuote selectors which
+ * are more reliable across different EPUB implementations.
  *
  * @param spineIndex - The 0-based spine index of the chapter
- * @param node - The DOM node (typically a text node) for the position
- * @param offset - The character offset within the node
- * @returns A complete CFI string like epubcfi(/6/4!/4/2/1:42)
+ * @param _node - Unused (kept for API compatibility)
+ * @param _offset - Unused (kept for API compatibility)
+ * @returns A spine-only CFI string like epubcfi(/6/4!/4/1:0)
  */
 export function generateFullCfi(
   spineIndex: number,
-  node: Node,
-  offset: number = 0
+  _node?: Node,
+  _offset: number = 0
 ): string {
   // Spine position uses EPUB CFI even-numbering: (index + 1) * 2
   const spinePosition = (spineIndex + 1) * 2;
 
-  try {
-    // Generate the intra-document path using epub-cfi-resolver
-    // CFI.generate returns epubcfi(...), so we need to extract the inner path
-    const intraDocCfi = CFI.generate(node, offset) as string;
-
-    // Validate that we got a proper CFI
-    if (!intraDocCfi || typeof intraDocCfi !== 'string' || !intraDocCfi.startsWith('epubcfi(')) {
-      console.warn('[CFI] Invalid CFI generated, using fallback');
-      return `epubcfi(/6/${spinePosition}!/4/1:0)`;
-    }
-
-    // Extract the path from epubcfi(...)
-    const innerPath = intraDocCfi.replace(/^epubcfi\(/, '').replace(/\)$/, '');
-
-    // Combine with spine position
-    // Format: epubcfi(/6/{spinePosition}!{innerPath})
-    return `epubcfi(/6/${spinePosition}!${innerPath})`;
-  } catch (error) {
-    // Phase 7: Protect against infinite loops or errors in CFI generation
-    console.warn('[CFI] Error generating CFI, using fallback:', error);
-    return `epubcfi(/6/${spinePosition}!/4/1:0)`;
-  }
+  // Return minimal CFI with spine position only
+  // Actual position anchoring uses TextQuote selectors
+  return `epubcfi(/6/${spinePosition}!/4/1:0)`;
 }
 
 /**
@@ -89,169 +71,81 @@ export function getSpineIndexFromCfi(cfi: string): number | null {
 }
 
 /**
- * Resolve a CFI to a DOM position within a document
+ * Resolve a CFI to a DOM position within a document.
  *
- * @param doc - The document to resolve the CFI in
- * @param cfi - The CFI string to resolve
- * @returns The resolved node and offset, or null if resolution fails
+ * Note: This always returns null to trigger TextQuote fallback.
+ * TextQuote-based anchoring is more reliable across EPUB implementations
+ * and handles DOM structure differences better than CFI resolution.
+ *
+ * @param _doc - The document (unused)
+ * @param _cfi - The CFI string (unused)
+ * @returns Always returns null to trigger TextQuote fallback
  */
 export async function resolveCfi(
-  doc: Document,
-  cfi: string
+  _doc: Document,
+  _cfi: string
 ): Promise<CfiResolution | null> {
-  try {
-    // Parse the CFI
-    const parsed = new CFI(cfi);
-
-    // Resolve in the document
-    // epub-cfi-resolver's resolve method handles the intra-document part
-    const result = await parsed.resolveLast(doc);
-
-    if (!result || !result.node) {
-      return null;
-    }
-
-    return {
-      node: result.node,
-      offset: result.offset || 0,
-    };
-  } catch (error) {
-    console.error('[CFI] Resolution failed:', error);
-    return null;
-  }
-}
-
-/**
- * Create a CFI from the first visible text node in a document
- *
- * @param doc - The document to search
- * @param spineIndex - The spine index of the chapter
- * @param viewportRect - The visible viewport rectangle
- * @returns A CFI string, or null if no visible text found
- */
-export function generateCfiFromVisibleText(
-  doc: Document,
-  spineIndex: number,
-  viewportRect: { left: number; top: number; width: number; height: number }
-): string | null {
-  // Walk through text nodes to find the first visible one
-  const walker = doc.createTreeWalker(
-    doc.body || doc.documentElement,
-    NodeFilter.SHOW_TEXT,
-    {
-      acceptNode: (node) => {
-        // Skip empty text nodes
-        if (!node.textContent || node.textContent.trim().length === 0) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    }
-  );
-
-  let node: Node | null;
-  while ((node = walker.nextNode())) {
-    const range = doc.createRange();
-    range.selectNodeContents(node);
-
-    const rects = range.getClientRects();
-    for (let i = 0; i < rects.length; i++) {
-      const rect = rects[i];
-      // Check if this rect is within the viewport
-      if (
-        rect.left >= viewportRect.left &&
-        rect.left < viewportRect.left + viewportRect.width &&
-        rect.top >= viewportRect.top &&
-        rect.top < viewportRect.top + viewportRect.height
-      ) {
-        // Found a visible text node - generate CFI
-        // Calculate approximate character offset based on position
-        const textNode = node as Text;
-        const charOffset = estimateCharacterOffset(
-          textNode,
-          viewportRect.left,
-          doc
-        );
-
-        return generateFullCfi(spineIndex, textNode, charOffset);
-      }
-    }
-  }
-
+  // Return null to trigger TextQuote fallback chain
+  // TextQuote selectors are stored alongside CFI and provide
+  // more reliable re-anchoring across EPUB implementations
   return null;
 }
 
 /**
- * Estimate the character offset at a given x position within a text node
+ * Create a CFI from the first visible text node in a document.
+ *
+ * Note: Returns a spine-only CFI. The actual position is stored
+ * in a TextQuote selector for reliable re-anchoring.
+ *
+ * @param _doc - The document (unused)
+ * @param spineIndex - The spine index of the chapter
+ * @param _viewportRect - The visible viewport (unused)
+ * @returns A spine-only CFI string
  */
-function estimateCharacterOffset(
-  textNode: Text,
-  targetX: number,
-  doc: Document
-): number {
-  const text = textNode.textContent || '';
-  if (text.length === 0) return 0;
-
-  const range = doc.createRange();
-
-  // Binary search for the character at targetX
-  let low = 0;
-  let high = text.length;
-
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    range.setStart(textNode, 0);
-    range.setEnd(textNode, mid);
-
-    const rect = range.getBoundingClientRect();
-    if (rect.right < targetX) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-
-  return low;
+export function generateCfiFromVisibleText(
+  _doc: Document,
+  spineIndex: number,
+  _viewportRect: { left: number; top: number; width: number; height: number }
+): string | null {
+  // Return spine-only CFI - actual position tracked via TextQuote
+  return generateFullCfi(spineIndex);
 }
 
 /**
- * Validate a CFI string format
+ * Validate a CFI string format (basic check only)
+ *
+ * @param cfi - The CFI string to validate
+ * @returns true if the CFI has valid format
  */
 export function isValidCfi(cfi: string): boolean {
   if (!cfi || typeof cfi !== 'string') return false;
 
-  try {
-    // Basic format check
-    if (!cfi.startsWith('epubcfi(') || !cfi.endsWith(')')) {
-      return false;
-    }
-
-    // Try to parse it
-    new CFI(cfi);
-    return true;
-  } catch {
+  // Basic format check - starts with epubcfi( and ends with )
+  if (!cfi.startsWith('epubcfi(') || !cfi.endsWith(')')) {
     return false;
   }
+
+  // Check for spine position marker
+  return /\/6\/\d+/.test(cfi);
 }
 
 /**
- * Compare two CFI strings to determine their order
+ * Compare two CFI strings to determine their order.
  *
+ * Note: Only compares spine positions since intra-document
+ * CFI paths are no longer generated.
+ *
+ * @param a - First CFI string
+ * @param b - Second CFI string
  * @returns negative if a < b, 0 if equal, positive if a > b
  */
 export function compareCfi(a: string, b: string): number {
-  try {
-    // First compare spine positions
-    const spineA = getSpineIndexFromCfi(a);
-    const spineB = getSpineIndexFromCfi(b);
+  const spineA = getSpineIndexFromCfi(a);
+  const spineB = getSpineIndexFromCfi(b);
 
-    if (spineA !== null && spineB !== null && spineA !== spineB) {
-      return spineA - spineB;
-    }
-
-    // Same spine, use epub-cfi-resolver's comparison
-    return CFI.compare(a, b);
-  } catch {
+  if (spineA === null || spineB === null) {
     return 0;
   }
+
+  return spineA - spineB;
 }

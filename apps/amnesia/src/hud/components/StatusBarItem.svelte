@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-  import { setIcon } from 'obsidian';
   import type { AmnesiaHUDProvider } from '../providers/AmnesiaHUDProvider';
   import type { StatusBarContent } from '../types/index';
 
@@ -13,22 +12,19 @@
   }>();
 
   let containerEl: HTMLElement;
-  let iconEl: HTMLElement;
   let statusContent: StatusBarContent;
+  let fileExtension: string | null = null;
   let unsubscribe: (() => void) | null = null;
 
   // Initial content - use legacy method for standalone HUD
-  statusContent = provider.getLegacyStatusBarContent();
+  statusContent = provider.getLegacyStatusBarContent?.() || { icon: 'book-open', text: '' };
+  fileExtension = provider.getCurrentFileExtension?.() || null;
 
   onMount(() => {
-    // Set icon
-    if (iconEl) {
-      setIcon(iconEl, statusContent.icon);
-    }
-
     // Subscribe to updates
     unsubscribe = provider.subscribe(() => {
-      statusContent = provider.getLegacyStatusBarContent();
+      statusContent = provider.getLegacyStatusBarContent?.() || { icon: 'book-open', text: '' };
+      fileExtension = provider.getCurrentFileExtension?.() || null;
     });
   });
 
@@ -62,6 +58,9 @@
   $: serverColorClass = statusContent.serverStatus
     ? `hud-server-${statusContent.serverStatus.color}`
     : '';
+
+  // Format tag text (uppercase)
+  $: formatTag = fileExtension ? fileExtension.toUpperCase() : null;
 </script>
 
 <div
@@ -72,9 +71,10 @@
   on:keydown={handleKeydown}
   role="button"
   tabindex="0"
-  title={statusContent.tooltip || 'Click to open Amnesia HUD'}
 >
-  <span class="hud-icon {colorClass}" bind:this={iconEl}></span>
+  {#if formatTag}
+    <span class="hud-format-tag">{formatTag}</span>
+  {/if}
   {#if statusContent.text}
     <span class="hud-text">{statusContent.text}</span>
   {/if}
@@ -107,17 +107,18 @@
     outline-offset: 2px;
   }
 
-  .hud-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 14px;
-    height: 14px;
-  }
-
-  .hud-icon :global(svg) {
-    width: 14px;
-    height: 14px;
+  /* Format tag styled like file explorer's nav-file-tag */
+  .hud-format-tag {
+    background-color: var(--nav-tag-background, var(--background-modifier-hover));
+    border-radius: var(--nav-tag-radius, var(--radius-s));
+    color: var(--nav-tag-color, var(--text-muted));
+    font-size: 9px;
+    font-weight: var(--nav-tag-weight, 500);
+    letter-spacing: 0.5px;
+    line-height: var(--line-height-normal);
+    padding: 0 var(--size-4-1);
+    text-transform: uppercase;
+    align-self: center;
   }
 
   .hud-text {
@@ -127,27 +128,6 @@
   .hud-server-status {
     margin-left: var(--size-4-1);
     font-size: var(--font-ui-smaller);
-  }
-
-  /* Status colors */
-  .hud-status-green {
-    color: var(--color-green);
-  }
-
-  .hud-status-yellow {
-    color: var(--color-yellow);
-  }
-
-  .hud-status-red {
-    color: var(--color-red);
-  }
-
-  .hud-status-gray {
-    color: var(--text-muted);
-  }
-
-  .hud-status-blue {
-    color: var(--color-blue);
   }
 
   /* Server status colors */

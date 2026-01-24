@@ -278,6 +278,8 @@ export interface DocumentRendererEvents {
   loading: boolean;
   /** Error occurred */
   error: Error;
+  /** Zoom level changed (PDF only) */
+  zoomed: number;
 }
 
 /**

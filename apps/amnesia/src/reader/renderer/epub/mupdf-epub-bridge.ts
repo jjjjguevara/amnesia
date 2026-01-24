@@ -10,6 +10,7 @@
 import type { TocEntry } from '../types';
 import type { IMuPDFBridge, RenderFormat } from '../pdf/mupdf-bridge';
 import { getSharedMuPDFBridge } from '../pdf/mupdf-bridge';
+import { ZipReader } from '../shared/zip-reader';
 
 // ============================================================================
 // Types
@@ -101,6 +102,15 @@ export interface FixedLayoutPageDimensions {
  * For reflowable EPUBs, this bridge extracts chapter HTML for Shadow DOM rendering.
  * For fixed-layout EPUBs, this bridge provides pixmap rendering like PDFs.
  */
+/** Parsed EPUB internal structure for direct ZIP access */
+interface EpubZipStructure {
+  opfPath: string;
+  spine: string[]; // hrefs of chapters in reading order
+  manifest: Map<string, { href: string; mediaType: string }>;
+  basePath: string;
+  toc: TocEntry[]; // Table of Contents parsed from NCX or NAV
+}
+
 export class MuPDFEpubBridge {
   private bridge: IMuPDFBridge | null = null;
   private initialized = false;
@@ -113,6 +123,10 @@ export class MuPDFEpubBridge {
     toc: TocEntry[];
     chapterCount: number;
     isFixedLayout: boolean;
+    /** Original EPUB data for direct ZIP extraction */
+    epubData?: ArrayBuffer;
+    /** Parsed EPUB ZIP structure */
+    zipStructure?: EpubZipStructure;
   }>();
 
   /**
@@ -157,6 +171,10 @@ export class MuPDFEpubBridge {
   async openEpub(data: ArrayBuffer, bookId?: string): Promise<ParsedEpub> {
     const bridge = await this.ensureInitialized();
 
+    // IMPORTANT: Copy the data BEFORE transferring to worker
+    // This allows us to extract chapter content directly from the ZIP later
+    const epubDataCopy = data.slice(0);
+
     // Load document with MuPDF - it auto-detects EPUB from magic bytes
     // The ArrayBuffer is transferred to the worker (ownership transfer)
     const result = await bridge.loadDocumentWithId(data);
@@ -175,27 +193,59 @@ export class MuPDFEpubBridge {
     // Fixed-layout EPUBs have specific viewport metadata
     const isFixedLayout = await this.detectFixedLayout(docId);
 
-    // Convert MuPDF TOC to our format
-    const toc = this.normalizeToc(result.toc);
+    // Convert MuPDF TOC to our format (may be empty for EPUBs)
+    const mupdfToc = this.normalizeToc(result.toc);
 
-    // Cache document info including TOC
+    // Parse EPUB structure for direct ZIP access
+    let zipStructure: EpubZipStructure | undefined;
+    try {
+      zipStructure = await this.parseEpubStructure(epubDataCopy);
+      console.log(`[MuPDF EPUB Bridge] Parsed EPUB structure: ${zipStructure.spine.length} chapters in spine, ${zipStructure.toc.length} TOC entries`);
+    } catch (err) {
+      console.warn('[MuPDF EPUB Bridge] Failed to parse EPUB structure:', err);
+    }
+
+    // Use ZIP-parsed TOC if MuPDF returns empty (common for EPUBs)
+    const toc = mupdfToc.length > 0 ? mupdfToc : (zipStructure?.toc ?? []);
+    if (mupdfToc.length === 0 && zipStructure?.toc?.length) {
+      console.log(`[MuPDF EPUB Bridge] Using ZIP-parsed TOC (${zipStructure.toc.length} entries) instead of empty MuPDF TOC`);
+    }
+
+    // Use ZIP structure's spine length for chapter count (more accurate than MuPDF's pageCount)
+    // MuPDF's pageCount often returns incorrect values for EPUBs
+    const actualChapterCount = zipStructure?.spine.length ?? chapterCount;
+    const actualSpine: EpubSpineItem[] = zipStructure
+      ? zipStructure.spine.map((href, i) => {
+          const manifestItem = zipStructure.manifest.get(href);
+          return {
+            id: `chapter-${i}`,
+            href: `chapter:${i}`,
+            linear: true, // Assume linear for now
+            mediaType: manifestItem?.mediaType || 'application/xhtml+xml',
+          };
+        })
+      : spine;
+
+    // Cache document info including TOC and EPUB data for direct access
     const id = bookId || docId;
     this.documentCache.set(id, {
       docId,
       metadata,
-      spine,
+      spine: actualSpine,
       toc,
-      chapterCount,
+      chapterCount: actualChapterCount,
       isFixedLayout,
+      epubData: epubDataCopy,
+      zipStructure,
     });
 
     return {
       id,
-      pageCount: result.pageCount,
-      chapterCount,
+      pageCount: actualChapterCount, // Use actual chapter count as page count for EPUBs
+      chapterCount: actualChapterCount,
       metadata,
       toc,
-      spine,
+      spine: actualSpine,
       isFixedLayout,
     };
   }
@@ -203,32 +253,75 @@ export class MuPDFEpubBridge {
   /**
    * Get chapter HTML content for Shadow DOM rendering
    *
-   * Extracts HTML from EPUB chapter using MuPDF's toText("html") method.
-   * Resources (images, CSS) are resolved to data URLs.
+   * Uses direct ZIP extraction to get the original XHTML content from the EPUB.
+   * This bypasses MuPDF's text extraction which doesn't work well for EPUBs.
    *
    * @param bookId Book identifier
    * @param chapterIndex 0-indexed chapter number
    */
   async getChapterHtml(bookId: string, chapterIndex: number): Promise<EpubChapterContent> {
-    const bridge = await this.ensureInitialized();
     const cached = this.documentCache.get(bookId);
 
     if (!cached) {
       throw new Error(`EPUB ${bookId} not loaded`);
     }
 
-    // MuPDF uses 1-indexed pages
-    const pageNum = chapterIndex + 1;
+    let html: string | null = null;
+    let text: string = '';
+    let zipError: Error | null = null;
+    let mupdfError: Error | null = null;
 
-    // Get text layer which includes structured content
-    const textLayer = await bridge.getTextLayer(cached.docId, pageNum);
+    // Try direct ZIP extraction first (preferred method)
+    if (cached.epubData && cached.zipStructure) {
+      try {
+        html = await this.readChapterFromZip(cached.epubData, cached.zipStructure, chapterIndex);
+        // Extract plain text from HTML for search/highlights
+        text = this.extractTextFromHtml(html);
+        console.log(`[MuPDF EPUB Bridge] Direct ZIP extraction: chapter ${chapterIndex}, ${html.length} chars`);
 
-    // Build HTML from text layer items
-    // MuPDF's toStructuredText provides positioned text blocks
-    const html = this.textLayerToHtml(textLayer);
+        return {
+          html,
+          text,
+          href: cached.spine[chapterIndex]?.href || `chapter-${chapterIndex}`,
+          chapterIndex,
+        };
+      } catch (err) {
+        zipError = err instanceof Error ? err : new Error(String(err));
+        console.warn(`[MuPDF EPUB Bridge] ZIP extraction failed for chapter ${chapterIndex}:`, err);
+      }
+    } else {
+      zipError = new Error('EPUB data or structure not cached');
+    }
 
-    // Get plain text for search indexing
-    const text = textLayer.items.map(item => item.text).join(' ');
+    // Fallback to MuPDF text layer extraction (rarely works for EPUBs)
+    try {
+      const bridge = await this.ensureInitialized();
+      const pageNum = chapterIndex + 1;
+      const textLayer = await bridge.getTextLayer(cached.docId, pageNum);
+
+      if (textLayer.htmlContent || textLayer.textContent) {
+        html = textLayer.htmlContent || this.wrapTextInHtml(textLayer.textContent || '');
+        text = textLayer.textContent || '';
+      } else if (textLayer.items.length > 0) {
+        html = this.textLayerToHtml(textLayer);
+        text = textLayer.items.map(item => item.text).join(' ');
+      }
+    } catch (err) {
+      mupdfError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[MuPDF EPUB Bridge] MuPDF text layer extraction failed for chapter ${chapterIndex}:`, err);
+    }
+
+    // If both methods failed to produce content, throw with context
+    if (!html || html.trim().length === 0 || html === this.wrapTextInHtml('')) {
+      const attemptedPath = cached.spine[chapterIndex]?.href || `chapter-${chapterIndex}`;
+      const zipInfo = zipError ? zipError.message : 'no EPUB data cached';
+      const mupdfInfo = mupdfError ? mupdfError.message : 'returned empty content';
+
+      throw new Error(
+        `Failed to extract chapter ${chapterIndex} (${attemptedPath}) from "${bookId}". ` +
+        `ZIP extraction: ${zipInfo}. MuPDF fallback: ${mupdfInfo}.`
+      );
+    }
 
     return {
       html,
@@ -254,6 +347,11 @@ export class MuPDFEpubBridge {
 
     const pageNum = chapterIndex + 1;
     const textLayer = await bridge.getTextLayer(cached.docId, pageNum);
+
+    // Use fallback textContent for EPUBs
+    if (textLayer.textContent) {
+      return textLayer.textContent;
+    }
 
     return textLayer.items.map(item => item.text).join(' ');
   }
@@ -400,6 +498,95 @@ export class MuPDFEpubBridge {
   getChapterCount(bookId: string): number {
     const cached = this.documentCache.get(bookId);
     return cached?.chapterCount ?? 0;
+  }
+
+  /**
+   * Get the actual file path of a chapter in the EPUB ZIP
+   *
+   * Returns the real file path (e.g., "OPS/chapter1.xhtml") for resolving
+   * relative resource paths like images.
+   */
+  getChapterFilePath(bookId: string, chapterIndex: number): string | undefined {
+    const cached = this.documentCache.get(bookId);
+    if (!cached?.zipStructure) {
+      return undefined;
+    }
+    return cached.zipStructure.spine[chapterIndex];
+  }
+
+  /**
+   * Get a resource (image, CSS, font) from the EPUB as bytes
+   *
+   * @param bookId Book identifier
+   * @param href Resource path (relative to EPUB root or chapter)
+   * @param chapterHref Optional chapter href to resolve relative paths
+   */
+  async getResource(bookId: string, href: string, chapterHref?: string): Promise<Uint8Array> {
+    const cached = this.documentCache.get(bookId);
+    if (!cached || !cached.epubData || !cached.zipStructure) {
+      throw new Error(`EPUB ${bookId} not loaded or missing ZIP data`);
+    }
+
+    const zip = new ZipReader(cached.epubData);
+    const basePath = cached.zipStructure.basePath;
+
+    // Resolve the resource path
+    let resourcePath: string;
+
+    if (href.startsWith('/')) {
+      // Absolute path from EPUB root
+      resourcePath = href.substring(1);
+    } else if (chapterHref) {
+      // Relative to chapter location
+      const chapterDir = chapterHref.includes('/')
+        ? chapterHref.substring(0, chapterHref.lastIndexOf('/') + 1)
+        : '';
+      resourcePath = this.sanitizeEpubPath(basePath + chapterDir, href);
+    } else {
+      // Relative to EPUB basePath
+      resourcePath = this.sanitizeEpubPath(basePath, href);
+    }
+
+    console.log(`[MuPDF EPUB Bridge] Loading resource: ${href} -> ${resourcePath}`);
+    return await zip.read(resourcePath);
+  }
+
+  /**
+   * Get a resource as a data URL
+   */
+  async getResourceAsDataUrl(bookId: string, href: string, chapterHref?: string): Promise<string> {
+    const bytes = await this.getResource(bookId, href, chapterHref);
+    const mimeType = this.guessMimeType(href);
+
+    // Convert to base64
+    const binary = Array.from(bytes).map(b => String.fromCharCode(b)).join('');
+    const base64 = btoa(binary);
+
+    return `data:${mimeType};base64,${base64}`;
+  }
+
+  /**
+   * Guess MIME type from file extension
+   */
+  private guessMimeType(href: string): string {
+    const ext = href.split('.').pop()?.toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+      gif: 'image/gif',
+      svg: 'image/svg+xml',
+      webp: 'image/webp',
+      woff: 'font/woff',
+      woff2: 'font/woff2',
+      ttf: 'font/ttf',
+      otf: 'font/otf',
+      css: 'text/css',
+      html: 'text/html',
+      xhtml: 'application/xhtml+xml',
+      xml: 'application/xml',
+    };
+    return mimeTypes[ext || ''] || 'application/octet-stream';
   }
 
   /**
@@ -564,6 +751,414 @@ ${paragraphs.join('\n')}
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#039;');
+  }
+
+  /**
+   * Wrap plain text in a basic HTML document
+   */
+  private wrapTextInHtml(text: string): string {
+    // Split text into paragraphs on double newlines or single newlines
+    const paragraphs = text
+      .split(/\n\n+/)
+      .map(p => p.trim())
+      .filter(p => p.length > 0)
+      .map(p => `<p>${this.escapeHtml(p.replace(/\n/g, ' '))}</p>`);
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+${paragraphs.join('\n')}
+</body>
+</html>`;
+  }
+
+  // ============================================================================
+  // ZIP Parsing for Direct EPUB Content Extraction
+  // ============================================================================
+
+  /**
+   * Parse EPUB ZIP structure to extract spine, manifest, and TOC
+   *
+   * EPUBs are ZIP files with:
+   * - META-INF/container.xml → points to OPF file
+   * - OPF file → contains manifest (all files) and spine (reading order)
+   * - NCX file (EPUB 2) or NAV file (EPUB 3) → contains TOC
+   */
+  private async parseEpubStructure(data: ArrayBuffer): Promise<EpubZipStructure> {
+    const zip = new ZipReader(data);
+
+    // 1. Read container.xml to find OPF path
+    const containerXml = await zip.readText('META-INF/container.xml');
+    const opfMatch = containerXml.match(/full-path="([^"]+)"/);
+    if (!opfMatch) {
+      throw new Error('Could not find OPF path in container.xml');
+    }
+    const opfPath = opfMatch[1];
+    const basePath = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+    // 2. Read and parse OPF file
+    const opfXml = await zip.readText(opfPath);
+
+    // 3. Parse manifest (all content items)
+    const manifest = new Map<string, { href: string; mediaType: string; properties?: string }>();
+    // Match items with various attribute orders
+    const itemRegex = /<item\s+([^>]+)\/?\s*>/gi;
+    let match;
+    while ((match = itemRegex.exec(opfXml)) !== null) {
+      const attrs = match[1];
+      const idMatch = attrs.match(/id="([^"]+)"/);
+      const hrefMatch = attrs.match(/href="([^"]+)"/);
+      const mediaMatch = attrs.match(/media-type="([^"]+)"/);
+      const propsMatch = attrs.match(/properties="([^"]+)"/);
+
+      if (idMatch && hrefMatch && mediaMatch) {
+        manifest.set(idMatch[1], {
+          href: hrefMatch[1],
+          mediaType: mediaMatch[1],
+          properties: propsMatch?.[1]
+        });
+      }
+    }
+
+    // 4. Parse spine (reading order)
+    const spine: string[] = [];
+    const spineRegex = /<itemref[^>]+idref="([^"]+)"[^>]*\/?>/gi;
+    while ((match = spineRegex.exec(opfXml)) !== null) {
+      const itemId = match[1];
+      const item = manifest.get(itemId);
+      if (item && (item.mediaType === 'application/xhtml+xml' || item.mediaType === 'text/html')) {
+        spine.push(item.href);
+      }
+    }
+
+    // 5. Parse TOC from NCX (EPUB 2) or NAV (EPUB 3)
+    let toc: TocEntry[] = [];
+
+    // Try EPUB 3 NAV first (properties="nav")
+    let navHref: string | null = null;
+    for (const [, item] of manifest) {
+      if (item.properties?.includes('nav')) {
+        navHref = item.href;
+        break;
+      }
+    }
+
+    if (navHref) {
+      try {
+        const navPath = basePath + navHref;
+        const navXml = await zip.readText(navPath);
+        toc = this.parseNavToc(navXml, spine, basePath);
+        console.log(`[MuPDF EPUB Bridge] Parsed EPUB 3 NAV TOC: ${toc.length} entries`);
+      } catch (err) {
+        console.warn('[MuPDF EPUB Bridge] Failed to parse NAV TOC:', err);
+      }
+    }
+
+    // Fall back to NCX (EPUB 2)
+    if (toc.length === 0) {
+      let ncxHref: string | null = null;
+      for (const [, item] of manifest) {
+        if (item.mediaType === 'application/x-dtbncx+xml') {
+          ncxHref = item.href;
+          break;
+        }
+      }
+
+      if (ncxHref) {
+        try {
+          const ncxPath = basePath + ncxHref;
+          const ncxXml = await zip.readText(ncxPath);
+          toc = this.parseNcxToc(ncxXml, spine, basePath);
+          console.log(`[MuPDF EPUB Bridge] Parsed EPUB 2 NCX TOC: ${toc.length} entries`);
+        } catch (err) {
+          console.warn('[MuPDF EPUB Bridge] Failed to parse NCX TOC:', err);
+        }
+      }
+    }
+
+    console.log(`[MuPDF EPUB Bridge] Parsed EPUB: OPF at ${opfPath}, ${manifest.size} manifest items, ${spine.length} spine items, ${toc.length} TOC entries`);
+
+    return { opfPath, spine, manifest, basePath, toc };
+  }
+
+  /**
+   * Parse EPUB 3 NAV document TOC
+   */
+  private parseNavToc(navXml: string, spine: string[], basePath: string): TocEntry[] {
+    const toc: TocEntry[] = [];
+
+    // Find the nav element with epub:type="toc"
+    const tocNavMatch = navXml.match(/<nav[^>]*epub:type="toc"[^>]*>([\s\S]*?)<\/nav>/i);
+    if (!tocNavMatch) {
+      // Try without epub:type (some EPUBs use id="toc")
+      const altMatch = navXml.match(/<nav[^>]*id="toc"[^>]*>([\s\S]*?)<\/nav>/i);
+      if (!altMatch) return toc;
+      return this.parseNavList(altMatch[1], spine, basePath, 0);
+    }
+
+    return this.parseNavList(tocNavMatch[1], spine, basePath, 0);
+  }
+
+  /**
+   * Parse nav list (ol/li structure) recursively
+   */
+  private parseNavList(html: string, spine: string[], basePath: string, level: number): TocEntry[] {
+    const entries: TocEntry[] = [];
+
+    // Match li elements at this level
+    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi;
+    let match;
+    let idx = 0;
+
+    while ((match = liRegex.exec(html)) !== null) {
+      const liContent = match[1];
+
+      // Extract anchor
+      const anchorMatch = liContent.match(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+      if (anchorMatch) {
+        const href = anchorMatch[1];
+        const label = anchorMatch[2].replace(/<[^>]+>/g, '').trim();
+
+        // Find spine index for this href
+        const chapterIndex = this.findChapterIndex(href, spine, basePath);
+
+        const entry: TocEntry = {
+          id: `toc-${level}-${idx}`,
+          label,
+          href: chapterIndex >= 0 ? `chapter:${chapterIndex}` : href,
+          children: [],
+        };
+
+        // Check for nested ol
+        const nestedOlMatch = liContent.match(/<ol[^>]*>([\s\S]*)<\/ol>/i);
+        if (nestedOlMatch) {
+          entry.children = this.parseNavList(nestedOlMatch[1], spine, basePath, level + 1);
+        }
+
+        entries.push(entry);
+        idx++;
+      }
+    }
+
+    return entries;
+  }
+
+  /**
+   * Parse EPUB 2 NCX document TOC
+   */
+  private parseNcxToc(ncxXml: string, spine: string[], basePath: string): TocEntry[] {
+    // Find navMap
+    const navMapMatch = ncxXml.match(/<navMap[^>]*>([\s\S]*)<\/navMap>/i);
+    if (!navMapMatch) return [];
+
+    return this.parseNcxNavPoints(navMapMatch[1], spine, basePath, 0);
+  }
+
+  /**
+   * Parse NCX navPoint elements recursively
+   */
+  private parseNcxNavPoints(xml: string, spine: string[], basePath: string, level: number): TocEntry[] {
+    const entries: TocEntry[] = [];
+
+    // Match navPoint elements (non-greedy to handle nesting)
+    const navPointRegex = /<navPoint[^>]*>([\s\S]*?)<\/navPoint>/gi;
+    let match;
+    let idx = 0;
+
+    // Process in order of appearance
+    while ((match = navPointRegex.exec(xml)) !== null) {
+      const content = match[1];
+
+      // Extract navLabel/text
+      const labelMatch = content.match(/<navLabel[^>]*>[\s\S]*?<text[^>]*>([\s\S]*?)<\/text>/i);
+      const label = labelMatch ? labelMatch[1].trim() : `Chapter ${idx + 1}`;
+
+      // Extract content src
+      const srcMatch = content.match(/<content[^>]+src="([^"]+)"/i);
+      const href = srcMatch ? srcMatch[1] : '';
+
+      // Find spine index
+      const chapterIndex = this.findChapterIndex(href, spine, basePath);
+
+      const entry: TocEntry = {
+        id: `toc-${level}-${idx}`,
+        label,
+        href: chapterIndex >= 0 ? `chapter:${chapterIndex}` : href,
+        children: [],
+      };
+
+      // Check for nested navPoints (after first closing tags)
+      const afterContent = content.substring(content.indexOf('</content>') + 10);
+      if (afterContent.includes('<navPoint')) {
+        entry.children = this.parseNcxNavPoints(afterContent, spine, basePath, level + 1);
+      }
+
+      entries.push(entry);
+      idx++;
+    }
+
+    return entries;
+  }
+
+  /**
+   * Find the spine index for a given href
+   */
+  private findChapterIndex(href: string, spine: string[], basePath: string): number {
+    // Remove fragment identifier
+    const hrefWithoutFragment = href.split('#')[0];
+
+    // Decode URI
+    let decodedHref = hrefWithoutFragment;
+    try {
+      decodedHref = decodeURIComponent(hrefWithoutFragment);
+    } catch {
+      // Keep original if decode fails
+    }
+
+    // Try exact match first
+    let index = spine.indexOf(decodedHref);
+    if (index >= 0) return index;
+
+    // Try with basePath prefix removed
+    if (decodedHref.startsWith(basePath)) {
+      const withoutBase = decodedHref.substring(basePath.length);
+      index = spine.indexOf(withoutBase);
+      if (index >= 0) return index;
+    }
+
+    // Try adding basePath
+    index = spine.indexOf(basePath + decodedHref);
+    if (index >= 0) return index;
+
+    // Try matching just the filename
+    const filename = decodedHref.split('/').pop();
+    if (filename) {
+      for (let i = 0; i < spine.length; i++) {
+        if (spine[i].endsWith(filename) || spine[i].split('/').pop() === filename) {
+          return i;
+        }
+      }
+    }
+
+    return -1;
+  }
+
+  /**
+   * Sanitize a path to prevent traversal attacks
+   *
+   * Security: URL decoding is performed BEFORE traversal checks to prevent
+   * bypasses via encoded sequences like %2e%2e%2f (../)
+   */
+  private sanitizeEpubPath(basePath: string, relativePath: string): string {
+    // Normalize path separators first
+    let normalized = relativePath.replace(/\\/g, '/');
+
+    // URL-decode the path FIRST to catch encoded traversal attempts
+    // (e.g., %2e%2e%2f would decode to ../)
+    try {
+      normalized = decodeURIComponent(normalized);
+    } catch {
+      // If decoding fails, log warning and continue with original
+      console.warn(`[EPUB] Invalid URL encoding in path: ${relativePath}`);
+    }
+
+    // Re-normalize after decoding (in case decoding introduced backslashes)
+    normalized = normalized.replace(/\\/g, '/');
+
+    // Reject path traversal attempts AFTER decoding
+    if (normalized.includes('../') || normalized.startsWith('/') || normalized.includes('..\\')) {
+      throw new Error(`Invalid EPUB path: traversal attempt detected in "${relativePath}"`);
+    }
+
+    // Reject paths with null bytes (another common attack vector)
+    if (normalized.includes('\0')) {
+      throw new Error(`Invalid EPUB path: null byte detected in "${relativePath}"`);
+    }
+
+    return basePath + normalized;
+  }
+
+  /**
+   * Read chapter content directly from EPUB ZIP
+   */
+  private async readChapterFromZip(
+    data: ArrayBuffer,
+    structure: EpubZipStructure,
+    chapterIndex: number
+  ): Promise<string> {
+    if (chapterIndex < 0 || chapterIndex >= structure.spine.length) {
+      throw new Error(`Chapter index ${chapterIndex} out of range (0-${structure.spine.length - 1})`);
+    }
+
+    const chapterHref = structure.spine[chapterIndex];
+    // Use sanitized path to prevent traversal attacks
+    const chapterPath = this.sanitizeEpubPath(structure.basePath, chapterHref);
+
+    const zip = new ZipReader(data);
+    const content = await zip.readText(chapterPath);
+
+    return content;
+  }
+
+  /**
+   * Extract plain text from HTML content
+   */
+  private extractTextFromHtml(html: string): string {
+    // Remove script and style tags and their content
+    let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+    text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+
+    // Remove all HTML tags
+    text = text.replace(/<[^>]+>/g, ' ');
+
+    // Decode numeric entities FIRST (before named entities)
+    // Decimal: &#8212; -> em-dash
+    text = text.replace(/&#(\d+);/g, (match, dec) => {
+      const code = parseInt(dec, 10);
+      if (isNaN(code)) return match; // Preserve malformed
+      // Valid Unicode scalar values: 0x0000-0xD7FF, 0xE000-0x10FFFF
+      // (excludes surrogate pair range 0xD800-0xDFFF)
+      if (code < 0 || code > 0x10FFFF) return ''; // Out of range
+      if (code >= 0xD800 && code <= 0xDFFF) return ''; // Invalid surrogates
+      return String.fromCodePoint(code);
+    });
+    // Hexadecimal: &#x2014; -> em-dash
+    text = text.replace(/&#x([0-9a-f]+);/gi, (match, hex) => {
+      const code = parseInt(hex, 16);
+      if (isNaN(code)) return match; // Preserve malformed
+      if (code < 0 || code > 0x10FFFF) return ''; // Out of range
+      if (code >= 0xD800 && code <= 0xDFFF) return ''; // Invalid surrogates
+      return String.fromCodePoint(code);
+    });
+
+    // Decode named entities
+    text = text.replace(/&nbsp;/g, ' ');
+    text = text.replace(/&amp;/g, '&');
+    text = text.replace(/&lt;/g, '<');
+    text = text.replace(/&gt;/g, '>');
+    text = text.replace(/&quot;/g, '"');
+    text = text.replace(/&apos;/g, "'");
+    text = text.replace(/&#039;/g, "'");
+    // Common typography entities
+    text = text.replace(/&mdash;/g, '\u2014'); // em-dash —
+    text = text.replace(/&ndash;/g, '\u2013'); // en-dash –
+    text = text.replace(/&hellip;/g, '\u2026'); // ellipsis …
+    text = text.replace(/&rsquo;/g, '\u2019'); // right single quote '
+    text = text.replace(/&lsquo;/g, '\u2018'); // left single quote '
+    text = text.replace(/&rdquo;/g, '\u201D'); // right double quote "
+    text = text.replace(/&ldquo;/g, '\u201C'); // left double quote "
+    text = text.replace(/&copy;/g, '\u00A9'); // copyright ©
+    text = text.replace(/&reg;/g, '\u00AE'); // registered ®
+    text = text.replace(/&trade;/g, '\u2122'); // trademark ™
+
+    // Normalize whitespace
+    text = text.replace(/\s+/g, ' ').trim();
+
+    return text;
   }
 }
 

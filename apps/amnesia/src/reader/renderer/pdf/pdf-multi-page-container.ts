@@ -31,6 +31,8 @@ export interface MultiPageConfig {
   padding: number;
   /** Pixel ratio for HiDPI */
   pixelRatio?: number;
+  /** Maximum zoom level used to cap scale tier */
+  maxZoom?: number;
   /** Enable text anti-aliasing */
   enableTextAntialiasing?: boolean;
   /** Enable image smoothing */
@@ -642,9 +644,7 @@ export class PdfMultiPageContainer {
       return pendingRequest;
     }
 
-    // Fetch from server at appropriate scale
-    // Use a minimum scale to avoid pixelation when zooming back in
-    // Note: HybridPdfProvider.renderPage() handles DPI-aware scaling internally
+    // Fetch at appropriate scale (minimum 1.5x to avoid pixelation when zooming)
     const fetchScale = Math.max(targetScale, 1.5);
 
     // Create the request promise and store it for deduplication
@@ -728,6 +728,7 @@ export class PdfMultiPageContainer {
       pageElement = new PdfPageElement({
         pageNumber: page,
         pixelRatio: this.config.pixelRatio,
+        maxZoom: this.config.maxZoom,
         enableTextAntialiasing: this.config.enableTextAntialiasing,
         enableImageSmoothing: this.config.enableImageSmoothing,
         useSvgTextLayer: true, // Enable vector-crisp text at any zoom

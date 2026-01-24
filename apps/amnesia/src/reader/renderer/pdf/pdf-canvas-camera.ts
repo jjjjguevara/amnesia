@@ -38,7 +38,7 @@ export interface CameraConstraints {
 
 const DEFAULT_CONSTRAINTS: CameraConstraints = {
   minZoom: 0.1,
-  maxZoom: 16, // Allow high zoom for detailed viewing
+  maxZoom: 32, // Allow very high zoom for detailed viewing (amnesia-pi0)
   constrainToBounds: false,
 };
 
@@ -113,14 +113,34 @@ export function zoomCameraToPoint(
   // Using multiplicative zoom: zoom *= (1 - delta)
   // This gives smooth, proportional zoom at any level
   const zoomFactor = 1 - delta;
-  const newZoom = clamp(
-    camera.z * zoomFactor,
-    constraints.minZoom,
-    constraints.maxZoom
-  );
+  const rawNewZoom = camera.z * zoomFactor;
+  const newZoom = clamp(rawNewZoom, constraints.minZoom, constraints.maxZoom);
 
-  // If zoom didn't change (hit constraints), return unchanged
-  if (newZoom === camera.z) {
+  // CRITICAL FIX (amnesia-ntj): Detect when zoom was clamped at HARD boundary
+  // When user continues pinching at max/min zoom, trackpad sends rebound events
+  // that would cause position drift if we calculated position adjustments.
+  //
+  // IMPORTANT: Only apply at HARD limits (0.1 and 32), NOT at soft constraints
+  // like "fit to page". Soft constraints can be dynamic and the rebound fix
+  // would incorrectly block legitimate zoom gestures.
+  //
+  // Detection logic:
+  // - atHardBoundary: zoom is at the absolute min (0.1) or max (32)
+  // - noEffectiveZoomChange: new zoom equals current zoom
+  //
+  // FIX (amnesia-eff): Use RELATIVE epsilon comparisons for floats
+  const HARD_MIN_ZOOM = 0.1;
+  const HARD_MAX_ZOOM = 32;
+  const EPSILON_PERCENT = 0.001; // 0.1%
+  const epsilon = Math.max(1e-6, newZoom * EPSILON_PERCENT);
+  const atHardMaxZoom = Math.abs(newZoom - HARD_MAX_ZOOM) < epsilon;
+  const atHardMinZoom = Math.abs(newZoom - HARD_MIN_ZOOM) < epsilon;
+  const noEffectiveZoomChange = Math.abs(newZoom - camera.z) < epsilon;
+
+  if ((atHardMaxZoom || atHardMinZoom) && noEffectiveZoomChange) {
+    // At hard boundary and zoom can't change - block position adjustment
+    // This prevents rebound events from causing focal point drift
+    console.log(`[ZOOM-CLAMP-FIX] Blocked at hard limit: zoom=${newZoom.toFixed(4)}, boundary=${atHardMaxZoom ? 'MAX(32)' : 'MIN(0.1)'}`);
     return camera;
   }
 
@@ -131,12 +151,30 @@ export function zoomCameraToPoint(
   // (using the new zoom level but old position)
   const p2 = screenToCanvas(point, { ...camera, z: newZoom });
 
-  // Adjust camera position to keep the point stationary
-  // The difference (p2 - p1) is how much the point "moved" due to zoom
-  // We compensate by moving the camera by that amount
+  // Calculate position adjustment to keep the point stationary
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+
+  // DEBUG: Log significant camera changes to track focal point drift
+  const significantChange = Math.abs(dx) > 5 || Math.abs(dy) > 5;
+  if (significantChange) {
+    // Use explicit string format to avoid Object truncation in MCP console capture
+    console.log(`[ZOOM-DEBUG] zoomCameraToPoint: delta=${delta.toFixed(4)}, ` +
+      `zoom=${camera.z.toFixed(2)}→${newZoom.toFixed(2)}, ` +
+      `focal=(${point.x.toFixed(0)},${point.y.toFixed(0)}), ` +
+      `posDelta=(${dx.toFixed(1)},${dy.toFixed(1)}), ` +
+      `camBefore=(${camera.x.toFixed(1)},${camera.y.toFixed(1)}), ` +
+      `camAfter=(${(camera.x + dx).toFixed(1)},${(camera.y + dy).toFixed(1)})`);
+  }
+
+  // Early return if no effective change
+  if (newZoom === camera.z && Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
+    return camera;
+  }
+
   return {
-    x: camera.x + (p2.x - p1.x),
-    y: camera.y + (p2.y - p1.y),
+    x: camera.x + dx,
+    y: camera.y + dy,
     z: newZoom,
   };
 }
@@ -286,15 +324,19 @@ export function constrainCamera(
 }
 
 /**
- * Get the CSS transform string for the camera
+ * Get the CSS transform string for the camera.
+ * Uses scale-then-translate for proper pan-zoom behavior.
  *
- * The transform order is: scale first, then translate
- * This ensures zoom happens correctly around the origin
+ * GPU COMPOSITING: Uses translate3d (with z=0) instead of translate to
+ * create a 3D rendering context. This ensures the canvas is promoted to
+ * its own compositing layer, enabling smooth 60fps zoom via GPU acceleration.
+ * Without 3D context, browsers may batch transforms with other layers,
+ * causing stepped/quantized zoom appearance.
  */
 export function getCameraTransform(camera: Camera): string {
-  // We use scale then translate
-  // The translate values are multiplied by zoom because transform is applied in order
-  return `scale(${camera.z}) translate(${camera.x}px, ${camera.y}px)`;
+  // Camera transform: scale then translate3d for GPU-accelerated pan-zoom
+  // translate3d creates a 3D context for GPU layer promotion
+  return `scale(${camera.z}) translate3d(${camera.x}px, ${camera.y}px, 0)`;
 }
 
 /**
@@ -319,6 +361,54 @@ export function getVisibleBounds(
     height,
   };
 }
+
+// ============================================================================
+// UNIFIED COORDINATE SPACE FUNCTIONS (V4 Architecture)
+// ============================================================================
+
+/**
+ * Pan camera in unified coordinate space.
+ *
+ * In unified coordinate space, pages are already at zoomed dimensions,
+ * so pan delta is applied directly without dividing by zoom.
+ */
+export function panCameraUnified(camera: Camera, dx: number, dy: number): Camera {
+  return {
+    x: camera.x - dx,
+    y: camera.y - dy,
+    z: camera.z,
+  };
+}
+
+/**
+ * Get visible bounds in unified coordinate space.
+ *
+ * In unified coordinate space, pages are sized to (baseWidth * zoom),
+ * and the camera's zoom is effectively 1 for visibility calculations
+ * since pages are already at final dimensions.
+ */
+export function getVisibleBoundsUnified(
+  camera: Camera,
+  viewportWidth: number,
+  viewportHeight: number
+): { x: number; y: number; width: number; height: number } {
+  // In unified space, camera.z represents the zoom applied to page dimensions
+  // Viewport covers the same screen area but pages are larger
+  // So visible bounds in page coordinates = viewport / zoom
+  const width = viewportWidth / camera.z;
+  const height = viewportHeight / camera.z;
+
+  return {
+    x: -camera.x,
+    y: -camera.y,
+    width,
+    height,
+  };
+}
+
+// ============================================================================
+// ANIMATION FUNCTIONS
+// ============================================================================
 
 /**
  * Animate camera transition (returns intermediate camera states)

@@ -41,6 +41,9 @@ apps/amnesia/screenshots/
 # Docker
 .docker/
 
+# Docs
+apps/amnesia/docs/
+
 # Logs
 *.log
 npm-debug.log*

@@ -22,7 +22,7 @@ import type {
   SpineItem,
 } from './renderer/types';
 import type { Highlight } from '../library/types';
-import type { ContentProvider } from './renderer/renderer';
+import type { ContentProvider } from './renderer/content-provider';
 import { ShadowDOMRenderer } from './shadow-dom-renderer';
 import { Paginator } from './renderer/paginator';
 import { Scroller } from './renderer/scroller';

@@ -2,9 +2,13 @@
   import { onMount, onDestroy } from 'svelte';
   import type AmnesiaPlugin from '../../main';
   import { loadBook, isAbsolutePath } from '../../reader/book-loader';
-  import { createApiClient, type ApiClient } from '../../reader/renderer';
   import { X, Download, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, Image, FolderOutput, Copy } from 'lucide-svelte';
   import { Notice } from 'obsidian';
+
+  // Server-dependent feature - ApiClient was removed
+  // This view requires server infrastructure to extract images from EPUBs
+  type ApiClient = null;
+  const createApiClient = (_config: unknown): ApiClient => null;
 
   export let plugin: AmnesiaPlugin;
   export let bookPath: string;

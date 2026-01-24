@@ -30,12 +30,15 @@ importers:
       dompurify:
         specifier: ^3.3.1
         version: 3.3.1
-      epub-cfi-resolver:
-        specifier: ^1.0.2
-        version: 1.0.2
       fast-xml-parser:
         specifier: ^4.3.0
         version: 4.5.3
+      idb:
+        specifier: ^8.0.3
+        version: 8.0.3
+      lethargy:
+        specifier: ^1.0.9
+        version: 1.0.9
       minisearch:
         specifier: ^7.2.0
         version: 7.2.0
@@ -54,6 +57,9 @@ importers:
       uuid:
         specifier: ^9.0.0
         version: 9.0.1
+      wheel-gestures:
+        specifier: ^2.2.48
+        version: 2.2.48
     devDependencies:
       '@tsconfig/svelte':
         specifier: 5.0.2
@@ -84,7 +90,7 @@ importers:
         version: 0.292.0(svelte@4.2.1)
       obsidian:
         specifier: latest
-        version: 1.11.0(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
+        version: 1.11.4(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
       svelte:
         specifier: 4.2.1
         version: 4.2.1
@@ -905,9 +911,6 @@ packages:
     resolution: {integrity: sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==}
     engines: {node: '>=0.12'}
 
-  epub-cfi-resolver@1.0.2:
-    resolution: {integrity: sha512-br7af3O6lRjNoE0r3RVgCLwmuhwsdjfOfjWyhDjxTWm5sqSa3HWWib+Hr5/Grt6jUloH/F33fACxCR0+0WA8kg==}
-
   es6-promise@3.3.1:
     resolution: {integrity: sha512-SOp9Phqvqn7jtEUxPWdWfWoLmyt2VaJ6MpvP9Comy1MceMXqE6bxvaTu4iaxpYYPzhny28Lc+M87/c2cPK6lDg==}
 
@@ -1015,6 +1018,9 @@ packages:
     resolution: {integrity: sha512-2Tth85cXwGFHfvRgZWszZSvdo+0Xsqmw8k8ZwxScfcBneNUraK+dxRxRm24nszx80Y0TVio8kKLt5sLE7ZCLlw==}
     engines: {node: '>=0.10.0'}
 
+  idb@8.0.3:
+    resolution: {integrity: sha512-LtwtVyVYO5BqRvcsKuB2iUMnHwPVByPCXFXOpuU96IZPPoPN6xjOGxZQ74pgSVVLQWtUOYgyeL4GE98BY5D3wg==}
+
   ignore@5.3.2:
     resolution: {integrity: sha512-hsBTNUqQTDwkWtcdYI2i06Y/nUBEsNEDJKjWdigLvegy8kDuJAS8uRlpkkcQpyEXL0Z/pjDy5HBmMjRCJ2gq+g==}
     engines: {node: '>= 4'}
@@ -1074,6 +1080,9 @@ packages:
 
   jsonfile@4.0.0:
     resolution: {integrity: sha512-m6F1R3z8jjlf2imQHS2Qez5sjKWQzbuuhuJ/FKYFRZvPE3PuHcSMVZzfsLhGVOkfd20obL5SWEBew5ShlquNxg==}
+
+  lethargy@1.0.9:
+    resolution: {integrity: sha512-nFM8blpCF9rqIL5mRAaTGc78W8oQixVtsD86jbEPvcI13+lDUYJf3R7DZQQL7tCiBpbGpGKMX2gwJFO9hiaOkg==}
 
   local-pkg@0.4.3:
     resolution: {integrity: sha512-SFppqq5p42fe2qcZQqqEOiVRXl+WCP1MdT6k7BDEW1j++sp5fIY+/fdRQitvKgB5BrBcmrs5m/L0v2FrU5MY1g==}
@@ -1170,8 +1179,8 @@ packages:
       chokidar:
         optional: true
 
-  obsidian@1.11.0:
-    resolution: {integrity: sha512-lVqN9AmDWHzhNATi2tDnjqVgI6WUYKeT+lIsAycAyLt4XCC6zRsWzb+tFCiB7Rn3PpttefjoovilhYwvS4Iqxw==}
+  obsidian@1.11.4:
+    resolution: {integrity: sha512-n0KD3S+VndgaByrEtEe8NELy0ya6/s+KZ7OcxA6xOm5NN4thxKpQjo6eqEudHEvfGCeT/TYToAKJzitQ1I3XTg==}
     peerDependencies:
       '@codemirror/state': 6.5.0
       '@codemirror/view': 6.38.6
@@ -1586,6 +1595,10 @@ packages:
   whatwg-url@15.1.0:
     resolution: {integrity: sha512-2ytDk0kiEj/yu90JOAp44PVPUkO9+jVhyf+SybKlRHSDlvOOZhdPIrr7xTH64l4WixO2cP+wQIcgujkGBPPz6g==}
     engines: {node: '>=20'}
+
+  wheel-gestures@2.2.48:
+    resolution: {integrity: sha512-f+Gy33Oa5Z14XY9679Zze+7VFhbsQfBFXodnU2x589l4kxGM9L5Y8zETTmcMR5pWOPQyRv4Z0lNax6xCO0NSlA==}
+    engines: {node: '>=18'}
 
   which@2.0.2:
     resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
@@ -2316,8 +2329,6 @@ snapshots:
 
   entities@6.0.1: {}
 
-  epub-cfi-resolver@1.0.2: {}
-
   es6-promise@3.3.1: {}
 
   esbuild-svelte@0.8.0(esbuild@0.17.3)(svelte@4.2.1):
@@ -2481,6 +2492,8 @@ snapshots:
     dependencies:
       safer-buffer: 2.1.2
 
+  idb@8.0.3: {}
+
   ignore@5.3.2: {}
 
   inflight@1.0.6:
@@ -2552,6 +2565,8 @@ snapshots:
   jsonfile@4.0.0:
     optionalDependencies:
       graceful-fs: 4.2.11
+
+  lethargy@1.0.9: {}
 
   local-pkg@0.4.3: {}
 
@@ -2629,7 +2644,7 @@ snapshots:
       asap: 2.0.6
       commander: 5.1.0
 
-  obsidian@1.11.0(@codemirror/state@6.5.0)(@codemirror/view@6.38.6):
+  obsidian@1.11.4(@codemirror/state@6.5.0)(@codemirror/view@6.38.6):
     dependencies:
       '@codemirror/state': 6.5.0
       '@codemirror/view': 6.38.6
@@ -2997,6 +3012,8 @@ snapshots:
     dependencies:
       tr46: 6.0.0
       webidl-conversions: 8.0.1
+
+  wheel-gestures@2.2.48: {}
 
   which@2.0.2:
     dependencies:

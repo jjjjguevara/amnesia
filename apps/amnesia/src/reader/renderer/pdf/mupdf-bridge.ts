@@ -11,7 +11,61 @@ import type {
   TextLayerData,
   SearchResult,
   TocEntry,
+  WorkerTiming,
+  RenderFormat,
+  SharedBufferSlot,
 } from './mupdf-worker';
+import { getSharedBufferPool, type SharedBufferPool, type BufferSlot } from './shared-buffer-pool';
+import { isFeatureEnabled } from './feature-flags';
+
+export type { RenderFormat };
+
+/**
+ * Common interface for MuPDF bridge implementations.
+ * Both MuPDFBridge and PooledMuPDFBridge implement this interface,
+ * allowing transparent switching between single-worker and multi-worker modes.
+ */
+export interface IMuPDFBridge {
+  initialize(): Promise<void>;
+  loadDocument(data: ArrayBuffer): Promise<{ pageCount: number; toc: TocEntry[] }>;
+  loadDocumentWithId(data: ArrayBuffer): Promise<{ id: string; pageCount: number; toc: TocEntry[] }>;
+  renderPage(
+    docId: string,
+    pageNum: number,
+    scale: number,
+    format?: RenderFormat
+  ): Promise<{
+    data: Uint8Array;
+    width: number;
+    height: number;
+    format: RenderFormat;
+    workerTiming?: WorkerTiming;
+    transferTime?: number;
+  }>;
+  renderTile(
+    docId: string,
+    pageNum: number,
+    tileX: number,
+    tileY: number,
+    tileSize: number,
+    scale: number,
+    format?: RenderFormat
+  ): Promise<{
+    data: Uint8Array;
+    width: number;
+    height: number;
+    format: RenderFormat;
+    workerTiming?: WorkerTiming;
+    transferTime?: number;
+  }>;
+  getTextLayer(docId: string, pageNum: number): Promise<TextLayerData>;
+  search(docId: string, query: string, maxHits?: number): Promise<SearchResult[]>;
+  getPageCount(docId: string): Promise<number>;
+  getPageDimensions(docId: string, pageNum: number): Promise<{ width: number; height: number }>;
+  unloadDocument(docId: string): Promise<void>;
+  terminate(): void;
+  readonly ready: boolean;
+}
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -60,13 +114,17 @@ async function getWorkerBlobUrl(): Promise<string> {
 /**
  * Bridge to communicate with MuPDF Web Worker
  */
-export class MuPDFBridge {
+export class MuPDFBridge implements IMuPDFBridge {
   private worker: Worker | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private requestIdCounter = 0;
   private isReady = false;
   private readyPromise: Promise<void>;
   private readyResolve: (() => void) | null = null;
+  /** SharedArrayBuffer pool for zero-copy transfer */
+  private sharedBufferPool: SharedBufferPool | null = null;
+  /** Whether SAB is enabled and initialized */
+  private sabEnabled = false;
 
   constructor() {
     this.readyPromise = new Promise((resolve) => {
@@ -89,7 +147,22 @@ export class MuPDFBridge {
     // Read WASM binary from disk using Node.js fs (available in Electron main thread)
     const fs = window.require('fs') as typeof import('fs');
     const wasmPath = `${pluginBasePath}/mupdf-wasm.wasm`;
-    const wasmBinary = fs.readFileSync(wasmPath);
+    const wasmBinaryBuffer = fs.readFileSync(wasmPath);
+
+    // Convert Node.js Buffer to ArrayBuffer (ensure it's a proper ArrayBuffer, not SharedArrayBuffer)
+    const wasmArrayBuffer = new ArrayBuffer(wasmBinaryBuffer.length);
+    new Uint8Array(wasmArrayBuffer).set(new Uint8Array(wasmBinaryBuffer.buffer, wasmBinaryBuffer.byteOffset, wasmBinaryBuffer.byteLength));
+
+    // Pre-compile WASM module for faster worker initialization
+    // Saves 400-800ms by doing compilation once on main thread
+    let wasmModule: WebAssembly.Module | undefined;
+    try {
+      const compileStart = performance.now();
+      wasmModule = await WebAssembly.compile(wasmArrayBuffer);
+      console.log(`[MuPDFBridge] WASM module compiled in ${(performance.now() - compileStart).toFixed(1)}ms`);
+    } catch (err) {
+      console.warn('[MuPDFBridge] WASM pre-compilation failed, falling back to worker compilation:', err);
+    }
 
     // Create worker from Blob URL (required for cross-origin in Obsidian/Electron)
     const workerUrl = await getWorkerBlobUrl();
@@ -100,14 +173,107 @@ export class MuPDFBridge {
     this.worker.onmessage = this.handleMessage.bind(this);
     this.worker.onerror = this.handleError.bind(this);
 
-    // Send WASM binary to worker - required by esbuild banner setup
-    // The worker is waiting for INIT_WASM message before loading mupdf
-    this.worker.postMessage(
-      { type: 'INIT_WASM', wasmBinary: wasmBinary },
-      [wasmBinary.buffer] // Transfer ownership for performance
-    );
+    // Send WASM module and/or binary to worker
+    // Try with pre-compiled module first (saves 400-800ms)
+    // Fall back to binary-only if Module cloning fails (Electron compatibility)
+    const wasmBinaryCopy = wasmArrayBuffer.slice(0);
 
-    return this.readyPromise;
+    if (wasmModule) {
+      try {
+        const initMessage = {
+          type: 'INIT_WASM',
+          wasmBinary: wasmBinaryCopy,
+          wasmModule: wasmModule,
+        };
+        this.worker.postMessage(initMessage, [wasmBinaryCopy]);
+        console.log('[MuPDFBridge] Sent WASM module + binary to worker');
+      } catch (err) {
+        // WebAssembly.Module may not be cloneable in some Electron versions
+        console.warn('[MuPDFBridge] Module cloning failed, falling back to binary:', err);
+        // Need fresh copy since the first one was transferred (or invalidated)
+        const fallbackCopy = wasmArrayBuffer.slice(0);
+        const fallbackMessage = {
+          type: 'INIT_WASM',
+          wasmBinary: fallbackCopy,
+        };
+        this.worker.postMessage(fallbackMessage, [fallbackCopy]);
+      }
+    } else {
+      const initMessage = {
+        type: 'INIT_WASM',
+        wasmBinary: wasmBinaryCopy,
+      };
+      this.worker.postMessage(initMessage, [wasmBinaryCopy]);
+      console.log('[MuPDFBridge] Sent WASM binary to worker (no pre-compiled module)');
+    }
+
+    // Wait for worker to be ready before initializing SharedArrayBuffer
+    await this.readyPromise;
+
+    // Initialize SharedArrayBuffer pool if enabled
+    await this.initializeSharedBuffers();
+  }
+
+  /**
+   * Initialize SharedArrayBuffer pool and send references to worker
+   */
+  private async initializeSharedBuffers(): Promise<void> {
+    // Check if SharedArrayBuffer is enabled
+    if (!isFeatureEnabled('useSharedArrayBuffer')) {
+      console.log('[MuPDFBridge] SharedArrayBuffer disabled by feature flag');
+      return;
+    }
+
+    try {
+      this.sharedBufferPool = getSharedBufferPool();
+
+      if (!this.sharedBufferPool.isSharedArrayBufferEnabled()) {
+        console.log('[MuPDFBridge] SharedArrayBuffer not available (fallback mode)');
+        return;
+      }
+
+      // Get buffer references to send to worker
+      const bufferRefs = this.sharedBufferPool.getBufferReferences();
+      if (!bufferRefs) {
+        console.log('[MuPDFBridge] No SharedArrayBuffer references available');
+        return;
+      }
+
+      // Flatten buffer references for message passing
+      const buffers: Array<{ tierSize: number; buffer: SharedArrayBuffer }> = [];
+      for (const [tierSize, tierBuffers] of bufferRefs) {
+        for (const buffer of tierBuffers) {
+          buffers.push({ tierSize, buffer });
+        }
+      }
+
+      if (buffers.length === 0) {
+        console.log('[MuPDFBridge] No SharedArrayBuffer slots available');
+        return;
+      }
+
+      // Send INIT_SHARED_BUFFERS to worker
+      const requestId = this.generateRequestId();
+      const response = await this.sendRequest<{
+        type: 'SHARED_BUFFERS_INITIALIZED';
+        requestId: string;
+        success: boolean;
+        tierSizes: number[];
+      }>({
+        type: 'INIT_SHARED_BUFFERS',
+        requestId,
+        buffers,
+      } as WorkerRequest);
+
+      this.sabEnabled = response.success;
+      console.log(
+        `[MuPDFBridge] SharedArrayBuffer initialized: ${response.success}, ` +
+        `tiers: ${response.tierSizes.join(', ')}`
+      );
+    } catch (err) {
+      console.error('[MuPDFBridge] Failed to initialize SharedArrayBuffer:', err);
+      this.sabEnabled = false;
+    }
   }
 
   /**
@@ -244,17 +410,20 @@ export class MuPDFBridge {
   }
 
   /**
-   * Render a page to PNG
+   * Render a page to PNG or raw RGBA
    * @param docId Document ID from loadDocumentWithId
    * @param pageNum 1-indexed page number
    * @param scale Render scale (1.0 = 72 DPI)
+   * @param format Output format: 'png' (compressed) or 'rgba' (raw pixels, faster)
    */
   async renderPage(
     docId: string,
     pageNum: number,
-    scale: number
-  ): Promise<{ data: Uint8Array; width: number; height: number }> {
+    scale: number,
+    format: RenderFormat = 'png'
+  ): Promise<{ data: Uint8Array; width: number; height: number; format: RenderFormat; workerTiming?: WorkerTiming; transferTime?: number }> {
     const requestId = this.generateRequestId();
+    const sendTime = performance.now();
 
     const response = await this.sendRequest<{
       type: 'PAGE_RENDERED';
@@ -263,12 +432,23 @@ export class MuPDFBridge {
       data: Uint8Array;
       width: number;
       height: number;
-    }>({ type: 'RENDER_PAGE', requestId, docId, pageNum, scale });
+      format: RenderFormat;
+      timing?: WorkerTiming;
+    }>({ type: 'RENDER_PAGE', requestId, docId, pageNum, scale, format });
+
+    const receiveTime = performance.now();
+    // Transfer time = round-trip - worker processing time
+    const transferTime = response.timing
+      ? (receiveTime - sendTime) - response.timing.total
+      : receiveTime - sendTime;
 
     return {
       data: response.data,
       width: response.width,
       height: response.height,
+      format: response.format,
+      workerTiming: response.timing,
+      transferTime: Math.max(0, transferTime),
     };
   }
 
@@ -368,6 +548,7 @@ export class MuPDFBridge {
    * @param tileY Tile Y coordinate (0-indexed)
    * @param tileSize Tile size in pixels (typically 256)
    * @param scale Render scale (1.0 = 72 DPI, 2.0 = 144 DPI for retina)
+   * @param format Output format: 'png' (compressed) or 'rgba' (raw pixels, faster)
    */
   async renderTile(
     docId: string,
@@ -375,35 +556,103 @@ export class MuPDFBridge {
     tileX: number,
     tileY: number,
     tileSize: number,
-    scale: number
-  ): Promise<{ data: Uint8Array; width: number; height: number }> {
+    scale: number,
+    format: RenderFormat = 'png'
+  ): Promise<{ data: Uint8Array; width: number; height: number; format: RenderFormat; workerTiming?: WorkerTiming; transferTime?: number }> {
     const requestId = this.generateRequestId();
+    const sendTime = performance.now();
 
-    const response = await this.sendRequest<{
-      type: 'TILE_RENDERED';
-      requestId: string;
-      pageNum: number;
-      tileX: number;
-      tileY: number;
-      data: Uint8Array;
-      width: number;
-      height: number;
-    }>({
-      type: 'RENDER_TILE',
-      requestId,
-      docId,
-      pageNum,
-      tileX,
-      tileY,
-      tileSize,
-      scale,
-    } as WorkerRequest);
+    // Try to use SharedArrayBuffer for RGBA format if enabled
+    let acquiredSlot: BufferSlot | null = null;
+    let sharedSlot: SharedBufferSlot | undefined;
 
-    return {
-      data: response.data,
-      width: response.width,
-      height: response.height,
-    };
+    if (this.sabEnabled && this.sharedBufferPool && format === 'rgba') {
+      // Calculate required buffer size for tile
+      const scaledTileSize = Math.ceil(tileSize * scale);
+      const requiredSize = scaledTileSize * scaledTileSize * 4; // RGBA
+
+      acquiredSlot = this.sharedBufferPool.acquire(requiredSize);
+      if (acquiredSlot && acquiredSlot.isShared) {
+        sharedSlot = {
+          tierSize: acquiredSlot.size,
+          index: acquiredSlot.index,
+        };
+      } else if (acquiredSlot) {
+        // Got fallback buffer, not shared - release it
+        this.sharedBufferPool.release(acquiredSlot);
+        acquiredSlot = null;
+      }
+    }
+
+    try {
+      // Build request with optional shared buffer slot
+      const request: WorkerRequest = {
+        type: 'RENDER_TILE',
+        requestId,
+        docId,
+        pageNum,
+        tileX,
+        tileY,
+        tileSize,
+        scale,
+        format,
+        ...(sharedSlot && { sharedSlot }),
+      } as WorkerRequest;
+
+      const response = await this.sendRequest<{
+        type: 'TILE_RENDERED' | 'TILE_RENDERED_SHARED';
+        requestId: string;
+        pageNum: number;
+        tileX: number;
+        tileY: number;
+        data?: Uint8Array;
+        dataLength?: number;
+        sharedSlot?: SharedBufferSlot;
+        width: number;
+        height: number;
+        format: RenderFormat;
+        timing?: WorkerTiming;
+        usedSharedBuffer?: boolean;
+      }>(request);
+
+      const receiveTime = performance.now();
+      // Transfer time = round-trip - worker processing time
+      const transferTime = response.timing
+        ? (receiveTime - sendTime) - response.timing.total
+        : receiveTime - sendTime;
+
+      // Handle shared buffer response
+      let data: Uint8Array;
+      if (response.type === 'TILE_RENDERED_SHARED' && response.usedSharedBuffer && acquiredSlot) {
+        // Read data from shared buffer
+        // We must copy before releasing the slot, but we still save the transfer copy
+        const dataLength = response.dataLength ?? (response.width * response.height * 4);
+        const sourceView = new Uint8Array(acquiredSlot.view.buffer, acquiredSlot.view.byteOffset, dataLength);
+        data = new Uint8Array(dataLength);
+        data.set(sourceView);
+        // Note: The benefit of SAB is we avoided the structured clone during message transfer
+        // We still need one copy here, but it's faster than the MessagePort serialization
+      } else if (response.data) {
+        // Standard response with data
+        data = response.data;
+      } else {
+        throw new Error('No tile data received');
+      }
+
+      return {
+        data,
+        width: response.width,
+        height: response.height,
+        format: response.format,
+        workerTiming: response.timing,
+        transferTime: Math.max(0, transferTime),
+      };
+    } finally {
+      // Always release the slot after use
+      if (acquiredSlot && this.sharedBufferPool) {
+        this.sharedBufferPool.release(acquiredSlot);
+      }
+    }
   }
 
   /**
@@ -427,20 +676,44 @@ export class MuPDFBridge {
 }
 
 // Singleton instance for shared use - use promise to prevent race conditions
-let sharedBridgePromise: Promise<MuPDFBridge> | null = null;
-let sharedBridgeInstance: MuPDFBridge | null = null;
+let sharedBridgePromise: Promise<IMuPDFBridge> | null = null;
+let sharedBridgeInstance: IMuPDFBridge | null = null;
 
 /**
  * Get or create the shared MuPDF bridge instance.
  * Uses promise-based singleton to prevent race conditions when multiple
  * callers invoke this concurrently during initialization.
+ *
+ * When workerCount > 1, returns a PooledMuPDFBridge that distributes
+ * requests across multiple workers for improved throughput.
  */
-export async function getSharedMuPDFBridge(): Promise<MuPDFBridge> {
+export async function getSharedMuPDFBridge(): Promise<IMuPDFBridge> {
+  console.log('[MuPDFBridge] getSharedMuPDFBridge() called, promise exists:', !!sharedBridgePromise);
   if (!sharedBridgePromise) {
     sharedBridgePromise = (async () => {
+      console.log('[MuPDFBridge] Creating new bridge...');
+      // Check if we should use the worker pool
+      const { getFeatureFlags } = await import('./feature-flags');
+      const flags = getFeatureFlags();
+      const resolved = flags.resolveFlags();
+      const workerCount = resolved.workerCount;
+      console.log('[MuPDFBridge] Feature flags resolved, workerCount:', workerCount);
+
+      if (workerCount > 1) {
+        // Use pooled bridge for multi-worker mode
+        const { PooledMuPDFBridge } = await import('./pooled-mupdf-bridge');
+        const pooledBridge = new PooledMuPDFBridge();
+        await pooledBridge.initialize();
+        sharedBridgeInstance = pooledBridge;
+        console.log(`[MuPDFBridge] Using pooled bridge with ${workerCount} workers`);
+        return pooledBridge;
+      }
+
+      // Single worker mode - use standard bridge
       const bridge = new MuPDFBridge();
       await bridge.initialize();
       sharedBridgeInstance = bridge;
+      console.log('[MuPDFBridge] Using single-worker bridge');
       return bridge;
     })();
   }
@@ -456,4 +729,11 @@ export function destroySharedMuPDFBridge(): void {
     sharedBridgeInstance = null;
   }
   sharedBridgePromise = null;
+
+  // Clean up Blob URL to prevent memory leak
+  if (cachedWorkerBlobUrl) {
+    URL.revokeObjectURL(cachedWorkerBlobUrl);
+    cachedWorkerBlobUrl = null;
+    console.log('[MuPDFBridge] Worker Blob URL revoked');
+  }
 }

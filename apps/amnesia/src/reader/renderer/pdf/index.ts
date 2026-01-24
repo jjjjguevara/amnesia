@@ -77,11 +77,7 @@ export {
   lerpCamera,
   screenToCanvas,
   canvasToScreen,
-  // Unified coordinate space functions (Phase 2)
-  panCameraUnified,
-  screenToCanvasUnified,
-  canvasToScreenUnified,
-  getVisibleBoundsUnified,
+
 } from './pdf-canvas-camera';
 export type { Camera, Point, CameraConstraints } from './pdf-canvas-camera';
 
@@ -147,7 +143,7 @@ export type {
   IterationResult,
 } from './benchmark-suite';
 
-// Coordinate debugger for V4 unified coordinate space
+// Coordinate debugger for PDF rendering diagnostics
 export {
   CoordinateDebugger,
   getCoordinateDebugger,
@@ -187,27 +183,62 @@ export type { TileCoordinate, TileScale, TileRenderRequest, PageLayout as TilePa
 export { TileCacheManager, getTileCacheManager } from './tile-cache-manager';
 export type { PageMetadata, CachedTileData, CachedPageClassification } from './tile-cache-manager';
 
+// Tile integrity checker (diagnostic tool for tile rendering failures)
+export { TileIntegrityChecker, getTileIntegrityChecker, resetTileIntegrityChecker } from './tile-integrity-checker';
+export type { TileRequest, TileResult, TileMapReport, RetryConfig } from './tile-integrity-checker';
+
 // Progressive zoom infrastructure (Phase 2: Multi-Resolution Zoom)
 export {
   SCALE_TIERS,
   getTargetScaleTier,
+  getExactTargetScale,
+  roundScaleForCache,
+  EXACT_SCALE_PRECISION,
   getProgressiveScales,
   getIntermediateScale,
   getCssScaleFactor,
   getAdaptiveTileSize,
-  getAdaptiveTileSizeUnified,
+
   ProgressiveTileRenderer,
   getProgressiveTileRenderer,
   resetProgressiveTileRenderer,
 } from './progressive-tile-renderer';
-export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig } from './progressive-tile-renderer';
+export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig, ExactScaleResult } from './progressive-tile-renderer';
 
+// Zoom Orchestrator (@deprecated - use ZoomStateManager for new code)
 export {
-  ZoomTransformLayer,
+  ZoomOrchestrator,
   getQualityDegradation,
   shouldUseProgressiveZoom,
-} from './zoom-transform-layer';
-export type { ZoomPhase, ZoomTransformState, ZoomTransformConfig } from './zoom-transform-layer';
+} from './zoom-orchestrator';
+export type {
+  ZoomState,
+  RenderPhase,
+  ZoomSnapshot,
+  ZoomRenderState,
+  ZoomOrchestratorConfig,
+} from './zoom-orchestrator';
+
+// Scale State Manager (single source of truth for scale decisions)
+export {
+  ScaleStateManager,
+  createScaleStateManager,
+  getScaleStateManager,
+  clearScaleStateManager,
+  clearAllScaleStateManagers,
+} from './scale-state-manager';
+export type {
+  ScaleMode,
+  RenderMode as ScaleRenderMode,
+  GesturePhase,
+  QualityFalloffMode,
+  RenderParamsId,
+  ScaleState,
+  ScaleSnapshot,
+  TileQualityParams,
+  FocalPointState,
+  ScaleStateManagerConfig,
+} from './scale-state-manager';
 
 export { RenderCoordinator, getRenderCoordinator, resetRenderCoordinator } from './render-coordinator';
 export type { RenderRequest, RenderResult, RenderMode, RenderPriority } from './render-coordinator';
@@ -261,6 +292,8 @@ export {
   destroyWorkerPool,
   resetWorkerPool,
   setWorkerPoolPluginPath,
+  prewarmWorkerPool,
+  isWorkerPoolReady,
 } from './worker-pool-manager';
 export type {
   WorkerPoolConfig,
@@ -307,3 +340,27 @@ export type {
   RenderStrategy,
   OptimizedRenderParams,
 } from './content-type-classifier';
+
+// Adaptive Quality (Phase 5: Adaptive Quality During Interaction)
+export {
+  AdaptiveQualityManager,
+  getAdaptiveQualityManager,
+  resetAdaptiveQualityManager,
+} from './adaptive-quality';
+export type {
+  QualityState,
+  AdaptiveQualityConfig,
+} from './adaptive-quality';
+
+// WebGL Compositor (Phase 7: GPU-Accelerated Compositing)
+export {
+  WebGLCompositor,
+  getWebGLCompositor,
+  resetWebGLCompositor,
+} from './webgl-compositor';
+export type {
+  TileTexture,
+  CompositorConfig,
+  TileRenderInfo,
+  CameraTransform,
+} from './webgl-compositor';

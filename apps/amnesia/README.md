@@ -21,12 +21,35 @@ An ebook reader plugin for Obsidian with OPDS support, highlights, PDF rendering
 
 ## PDF Rendering
 
-The plugin includes a server-based PDF renderer with:
+The plugin includes a high-performance PDF renderer with:
+- **Custom MuPDF WASM**: Optimized build with SIMD and LTO (12% smaller, 1.3-2.5x faster)
 - Smooth pan and zoom (pinch-to-zoom and Cmd+scroll)
 - Multiple display modes (paginated, scroll, canvas)
 - Text selection and highlighting
 - Region selection for scanned PDFs
 - Velocity-based adaptive prefetching
+- Multi-worker tile rendering (4 workers default)
+
+### Custom MuPDF WASM Build
+
+The plugin uses a custom MuPDF WASM build optimized for PDF and EPUB rendering:
+
+| Metric | Custom Build | npm Package | Improvement |
+|--------|-------------|-------------|-------------|
+| **Size (uncompressed)** | 8.4 MB | 9.5 MB | 12% smaller |
+| **Size (gzipped)** | 2.9 MB | 4.3 MB | 33% smaller |
+| **Core render time** | ~8ms | ~15ms | 1.3-2.5x faster |
+
+**Optimizations enabled:**
+- SIMD instructions (`-msimd128`) for vectorized operations
+- Link-Time Optimization (`-flto`) for smaller binary
+- wasm-opt with SIMD and exception handling
+- CJK fonts stripped (saves 3.4MB for non-CJK users)
+
+**Features kept:** PDF, EPUB, SVG (for EPUB3), image handling
+**Features disabled:** XPS, CBZ, HTML (standalone), JavaScript forms, MOBI, FB2, Office formats
+
+To rebuild the custom WASM, see `build/mupdf-wasm/mupdf/platform/wasm/tools/build-amnesia.sh`
 
 ## Version History
 

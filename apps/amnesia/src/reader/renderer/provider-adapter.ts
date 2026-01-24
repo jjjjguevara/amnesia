@@ -1,12 +1,19 @@
 /**
  * Provider Adapter
  *
- * Adapts the HybridBookProvider to the interface expected by EpubRenderer.
- * Allows the renderer to work with both server and WASM backends transparently.
+ * Adapts book providers to the ContentProvider interface.
  */
 
 import type { ParsedBook, ChapterContent } from './types';
-import type { HybridBookProvider } from './hybrid-provider';
+
+interface HybridBookProvider {
+  loadBook(data: ArrayBuffer, filename?: string): Promise<ParsedBook>;
+  loadBookById?(bookId: string): Promise<ParsedBook>;
+  getChapter(bookId: string, href: string): Promise<ChapterContent>;
+  getResource(bookId: string, href: string): Promise<Uint8Array>;
+  getResourceAsUrl(bookId: string, href: string): Promise<string>;
+  isAvailable(): boolean;
+}
 
 /**
  * Chapter cache for provider adapter

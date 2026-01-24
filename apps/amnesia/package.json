@@ -29,12 +29,14 @@
     "dompurify": "^3.3.1",
     "fast-xml-parser": "^4.3.0",
     "idb": "^8.0.3",
+    "lethargy": "^1.0.9",
     "minisearch": "^7.2.0",
     "mupdf": "^1.26.0",
     "nunjucks": "^3.2.4",
     "p-queue": "^8.0.1",
     "sql.js": "^1.10.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "wheel-gestures": "^2.2.48"
   },
   "devDependencies": {
     "@tsconfig/svelte": "5.0.2",

@@ -1,50 +1,28 @@
 /**
- * EPUB Renderer Module
+ * Document Renderer Module
  *
- * Custom EPUB renderer that replaces epub.js with:
- * - Server-based content delivery (amnesia-server)
- * - CSS multi-column pagination
- * - Continuous scroll mode
- * - SVG highlight overlay
+ * Unified rendering for EPUB and PDF documents using MuPDF WASM:
+ * - WASM-based content delivery (MuPDF)
+ * - CSS multi-column pagination (EPUB)
+ * - Shadow DOM isolation (EPUB)
+ * - Tiled rendering (PDF)
  * - Multi-selector annotations
- * - Automatic background sync
+ * - TextQuote-based highlight anchoring
  *
  * @example
  * ```typescript
- * import {
- *   EpubRenderer,
- *   ApiClient,
- *   createApiClient,
- *   SyncManager
- * } from './renderer';
+ * import { HybridDocumentProvider, createHybridDocumentProvider } from './renderer';
+ * import { ShadowDOMRenderer } from '../shadow-dom-renderer';
  *
- * // Initialize API client
- * const api = createApiClient({
- *   baseUrl: 'http://localhost:3000',
- *   deviceId: 'device-123'
- * });
+ * // Create document provider
+ * const provider = await createHybridDocumentProvider({ pluginPath: '...' });
  *
- * // Create renderer
- * const renderer = new EpubRenderer(containerElement, api, {
- *   mode: 'paginated',
- *   fontSize: 18,
- *   theme: 'sepia'
- * });
+ * // Load document
+ * await provider.loadDocument(arrayBuffer);
  *
- * // Load book
- * await renderer.load(bookId);
- *
- * // Set up sync
- * const sync = new SyncManager(api, {
- *   deviceId: 'device-123',
- *   onStatusChange: (status) => console.log('Sync:', status)
- * });
- * await sync.initialize(bookId);
- *
- * // Listen for events
- * renderer.on('relocated', (location) => {
- *   sync.update('progress', bookId, location);
- * });
+ * // For EPUB rendering, use ShadowDOMRenderer
+ * const renderer = new ShadowDOMRenderer(container, contentProvider, config);
+ * await renderer.loadFromBytes(arrayBuffer);
  * ```
  */
 
@@ -139,13 +117,9 @@ export {
   parsePdfLocator,
 } from './document-renderer';
 
-// API Client
-export { ApiClient, ApiError, createApiClient, getApiClient } from './api-client';
-export type { ApiClientConfig } from './api-client';
 
-// Renderer
-export { EpubRenderer } from './renderer';
-export type { ContentProvider } from './renderer';
+// Content Provider Interface
+export type { ContentProvider } from './content-provider';
 
 // Pagination
 export { Paginator } from './paginator';
@@ -165,21 +139,14 @@ export type { InlineHighlight, InlineHighlightClickCallback } from './inline-hig
 export { SelectionHandler } from './selection';
 export type { SelectionData, SelectionCallback } from './selection';
 
-// Sync
-export { SyncManager } from './sync-manager';
-export type { SyncManagerConfig } from './sync-manager';
 
 // Device ID
 export { getDeviceId, resetDeviceId } from './device-id';
 
-// Reader Adapter (epub.js compatibility layer)
-export { ReaderAdapter, createReaderAdapter } from './reader-adapter';
 
 // Book Providers
 export type { BookProvider, SearchResult, ProviderStatus } from './book-provider';
 export { WasmBookProvider } from './wasm-provider';
-export { HybridBookProvider, createHybridProvider } from './hybrid-provider';
-export type { HybridProviderConfig, ProviderMode } from './hybrid-provider';
 export { ProviderAdapter, createProviderAdapter } from './provider-adapter';
 // Unified Document Provider (PDF + EPUB)
 export {
@@ -189,7 +156,7 @@ export {
 } from './hybrid-document-provider';
 export type { HybridDocumentProviderConfig, RenderOptions, TileRenderOptions } from './hybrid-document-provider';
 
-// PDF Renderer (server-based, PDF.js deprecated)
+// PDF Renderer (WASM-based)
 export {
   PdfRenderer,
   PdfCanvasLayer,
@@ -198,8 +165,6 @@ export {
   PdfRegionSelection,
   PdfPaginator,
   PdfScroller,
-  HybridPdfProvider,
-  createHybridPdfProvider,
 } from './pdf';
 export type {
   PdfRendererConfig,
@@ -221,9 +186,6 @@ export type {
   PdfScrollCallback,
   PageRenderCallback,
   PdfScrollerConfig,
-  HybridPdfProviderConfig,
-  HybridPdfProviderStatus,
-  PdfProviderMode,
 } from './pdf';
 
 // Highlight Anchoring (unified EPUB/PDF)

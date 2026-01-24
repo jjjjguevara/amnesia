@@ -4,13 +4,20 @@
  * PDF rendering mode, scale, layout, OCR, and provider settings.
  */
 
-import { Setting } from 'obsidian';
+import { Notice, Setting } from 'obsidian';
 import type AmnesiaPlugin from '../../main';
 import {
     createTabHeader,
     createSection,
     createExplainerBox,
 } from '../settings-ui/section-helpers';
+import {
+    type PdfPerformancePreset,
+    PDF_PERFORMANCE_PRESETS,
+} from '../settings';
+import {
+    getPerformanceSettingsManager,
+} from '../../reader/renderer/pdf/performance-settings-manager';
 
 export interface PdfSettingsProps {
     plugin: AmnesiaPlugin;
@@ -507,4 +514,171 @@ export function PdfSettings({ plugin, containerEl }: PdfSettingsProps): void {
                 containerEl.empty();
                 PdfSettings({ plugin, containerEl });
             }));
+
+    // ==========================================================================
+    // PERFORMANCE PRESETS (WASM Tile Renderer)
+    // ==========================================================================
+
+    const presetSection = createSection(containerEl, 'gauge', 'Performance Presets');
+
+    createExplainerBox(presetSection,
+        'Performance presets optimize the tile-based renderer for different use cases. ' +
+        'Changes apply immediately without restart.'
+    );
+
+    // Preset selector
+    new Setting(presetSection)
+        .setName('Preset')
+        .setDesc('Choose a performance profile or customize individual settings')
+        .addDropdown(dropdown => dropdown
+            .addOption('balanced', 'Balanced (Recommended)')
+            .addOption('performance', 'Performance (High-end devices)')
+            .addOption('memory-saver', 'Memory Saver (Low-end devices)')
+            .addOption('quality', 'Quality (Best visual fidelity)')
+            .addOption('custom', 'Custom')
+            .setValue(settings.pdf.performancePreset)
+            .onChange(async (value) => {
+                const preset = value as PdfPerformancePreset;
+                settings.pdf.performancePreset = preset;
+
+                // Apply preset values if not custom
+                if (preset !== 'custom') {
+                    settings.pdf.tilePerformance = { ...PDF_PERFORMANCE_PRESETS[preset] };
+                    // Update the live manager
+                    getPerformanceSettingsManager().applyPreset(preset);
+                }
+
+                await plugin.saveSettings();
+                // Refresh to show/hide custom settings
+                containerEl.empty();
+                PdfSettings({ plugin, containerEl });
+            }));
+
+    // Show detailed settings only when custom preset is selected
+    if (settings.pdf.performancePreset === 'custom') {
+        const customSection = createSection(containerEl, 'sliders', 'Custom Performance Settings');
+
+        // L1 Cache Size
+        new Setting(customSection)
+            .setName('L1 Cache Size (MB)')
+            .setDesc('Memory cache for hot tiles. Higher = faster but more RAM.')
+            .addSlider(slider => slider
+                .setLimits(20, 150, 10)
+                .setValue(settings.pdf.tilePerformance.l1CacheSizeMB)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.l1CacheSizeMB = value;
+                    getPerformanceSettingsManager().updateSetting('l1CacheSizeMB', value);
+                    await plugin.saveSettings();
+                }));
+
+        // L2 Cache Size
+        new Setting(customSection)
+            .setName('L2 Cache Size (MB)')
+            .setDesc('IndexedDB cache for warm tiles. Higher = more disk usage.')
+            .addSlider(slider => slider
+                .setLimits(50, 500, 25)
+                .setValue(settings.pdf.tilePerformance.l2CacheSizeMB)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.l2CacheSizeMB = value;
+                    getPerformanceSettingsManager().updateSetting('l2CacheSizeMB', value);
+                    await plugin.saveSettings();
+                }));
+
+        // Worker Count (requires restart)
+        new Setting(customSection)
+            .setName('Worker Count (requires restart)')
+            .setDesc('Number of WASM workers. 0 = auto (based on CPU cores).')
+            .addSlider(slider => slider
+                .setLimits(0, 4, 1)
+                .setValue(settings.pdf.tilePerformance.workerCount)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.workerCount = value;
+                    getPerformanceSettingsManager().updateSetting('workerCount', value);
+                    await plugin.saveSettings();
+                    new Notice('Worker count updated. Restart the plugin to apply the new value.');
+                }));
+
+        // Scroll Debounce
+        new Setting(customSection)
+            .setName('Scroll Debounce (ms)')
+            .setDesc('Delay before re-rendering during scroll. Lower = more responsive.')
+            .addSlider(slider => slider
+                .setLimits(8, 100, 4)
+                .setValue(settings.pdf.tilePerformance.scrollDebounceMsOverride)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.scrollDebounceMsOverride = value;
+                    getPerformanceSettingsManager().updateSetting('scrollDebounceMsOverride', value);
+                    await plugin.saveSettings();
+                }));
+
+        // Zoom Debounce
+        new Setting(customSection)
+            .setName('Zoom Debounce (ms)')
+            .setDesc('Delay before final quality render after zoom. Lower = faster.')
+            .addSlider(slider => slider
+                .setLimits(25, 300, 25)
+                .setValue(settings.pdf.tilePerformance.zoomDebounceMs)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.zoomDebounceMs = value;
+                    getPerformanceSettingsManager().updateSetting('zoomDebounceMs', value);
+                    await plugin.saveSettings();
+                }));
+
+        // Prefetch Viewports
+        new Setting(customSection)
+            .setName('Prefetch Viewports')
+            .setDesc('Number of viewports to prefetch ahead during scroll.')
+            .addSlider(slider => slider
+                .setLimits(1, 4, 1)
+                .setValue(settings.pdf.tilePerformance.prefetchViewports)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.prefetchViewports = value;
+                    getPerformanceSettingsManager().updateSetting('prefetchViewports', value);
+                    await plugin.saveSettings();
+                }));
+
+        // Fast Scroll Quality
+        new Setting(customSection)
+            .setName('Fast Scroll Quality (%)')
+            .setDesc('Quality reduction during fast scrolling. Lower = smoother scroll.')
+            .addSlider(slider => slider
+                .setLimits(25, 100, 5)
+                .setValue(Math.round(settings.pdf.tilePerformance.fastScrollQuality * 100))
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.fastScrollQuality = value / 100;
+                    getPerformanceSettingsManager().updateSetting('fastScrollQuality', value / 100);
+                    await plugin.saveSettings();
+                }));
+
+        // Progressive Zoom Toggle
+        new Setting(customSection)
+            .setName('Progressive Zoom')
+            .setDesc('Enable multi-resolution zoom for instant feedback.')
+            .addToggle(toggle => toggle
+                .setValue(settings.pdf.tilePerformance.enableProgressiveZoom)
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.enableProgressiveZoom = value;
+                    getPerformanceSettingsManager().updateSetting('enableProgressiveZoom', value);
+                    await plugin.saveSettings();
+                }));
+
+        // Hybrid Rendering Toggle
+        new Setting(customSection)
+            .setName('Hybrid Rendering')
+            .setDesc('Use full-page rendering at low zoom, tiles at high zoom.')
+            .addToggle(toggle => toggle
+                .setValue(settings.pdf.tilePerformance.enableHybridRendering)
+                .onChange(async (value) => {
+                    settings.pdf.tilePerformance.enableHybridRendering = value;
+                    getPerformanceSettingsManager().updateSetting('enableHybridRendering', value);
+                    await plugin.saveSettings();
+                }));
+    }
 }

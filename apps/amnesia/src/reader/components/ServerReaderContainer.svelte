@@ -80,27 +80,19 @@
     ChevronDown,
   } from 'lucide-svelte';
 
-  // Import the new renderer
+  // Import renderer infrastructure
   import {
-    EpubRenderer,
-    ApiClient,
-    createApiClient,
-    SyncManager,
     getDeviceId,
     HighlightOverlay,
-    HybridBookProvider,
-    createHybridProvider,
-    ProviderAdapter,
-    createProviderAdapter,
     // Unified document provider (replaces HybridPdfProvider)
     HybridDocumentProvider,
     createHybridDocumentProvider,
+    // MuPDF EPUB provider (WASM-only)
+    getSharedMuPDFEpubContentProvider,
     type ReadingLocation,
     type ParsedBook,
     type TocEntry,
     type RendererConfig,
-    type ProviderStatus,
-    type ProviderMode,
     type ContentProvider,
   } from '../renderer';
 
@@ -110,9 +102,8 @@
     type PdfRendererConfig,
   } from '../renderer/pdf';
 
-  // Import the new Shadow DOM renderer (V2)
+  // Import the Shadow DOM renderer
   import { ShadowDOMRenderer } from '../shadow-dom-renderer';
-  import { USE_SHADOW_DOM_RENDERER } from '../renderer-adapter';
 
   // Import reader mode for Source/Live toggle
   import {
@@ -413,6 +404,18 @@
           const src = img.getAttribute('src') || img.getAttribute('data-src');
           if (src && !seenHrefs.has(src)) {
             seenHrefs.add(src);
+            // Extract alt and title attributes for better labeling
+            const alt = img.getAttribute('alt') || undefined;
+            const title = img.getAttribute('title') || undefined;
+            // Try to get figure caption if image is inside a <figure>
+            let figCaption: string | undefined;
+            const figure = img.closest('figure');
+            if (figure) {
+              const caption = figure.querySelector('figcaption');
+              if (caption?.textContent) {
+                figCaption = caption.textContent.trim();
+              }
+            }
             // The src should already be a blob URL from the provider
             imageItems.push({
               id: `img-${imageItems.length}`,
@@ -420,6 +423,8 @@
               blobUrl: src, // Already resolved to blob URL by provider
               spineIndex,
               spineHref: spineItem.href,
+              alt: figCaption || alt, // Prefer figure caption over alt
+              title: title,
             });
           }
         }
@@ -430,12 +435,15 @@
           const href = img.getAttribute('xlink:href') || img.getAttribute('href');
           if (href && !seenHrefs.has(href)) {
             seenHrefs.add(href);
+            // SVG images can have title child elements
+            const titleEl = img.querySelector('title');
             imageItems.push({
               id: `img-${imageItems.length}`,
               href: href,
               blobUrl: href, // Already resolved to blob URL by provider
               spineIndex,
               spineHref: spineItem.href,
+              title: titleEl?.textContent?.trim() || undefined,
             });
           }
         }
@@ -965,13 +973,10 @@
   let rendererContainer: HTMLElement;
 
   // Renderer instances
-  let renderer: EpubRenderer | PdfRenderer | null = null;
-  let apiClient: ApiClient | null = null;
-  let syncManager: SyncManager | null = null;
-  let bookProvider: HybridBookProvider | null = null;
+  let renderer: ShadowDOMRenderer | PdfRenderer | null = null;
   let pdfProvider: HybridDocumentProvider | null = null;
-  let providerAdapter: ProviderAdapter | null = null;
-  let providerStatus: ProviderStatus | null = null;
+  // ContentProvider is the common interface for MuPDFEpubContentProvider
+  let providerAdapter: ContentProvider | null = null;
 
   // Format detection - determined after loading book via book-loader
   let detectedFormat: BookFormat = 'epub';
@@ -1005,6 +1010,7 @@
   // PDF state tracking
   let pdfCurrentPage = 1;
   let pdfTotalPages = 0;
+  let pdfCurrentZoom = 1; // Live zoom level from camera (updated via 'zoomed' event)
 
   // Image lightbox state
   let lightboxOpen = false;
@@ -1199,50 +1205,20 @@
     isCalibreBook = isAbsolutePath(bookPath);
 
     try {
-      // Initialize book provider (hybrid: server + WASM fallback)
+      // Initialize device ID for reading position sync
       const deviceId = getDeviceId();
-      const providerMode: ProviderMode = plugin.settings.serverEnabled ? 'auto' : 'wasm';
+      console.log('[Reader] Device ID:', deviceId);
 
-      // Get WASM path for offline mode (in Obsidian plugin folder)
-      const pluginDir = (plugin.manifest as any).dir || '.obsidian/plugins/amnesia';
-      const wasmPath = `${pluginDir}/epub_processor_bg.wasm`;
-
-      // Load WASM file from vault
-      let wasmSource: ArrayBuffer | undefined;
+      // Initialize MuPDF EPUB provider (WASM-only, no server)
       try {
-        const adapter = plugin.app.vault.adapter;
-        if (adapter && typeof (adapter as any).readBinary === 'function') {
-          wasmSource = await (adapter as any).readBinary(wasmPath);
-          console.log('[Reader] Loaded WASM file:', wasmPath, 'size:', wasmSource?.byteLength);
-        }
-      } catch (e) {
-        console.warn('[Reader] Failed to load WASM file:', e);
-      }
-
-      bookProvider = createHybridProvider({
-        serverUrl: plugin.settings.serverEnabled ? plugin.settings.serverUrl : undefined,
-        deviceId,
-        mode: providerMode,
-        wasmSource,
-        onStatusChange: (status) => {
-          providerStatus = status;
-          console.log('[Reader] Provider status:', status);
-        },
-      });
-
-      // Check provider availability
-      providerStatus = await bookProvider.getStatus();
-      if (providerStatus.active === 'none') {
-        error = 'No book provider available. Enable server connection or ensure your browser supports WebAssembly.';
+        providerAdapter = await getSharedMuPDFEpubContentProvider();
+        console.log('[ServerReader] Successfully initialized MuPDF EPUB provider');
+      } catch (err) {
+        console.error('[ServerReader] Failed to initialize MuPDF EPUB provider:', err);
+        error = 'Failed to initialize EPUB provider. Please ensure WebAssembly is supported.';
         loading = false;
         return;
       }
-
-      // Get API client for sync operations (if server is available)
-      apiClient = bookProvider.getServerClient();
-
-      // Create provider adapter for renderer
-      providerAdapter = createProviderAdapter(bookProvider);
 
       // Wait for container to be ready
       await tick();
@@ -1314,6 +1290,16 @@
         try {
           parsedDocument = await pdfProvider.loadDocument(pdfData, filename);
           console.log('[ServerReader] PDF loaded into provider:', { id: parsedDocument.id, pageCount: parsedDocument.itemCount });
+          
+          // Set document info for Resource Detector (Phase R2.2)
+          // Note: start() is called later after renderer creation to avoid race condition
+          if (plugin.resourceDetector) {
+            const fileSizeMB = pdfData.byteLength / (1024 * 1024);
+            plugin.resourceDetector.setDocumentInfo({
+              pageCount: parsedDocument.itemCount,
+              fileSizeMB,
+            });
+          }
         } catch (e) {
           error = `Failed to parse PDF: ${e instanceof Error ? e.message : String(e)}`;
           loading = false;
@@ -1368,6 +1354,9 @@
         });
         renderer.on('selected', handleSelected);
         renderer.on('highlightClicked', handleHighlightClicked);
+        renderer.on('zoomed', (zoom: number) => {
+          pdfCurrentZoom = zoom;
+        });
 
         // Load PDF document into renderer (document already loaded in provider)
         try {
@@ -1404,6 +1393,8 @@
           // Update PDF page tracking
           pdfTotalPages = totalPages;
           pdfCurrentPage = 1;
+          // Get actual zoom from renderer (may differ from settings if view was restored)
+          pdfCurrentZoom = (renderer as PdfRenderer).getZoom?.() ?? pdfSettings.scale;
 
           // Update sidebar store with current book info (same as EPUB path)
           sidebarStore.setActiveBook(highlightBookId, bookPath, bookTitle);
@@ -1419,6 +1410,11 @@
 
           loading = false;
           console.log('[ServerReader] PDF loaded successfully:', { bookId, pageCount: totalPages });
+          
+          // Start Resource Detector monitoring after successful PDF render (Phase R2.2)
+          if (plugin.resourceDetector) {
+            plugin.resourceDetector.start();
+          }
         } catch (e) {
           error = `Failed to render PDF: ${e instanceof Error ? e.message : String(e)}`;
           loading = false;
@@ -1474,13 +1470,9 @@
         margin: getMarginValue(readerSettings.margins),
       };
 
-      // Create renderer - use new Shadow DOM renderer if feature flag is enabled
-      if (USE_SHADOW_DOM_RENDERER) {
-        console.log('[ServerReader] Using new Shadow DOM Renderer (V2)');
-        renderer = new ShadowDOMRenderer(rendererContainer, providerAdapter!, rendererConfig) as unknown as EpubRenderer;
-      } else {
-        renderer = new EpubRenderer(rendererContainer, providerAdapter!, rendererConfig);
-      }
+      // Create Shadow DOM renderer
+      console.log('[ServerReader] Using Shadow DOM Renderer');
+      renderer = new ShadowDOMRenderer(rendererContainer, providerAdapter!, rendererConfig);
 
       // Set up event handlers
       renderer.on('relocated', handleRelocated);
@@ -1519,20 +1511,6 @@
 
       // Load book in renderer
       await renderer.load(bookId);
-
-      // Initialize sync manager only if server is available
-      if (apiClient && providerStatus?.server) {
-        syncManager = new SyncManager(apiClient, {
-          deviceId,
-          syncInterval: (plugin.settings.syncInterval || 0) * 60 * 1000,
-          onStatusChange: (status) => {
-            // Status change logged only in debug mode
-          },
-        });
-        await syncManager.initialize(bookId);
-      } else {
-        console.log('[Reader] Sync manager disabled - using offline WASM mode');
-      }
 
       // highlightBookId was already set early (before renderer creation)
       console.log('[ServerReader] Book loaded', {
@@ -1710,9 +1688,17 @@
     calibreStoreUnsubscribe?.();
 
     // Clean up
-    syncManager?.stop();
     renderer?.destroy();
     pdfProvider?.destroy?.(); // PDF provider cleanup if available
+    // EPUB provider cleanup (MuPDFEpubContentProvider has caches that need clearing)
+    if (providerAdapter && 'destroy' in providerAdapter) {
+      (providerAdapter as { destroy: () => void }).destroy();
+    }
+
+    // Stop Resource Detector monitoring (Phase R2.2)
+    if (plugin.resourceDetector) {
+      plugin.resourceDetector.stop();
+    }
   });
 
   // Event handlers
@@ -2167,9 +2153,6 @@
       renderer.addHighlight(highlight.id, highlight.id, event.detail.color, pendingSelection.rects);
     }
 
-    // Sync to server
-    syncManager?.create('annotation', highlight.id, highlight);
-
     closePopup();
 
     if (readerSettings.hapticFeedback) HapticFeedback.success();
@@ -2184,8 +2167,6 @@
 
     // Remove from renderer overlay
     renderer?.removeHighlight(highlightId);
-
-    syncManager?.delete('annotation', highlightId);
 
     closePopup();
 
@@ -2250,9 +2231,6 @@
     if (updates.color && renderer) {
       renderer.updateHighlightColor(id, updates.color);
     }
-
-    // Sync to server
-    syncManager?.update('annotation', id, updatedHighlight);
 
     if (readerSettings.hapticFeedback) HapticFeedback.light();
   }
@@ -2511,9 +2489,6 @@
       // Remove from renderer overlay immediately
       renderer?.removeHighlight(highlightId);
 
-      // Sync deletion
-      syncManager?.delete('annotation', highlightId);
-
       if (readerSettings.hapticFeedback) HapticFeedback.light();
     } catch (e) {
       console.error('Failed to delete highlight:', e);
@@ -2628,13 +2603,21 @@
 
   function handlePdfZoomIn() {
     if (!isPdf || !renderer) return;
-    const newScale = Math.min(plugin.settings.pdf.scale + 0.25, 4);
+    // Use logarithmic zoom steps for better UX at high zoom levels
+    // Read from pdfCurrentZoom (live camera state) not settings
+    const currentScale = pdfCurrentZoom;
+    const step = currentScale < 2 ? 0.25 : currentScale < 8 ? 0.5 : 1;
+    const newScale = Math.min(currentScale + step, 32);
     handlePdfSettingsChange({ detail: { settings: { scale: newScale } } } as CustomEvent);
   }
 
   function handlePdfZoomOut() {
     if (!isPdf || !renderer) return;
-    const newScale = Math.max(plugin.settings.pdf.scale - 0.25, 0.25);
+    // Use logarithmic zoom steps for better UX at high zoom levels
+    // Read from pdfCurrentZoom (live camera state) not settings
+    const currentScale = pdfCurrentZoom;
+    const step = currentScale <= 2 ? 0.25 : currentScale <= 8 ? 0.5 : 1;
+    const newScale = Math.max(currentScale - step, 0.1);
     handlePdfSettingsChange({ detail: { settings: { scale: newScale } } } as CustomEvent);
   }
 
@@ -3038,7 +3021,7 @@
           <button class="icon-button" on:click|stopPropagation={handlePdfZoomOut} title="Zoom out (-)">
             <ZoomOut size={18} />
           </button>
-          <span class="zoom-display">{Math.round(pdfSettings.scale * 100)}%</span>
+          <span class="zoom-display">{Math.round(pdfCurrentZoom * 100)}%</span>
           <button class="icon-button" on:click|stopPropagation={handlePdfZoomIn} title="Zoom in (+)">
             <ZoomIn size={18} />
           </button>

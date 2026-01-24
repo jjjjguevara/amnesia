@@ -15,6 +15,7 @@
 // Import types only - the actual module is loaded dynamically
 // @ts-ignore - mupdf types are available but moduleResolution needs bundler
 import type * as MuPDFTypes from 'mupdf';
+import { ZipReader } from './shared/zip-reader';
 
 // MuPDF is loaded dynamically after receiving WASM binary
 // @ts-ignore - mupdf types are available but moduleResolution needs bundler
@@ -111,7 +112,7 @@ export type DocumentWorkerResponse =
   | { type: 'LOADED'; requestId: string; document: ParsedDocument; success: true }
   | { type: 'LOAD_ERROR'; requestId: string; error: string; success: false }
   | { type: 'ITEM_RENDERED'; requestId: string; itemIndex: number; data: Uint8Array; width: number; height: number }
-  | { type: 'TILE_RENDERED'; requestId: string; itemIndex: number; tileX: number; tileY: number; data: Uint8Array; width: number; height: number }
+  | { type: 'TILE_RENDERED'; requestId: string; itemIndex: number; tileX: number; tileY: number; data: Uint8Array; width: number; height: number; timing?: WorkerTiming }
   | { type: 'TILE_RENDER_ERROR'; requestId: string; itemIndex: number; tileX: number; tileY: number; error: string }
   | { type: 'RENDER_ERROR'; requestId: string; itemIndex: number; error: string }
   | { type: 'STRUCTURED_TEXT'; requestId: string; itemIndex: number; data: StructuredText }
@@ -135,6 +136,18 @@ interface CachedDocument {
   doc: any; // MuPDF Document
   format: DocumentFormat;
   metadata: ParsedDocument;
+  /** Original EPUB data for direct ZIP parsing */
+  epubData?: ArrayBuffer;
+  /** Parsed EPUB structure */
+  epubStructure?: EpubStructure;
+}
+
+/** Parsed EPUB internal structure */
+interface EpubStructure {
+  opfPath: string;
+  spine: string[]; // hrefs of chapters in reading order
+  manifest: Map<string, { href: string; mediaType: string }>;
+  basePath: string;
 }
 
 const documents = new Map<string, CachedDocument>();
@@ -177,6 +190,166 @@ function getMimeType(format: DocumentFormat): string {
 }
 
 // ============================================================================
+// EPUB Structure Parsing
+// ============================================================================
+
+/**
+ * Parse EPUB structure from ZIP data.
+ * Reads container.xml -> OPF -> extracts spine and manifest.
+ */
+async function parseEpubStructure(data: ArrayBuffer): Promise<EpubStructure> {
+  const zip = new ZipReader(data);
+
+  // Step 1: Read container.xml to find OPF path
+  const containerXml = await zip.readText('META-INF/container.xml');
+  const opfPath = extractOpfPath(containerXml);
+
+  if (!opfPath) {
+    throw new Error('Could not find OPF path in container.xml');
+  }
+
+  // Determine base path for relative URLs in OPF
+  const basePath = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+  // Step 2: Read and parse OPF
+  const opfXml = await zip.readText(opfPath);
+  const { spine, manifest } = parseOpf(opfXml);
+
+  return {
+    opfPath,
+    spine,
+    manifest,
+    basePath,
+  };
+}
+
+/**
+ * Extract OPF path from container.xml using regex (lightweight parsing)
+ */
+function extractOpfPath(containerXml: string): string | null {
+  // Look for: <rootfile full-path="..." media-type="application/oebps-package+xml"/>
+  const match = containerXml.match(/full-path\s*=\s*["']([^"']+)["']/i);
+  return match ? match[1] : null;
+}
+
+/**
+ * Parse OPF to extract spine (reading order) and manifest
+ */
+function parseOpf(opfXml: string): { spine: string[]; manifest: Map<string, { href: string; mediaType: string }> } {
+  const manifest = new Map<string, { href: string; mediaType: string }>();
+  const spine: string[] = [];
+
+  // Parse manifest items
+  // <item id="..." href="..." media-type="..."/>
+  const itemRegex = /<item\s+([^>]+)\/?\s*>/gi;
+  let itemMatch;
+  while ((itemMatch = itemRegex.exec(opfXml)) !== null) {
+    const attrs = itemMatch[1];
+    const id = extractAttr(attrs, 'id');
+    const href = extractAttr(attrs, 'href');
+    const mediaType = extractAttr(attrs, 'media-type');
+
+    if (id && href) {
+      manifest.set(id, { href, mediaType: mediaType || 'application/xhtml+xml' });
+    }
+  }
+
+  // Parse spine itemrefs
+  // <itemref idref="..."/>
+  const itemrefRegex = /<itemref\s+([^>]+)\/?\s*>/gi;
+  let itemrefMatch;
+  while ((itemrefMatch = itemrefRegex.exec(opfXml)) !== null) {
+    const attrs = itemrefMatch[1];
+    const idref = extractAttr(attrs, 'idref');
+
+    if (idref) {
+      const item = manifest.get(idref);
+      if (item) {
+        spine.push(item.href);
+      }
+    }
+  }
+
+  return { spine, manifest };
+}
+
+/**
+ * Extract attribute value from HTML/XML attribute string
+ */
+function extractAttr(attrStr: string, name: string): string | null {
+  const regex = new RegExp(`${name}\\s*=\\s*["']([^"']+)["']`, 'i');
+  const match = attrStr.match(regex);
+  return match ? decodeXmlEntities(match[1]) : null;
+}
+
+/**
+ * Decode common XML entities
+ */
+function decodeXmlEntities(str: string): string {
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+/**
+ * Sanitize a path to prevent traversal attacks
+ *
+ * Security: URL decoding is performed BEFORE traversal checks to prevent
+ * bypasses via encoded sequences like %2e%2e%2f (../)
+ */
+function sanitizeEpubPath(basePath: string, relativePath: string): string {
+  // Normalize path separators first
+  let normalized = relativePath.replace(/\\/g, '/');
+
+  // URL-decode the path FIRST to catch encoded traversal attempts
+  // (e.g., %2e%2e%2f would decode to ../)
+  try {
+    normalized = decodeURIComponent(normalized);
+  } catch {
+    // If decoding fails, log warning and continue with original
+    console.warn(`[EPUB Worker] Invalid URL encoding in path: ${relativePath}`);
+  }
+
+  // Re-normalize after decoding (in case decoding introduced backslashes)
+  normalized = normalized.replace(/\\/g, '/');
+
+  // Reject path traversal attempts AFTER decoding
+  if (normalized.includes('../') || normalized.startsWith('/') || normalized.includes('..\\')) {
+    throw new Error(`Invalid EPUB path: traversal attempt detected in "${relativePath}"`);
+  }
+
+  // Reject paths with null bytes (another common attack vector)
+  if (normalized.includes('\0')) {
+    throw new Error(`Invalid EPUB path: null byte detected in "${relativePath}"`);
+  }
+
+  return basePath + normalized;
+}
+
+/**
+ * Read EPUB chapter content directly from ZIP
+ */
+async function readEpubChapter(data: ArrayBuffer, structure: EpubStructure, chapterIndex: number): Promise<string> {
+  if (chapterIndex < 0 || chapterIndex >= structure.spine.length) {
+    throw new Error(`Invalid chapter index: ${chapterIndex}. EPUB has ${structure.spine.length} chapters.`);
+  }
+
+  const chapterHref = structure.spine[chapterIndex];
+  // Use sanitized path to prevent traversal attacks
+  const fullPath = sanitizeEpubPath(structure.basePath, chapterHref);
+
+  const zip = new ZipReader(data);
+  const xhtml = await zip.readText(fullPath);
+
+  return xhtml;
+}
+
+// ============================================================================
 // Document Operations
 // ============================================================================
 
@@ -193,6 +366,10 @@ function loadDocument(id: string, data: ArrayBuffer, filename?: string): ParsedD
 
   const format = detectFormat(data, filename);
   const mimeType = getMimeType(format);
+
+  // Copy EPUB data BEFORE passing to MuPDF (MuPDF may consume/transfer the buffer)
+  const epubData = format === 'epub' ? data.slice(0) : undefined;
+
   const doc = mupdf.Document.openDocument(data, mimeType);
 
   // Extract metadata
@@ -244,7 +421,7 @@ function loadDocument(id: string, data: ArrayBuffer, filename?: string): ParsedD
     hasTextLayer,
   };
 
-  documents.set(id, { doc, format, metadata: parsed });
+  documents.set(id, { doc, format, metadata: parsed, epubData });
   return parsed;
 }
 
@@ -278,22 +455,65 @@ function renderItem(
 
   const page = cached.doc.loadPage(itemIndex);
   let pixmap: any = null;
+  let device: any = null;
 
   try {
-    const matrix = mupdf.Matrix.scale(scale, scale);
-    pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, true, true);
+    const bounds = page.getBounds();
+    const pageWidth = bounds[2] - bounds[0];
+    const pageHeight = bounds[3] - bounds[1];
+
+    // PERF FIX: Cap output dimensions to prevent OOM on full-page renders.
+    // At scale 32 with US Letter (612×792), output would be 19584×25344 = ~2GB.
+    // Cap to 4096px max dimension (still high quality for most use cases).
+    // This matches the approach used in renderTile but with larger limit for full pages.
+    const MAX_OUTPUT_DIM = 4096;
+    const rawOutputWidth = Math.ceil(pageWidth * scale);
+    const rawOutputHeight = Math.ceil(pageHeight * scale);
+
+    // If output would exceed max, reduce effective scale
+    const dimensionScale = Math.min(
+      MAX_OUTPUT_DIM / rawOutputWidth,
+      MAX_OUTPUT_DIM / rawOutputHeight,
+      1.0 // Don't increase scale
+    );
+
+    const outputWidth = Math.ceil(rawOutputWidth * dimensionScale);
+    const outputHeight = Math.ceil(rawOutputHeight * dimensionScale);
+    const effectiveScale = scale * dimensionScale;
+
+    const bbox: [number, number, number, number] = [0, 0, outputWidth, outputHeight];
+    pixmap = new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB, bbox, true);
+    pixmap.clear(255); // Fill with white background
+
+    device = new mupdf.DrawDevice(mupdf.Matrix.identity, pixmap);
+    // Scale the page to output size
+    // Use effectiveScale (capped) instead of raw scale to prevent OOM
+    const matrix = mupdf.Matrix.scale(effectiveScale, effectiveScale);
+
+    page.run(device, matrix);
+    device.close();
+
     const pngData = pixmap.asPNG();
 
     return {
       data: pngData,
-      width: pixmap.getWidth(),
-      height: pixmap.getHeight(),
+      width: outputWidth,
+      height: outputHeight,
     };
   } finally {
     // Ensure cleanup even if an error occurs
+    try { device?.destroy(); } catch { /* ignore */ }
     try { pixmap?.destroy(); } catch { /* ignore */ }
     try { page.destroy(); } catch { /* ignore */ }
   }
+}
+
+/** Worker timing data for pipeline telemetry */
+export interface WorkerTiming {
+  pageLoad: number;
+  render: number;
+  encode: number;
+  total: number;
 }
 
 function renderTile(
@@ -303,13 +523,19 @@ function renderTile(
   tileY: number,
   tileSize: number,
   scale: number
-): { data: Uint8Array; width: number; height: number } {
+): { data: Uint8Array; width: number; height: number; timing: WorkerTiming } {
+  const startTotal = performance.now();
+
   const cached = documents.get(id);
   if (!cached) {
     throw new Error(`Document ${id} not loaded`);
   }
 
+  // Time page load
+  const startPageLoad = performance.now();
   const page = cached.doc.loadPage(itemIndex);
+  const pageLoadTime = performance.now() - startPageLoad;
+
   let pixmap: any = null;
   let device: any = null;
 
@@ -338,19 +564,32 @@ function renderTile(
     pixmap.clear(255);
 
     device = new mupdf.DrawDevice(mupdf.Matrix.identity, pixmap);
+    // Translate to tile origin, then scale
     const translateMatrix = mupdf.Matrix.translate(-originX, -originY);
     const scaleMatrix = mupdf.Matrix.scale(scale, scale);
     const matrix = mupdf.Matrix.concat(translateMatrix, scaleMatrix);
 
+    // Time render
+    const startRender = performance.now();
     page.run(device, matrix);
     device.close();
+    const renderTime = performance.now() - startRender;
 
+    // Time encode
+    const startEncode = performance.now();
     const pngData = pixmap.asPNG();
+    const encodeTime = performance.now() - startEncode;
 
     return {
       data: pngData,
       width: outputWidth,
       height: outputHeight,
+      timing: {
+        pageLoad: pageLoadTime,
+        render: renderTime,
+        encode: encodeTime,
+        total: performance.now() - startTotal,
+      },
     };
   } finally {
     // Ensure cleanup even if an error occurs
@@ -543,11 +782,11 @@ function getItemDimensions(id: string, itemIndex: number): { width: number; heig
 }
 
 /**
- * Get EPUB chapter XHTML content.
- * Note: This requires MuPDF's archive access which may not be fully exposed.
- * Falls back to rendering the page as text if archive access isn't available.
+ * Get EPUB chapter XHTML content using direct ZIP extraction.
+ * This bypasses MuPDF's text extraction (which doesn't work for EPUBs)
+ * and reads the original XHTML directly from the EPUB ZIP archive.
  */
-function getEpubChapter(id: string, chapterIndex: number): string {
+async function getEpubChapter(id: string, chapterIndex: number): Promise<string> {
   const cached = documents.get(id);
   if (!cached) {
     throw new Error(`Document ${id} not loaded`);
@@ -557,45 +796,22 @@ function getEpubChapter(id: string, chapterIndex: number): string {
     throw new Error('getEpubChapter is only available for EPUB documents');
   }
 
-  // MuPDF's Node.js/WASM API may not expose direct archive access
-  // For now, extract text content as a fallback
-  // TODO: If mupdf-js exposes archive access, use it here
-  const page = cached.doc.loadPage(chapterIndex);
-  const stext = page.toStructuredText('preserve-whitespace');
-
-  // Build basic HTML from structured text
-  let html = '<html><head><meta charset="utf-8"></head><body>';
-
-  const blocks: string[] = [];
-  let currentBlock = '';
-
-  stext.walk({
-    beginLine() {
-      // Start of a new line
-    },
-    onChar(c: string) {
-      currentBlock += c;
-    },
-    endLine() {
-      if (currentBlock.trim()) {
-        blocks.push(`<p>${escapeHtml(currentBlock)}</p>`);
-      }
-      currentBlock = '';
-    },
-  });
-
-  // Flush any remaining content
-  if (currentBlock.trim()) {
-    blocks.push(`<p>${escapeHtml(currentBlock)}</p>`);
+  if (!cached.epubData) {
+    throw new Error('EPUB data not available. Document may have been loaded incorrectly.');
   }
 
-  html += blocks.join('\n');
-  html += '</body></html>';
+  // Parse EPUB structure lazily (first access parses and caches)
+  if (!cached.epubStructure) {
+    console.log('[Document Worker] Parsing EPUB structure...');
+    cached.epubStructure = await parseEpubStructure(cached.epubData);
+    console.log(`[Document Worker] EPUB has ${cached.epubStructure.spine.length} chapters in spine`);
+  }
 
-  stext.destroy();
-  page.destroy();
+  // Read chapter content directly from ZIP
+  const xhtml = await readEpubChapter(cached.epubData, cached.epubStructure, chapterIndex);
+  console.log(`[Document Worker] Read chapter ${chapterIndex}: ${xhtml.length} chars`);
 
-  return html;
+  return xhtml;
 }
 
 function escapeHtml(text: string): string {
@@ -659,7 +875,7 @@ function handleRequest(request: DocumentWorkerRequest): void {
       }
 
       case 'RENDER_TILE': {
-        const { data, width, height } = renderTile(
+        const { data, width, height, timing } = renderTile(
           request.docId,
           request.itemIndex,
           request.tileX,
@@ -676,6 +892,7 @@ function handleRequest(request: DocumentWorkerRequest): void {
           data,
           width,
           height,
+          timing,
         };
         (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(
           message,
@@ -735,13 +952,25 @@ function handleRequest(request: DocumentWorkerRequest): void {
       }
 
       case 'GET_EPUB_CHAPTER': {
-        const xhtml = getEpubChapter(request.docId, request.chapterIndex);
-        self.postMessage({
-          type: 'EPUB_CHAPTER',
-          requestId: request.requestId,
-          chapterIndex: request.chapterIndex,
-          xhtml,
-        } as DocumentWorkerResponse);
+        // Async handler for EPUB chapter extraction
+        getEpubChapter(request.docId, request.chapterIndex)
+          .then((xhtml) => {
+            self.postMessage({
+              type: 'EPUB_CHAPTER',
+              requestId: request.requestId,
+              chapterIndex: request.chapterIndex,
+              xhtml,
+            } as DocumentWorkerResponse);
+          })
+          .catch((error) => {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            self.postMessage({
+              type: 'EPUB_CHAPTER_ERROR',
+              requestId: request.requestId,
+              chapterIndex: request.chapterIndex,
+              error: errorMessage,
+            } as DocumentWorkerResponse);
+          });
         break;
       }
 

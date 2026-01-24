@@ -1,12 +1,18 @@
 /**
  * Library scanner for EPUB files in the vault
  *
- * Uses the Amnesia server API for EPUB parsing instead of epub.js.
+ * NOTE: This scanner requires server infrastructure that was removed.
+ * Scanning will fail until reimplemented with HybridDocumentProvider.
+ * Use the Library service's metadata extraction instead.
  */
 import { App, TFile, TFolder } from 'obsidian';
 import { Book, BookStatus } from './types';
 import { v4 as uuidv4 } from 'uuid';
-import { ApiClient, createApiClient, getApiClient } from '../reader/renderer';
+
+// Stub - server infrastructure removed, scanner non-functional
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ApiClient = any;
+const createApiClient = (_config: unknown): ApiClient => null;
 
 export interface ScanResult {
   books: Book[];
