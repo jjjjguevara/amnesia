@@ -110,6 +110,15 @@ export interface RenderResult {
   scaleEpoch?: number;
   /** Render parameters identity hash (INV-6: Scale/Layout Atomicity). */
   renderParamsId?: string;
+  /**
+   * amnesia-e4i FIX: The actual tile coordinates of the fallback tile.
+   * When a fallback is used, this contains the tile coordinates that map to
+   * the actual PDF region in the bitmap. The compositing code MUST use these
+   * coordinates (not the original request coordinates) for correct positioning.
+   *
+   * If undefined, the original request tile coordinates should be used.
+   */
+  fallbackTile?: import('./tile-render-engine').TileCoordinate;
 }
 
 /** Render mode */
@@ -873,6 +882,7 @@ export class RenderCoordinator {
           this.queueBackgroundRender(request);
 
           // Return fallback immediately for display
+          // amnesia-e4i: Include fallbackTile for correct compositing position
           return {
             success: true,
             data: fallback.bitmap,
@@ -880,6 +890,7 @@ export class RenderCoordinator {
             isFallback: true,
             actualScale: fallback.actualScale,
             cssStretch: fallback.cssStretch,
+            fallbackTile: fallback.fallbackTile,
           };
         }
       }
@@ -1234,6 +1245,7 @@ export class RenderCoordinator {
       if (request.type === 'tile') {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
         if (fallback) {
+          // amnesia-e4i: Include fallbackTile for correct compositing position
           return {
             success: true,
             data: fallback.bitmap,
@@ -1241,6 +1253,7 @@ export class RenderCoordinator {
             isFallback: true,
             actualScale: fallback.actualScale,
             cssStretch: fallback.cssStretch,
+            fallbackTile: fallback.fallbackTile,
           };
         }
       }
@@ -1292,6 +1305,7 @@ export class RenderCoordinator {
       if (request.type === 'tile') {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
         if (fallback) {
+          // amnesia-e4i: Include fallbackTile for correct compositing position
           return {
             success: true,
             data: fallback.bitmap,
@@ -1299,6 +1313,7 @@ export class RenderCoordinator {
             isFallback: true,
             actualScale: fallback.actualScale,
             cssStretch: fallback.cssStretch,
+            fallbackTile: fallback.fallbackTile,
           };
         }
       }
@@ -1317,6 +1332,7 @@ export class RenderCoordinator {
         if (request.type === 'tile') {
           const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
           if (fallback) {
+            // amnesia-e4i: Include fallbackTile for correct compositing position
             return {
               success: true,
               data: fallback.bitmap,
@@ -1324,6 +1340,7 @@ export class RenderCoordinator {
               isFallback: true,
               actualScale: fallback.actualScale,
               cssStretch: fallback.cssStretch,
+              fallbackTile: fallback.fallbackTile,
             };
           }
         }

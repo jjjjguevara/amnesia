@@ -1367,10 +1367,17 @@ export class TileCacheManager {
    async getBestAvailable(
     tile: TileCoordinate,
     tileSize: number = 256
-  ): Promise<{ data: CachedTileData; actualScale: number; cssStretch: number } | null> {
+  ): Promise<{
+    data: CachedTileData;
+    actualScale: number;
+    cssStretch: number;
+    /** amnesia-e4i: The actual tile coordinates used (for correct compositing) */
+    fallbackTile?: TileCoordinate;
+  } | null> {
     // First, check if exact scale is available
     const exactData = this.getCachedData(tile);
     if (exactData) {
+      // Exact match - no fallback needed, use original tile coords
       return { data: exactData, actualScale: tile.scale, cssStretch: 1 };
     }
 
@@ -1385,14 +1392,45 @@ export class TileCacheManager {
     const pdfX = tile.tileX * pdfTileSize;
     const pdfY = tile.tileY * pdfTileSize;
 
-    // Helper: find the tile at a given scale that covers the same PDF position
-    const getTileAtScaleForPdfPosition = (scaleTier: number): TileCoordinate => {
-      // amnesia-e4i FIX: Use effectiveTileSize (from tile.tileSize or parameter)
-      const fallbackPdfTileSize = effectiveTileSize / scaleTier;
-      const fallbackTileX = Math.floor(pdfX / fallbackPdfTileSize);
-      const fallbackTileY = Math.floor(pdfY / fallbackPdfTileSize);
-      // amnesia-e4i FIX: Include tileSize so render uses matching size
-      return { page: tile.page, tileX: fallbackTileX, tileY: fallbackTileY, scale: scaleTier, tileSize: effectiveTileSize };
+    // amnesia-e4i CRITICAL FIX: Fallback tiles may have been rendered with DIFFERENT
+    // tileSizes than the current request. When looking up fallbacks, we must try ALL
+    // possible tileSizes (128, 256, 512) since we don't know what zoom level was active
+    // when the fallback tile was rendered.
+    //
+    // Example: Current tile at scale 32 with tileSize 256 covers PDF (72, 160).
+    // We look for fallback at scale 16, but that tile was rendered at zoom 16 with
+    // tileSize 512. The cache key is different:
+    // - Looking for: p1-t4x10-s16-ts256 (wrong - doesn't exist)
+    // - Actual:      p1-t2x5-s16-ts512  (correct - this is what was cached)
+    //
+    // FIX: Try all possible tileSizes for each scale tier.
+    const POSSIBLE_TILE_SIZES = [512, 256, 128]; // Prefer larger tiles (better quality)
+
+    // Helper: find cached tile at given scale+tileSize that covers the same PDF position
+    const findCachedTileForPdfPosition = (
+      scaleTier: number
+    ): { tile: TileCoordinate; data: CachedTileData } | null => {
+      // Try each possible tileSize the fallback might have been rendered with
+      for (const fallbackTileSize of POSSIBLE_TILE_SIZES) {
+        const fallbackPdfTileSize = fallbackTileSize / scaleTier;
+        const fallbackTileX = Math.floor(pdfX / fallbackPdfTileSize);
+        const fallbackTileY = Math.floor(pdfY / fallbackPdfTileSize);
+        
+        // Create lookup with the fallback's ACTUAL tileSize (for correct cache key)
+        const fallbackTile: TileCoordinate = {
+          page: tile.page,
+          tileX: fallbackTileX,
+          tileY: fallbackTileY,
+          scale: scaleTier,
+          tileSize: fallbackTileSize, // Use fallback's tileSize, not original!
+        };
+        
+        const fallbackData = this.getCachedData(fallbackTile);
+        if (fallbackData) {
+          return { tile: fallbackTile, data: fallbackData };
+        }
+      }
+      return null;
     };
 
     // ZOOM-OUT FIX: Check for HIGHER scales first (can be CSS-downscaled)
@@ -1403,20 +1441,21 @@ export class TileCacheManager {
       if (scaleTier <= tile.scale) continue; // Skip scales at or below requested
 
       // COORDINATE FIX (amnesia-e4i): Find the tile at this scale that covers the SAME PDF position
-      const fallbackTile = getTileAtScaleForPdfPosition(scaleTier);
-      const fallbackData = this.getCachedData(fallbackTile);
-      if (fallbackData) {
+      const found = findCachedTileForPdfPosition(scaleTier);
+      if (found) {
         // cssStretch < 1 means downscale (e.g., have scale 16, need 8 → stretch 0.5)
         const cssStretch = tile.scale / scaleTier;
         
         // Log when fallback tile indices differ from requested (indicates the fix is working)
-        if (fallbackTile.tileX !== tile.tileX || fallbackTile.tileY !== tile.tileY) {
-          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale} ` +
-            `→ using (${fallbackTile.tileX},${fallbackTile.tileY})@s${scaleTier} ` +
+        if (found.tile.tileX !== tile.tileX || found.tile.tileY !== tile.tileY ||
+            found.tile.tileSize !== effectiveTileSize) {
+          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale}/ts${effectiveTileSize} ` +
+            `→ using (${found.tile.tileX},${found.tile.tileY})@s${scaleTier}/ts${found.tile.tileSize} ` +
             `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
         }
         
-        return { data: fallbackData, actualScale: scaleTier, cssStretch };
+        // amnesia-e4i: Include fallbackTile so compositing can position correctly
+        return { data: found.data, actualScale: scaleTier, cssStretch, fallbackTile: found.tile };
       }
     }
 
@@ -1426,20 +1465,21 @@ export class TileCacheManager {
       if (scaleTier >= tile.scale) continue; // Skip scales at or above requested
 
       // COORDINATE FIX (amnesia-e4i): Find the tile at this scale that covers the SAME PDF position
-      const fallbackTile = getTileAtScaleForPdfPosition(scaleTier);
-      const fallbackData = this.getCachedData(fallbackTile);
-      if (fallbackData) {
+      const found = findCachedTileForPdfPosition(scaleTier);
+      if (found) {
         // cssStretch > 1 means upscale (e.g., have scale 4, need 8 → stretch 2)
         const cssStretch = tile.scale / scaleTier;
         
         // Log when fallback tile indices differ from requested (indicates the fix is working)
-        if (fallbackTile.tileX !== tile.tileX || fallbackTile.tileY !== tile.tileY) {
-          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale} ` +
-            `→ using (${fallbackTile.tileX},${fallbackTile.tileY})@s${scaleTier} ` +
+        if (found.tile.tileX !== tile.tileX || found.tile.tileY !== tile.tileY ||
+            found.tile.tileSize !== effectiveTileSize) {
+          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale}/ts${effectiveTileSize} ` +
+            `→ using (${found.tile.tileX},${found.tile.tileY})@s${scaleTier}/ts${found.tile.tileSize} ` +
             `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
         }
         
-        return { data: fallbackData, actualScale: scaleTier, cssStretch };
+        // amnesia-e4i: Include fallbackTile so compositing can position correctly
+        return { data: found.data, actualScale: scaleTier, cssStretch, fallbackTile: found.tile };
       }
     }
 
@@ -1460,10 +1500,16 @@ export class TileCacheManager {
    * @param tileSize Optional tile size in pixels (default 256)
    * @returns ImageBitmap and metadata, or null if nothing cached
    */
-  async getBestAvailableBitmap(
+   async getBestAvailableBitmap(
     tile: TileCoordinate,
     tileSize: number = 256
-  ): Promise<{ bitmap: ImageBitmap; actualScale: number; cssStretch: number } | null> {
+  ): Promise<{
+    bitmap: ImageBitmap;
+    actualScale: number;
+    cssStretch: number;
+    /** amnesia-e4i: The actual tile coordinates for the fallback (for correct compositing) */
+    fallbackTile?: TileCoordinate;
+  } | null> {
     // amnesia-e4i FIX: Use tile.tileSize if available for correct PDF position calculation
     const effectiveTileSize = tile.tileSize ?? tileSize;
     
@@ -1472,7 +1518,9 @@ export class TileCacheManager {
     if (result) {
       try {
         const bitmap = await this.createBitmapFromCachedData(result.data);
-        return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch };
+        // amnesia-e4i FIX: Include fallbackTile when tile coordinates differ
+        const fallbackTile = result.fallbackTile;
+        return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch, fallbackTile };
       } catch (error) {
         console.warn('[TileCacheManager] Failed to create bitmap from best available:', error);
         // Fall through to full-page fallback

@@ -3401,8 +3401,26 @@ export class PdfInfiniteCanvas {
           // Runtime check ensures type safety (RenderCoordinator decodes Blobs off main thread)
           // Extract cssStretch from fallback results for proper CSS sizing
           // INV-6: Include scaleEpoch/renderParamsId for display-time validation
+          //
+          // amnesia-e4i CRITICAL FIX: Use fallbackTile for positioning when available!
+          // When a fallback tile is used, its coordinates (tileX, tileY, tileSize) map to
+          // the actual PDF region in the bitmap. Using the original request tile's coordinates
+          // would position the content at the WRONG location, causing visual corruption.
+          const tileForCompositing = result.fallbackTile ?? tiles[i];
+          
+          // Log when fallback tile coordinates differ (indicates the fix is working)
+          if (result.fallbackTile && (
+            result.fallbackTile.tileX !== tiles[i].tileX ||
+            result.fallbackTile.tileY !== tiles[i].tileY ||
+            result.fallbackTile.tileSize !== tiles[i].tileSize
+          )) {
+            console.log(`[amnesia-e4i] Using fallbackTile for compositing: ` +
+              `requested (${tiles[i].tileX},${tiles[i].tileY})/ts${tiles[i].tileSize} → ` +
+              `actual (${result.fallbackTile.tileX},${result.fallbackTile.tileY})/ts${result.fallbackTile.tileSize}`);
+          }
+          
           tileImages.push({
-            tile: tiles[i],
+            tile: tileForCompositing,
             bitmap: result.data,
             cssStretch: result.cssStretch, // May be undefined for exact-scale tiles
             scaleEpoch: result.scaleEpoch,
