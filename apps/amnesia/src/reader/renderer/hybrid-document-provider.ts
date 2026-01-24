@@ -1,69 +1,53 @@
 /**
  * Hybrid Document Provider
  *
- * Unified provider for PDF and EPUB document handling, combining server and WASM capabilities.
+ * Unified provider for PDF and EPUB document handling using MuPDF WASM.
  * Provides a single interface for loading, rendering, and searching across both document formats.
  *
  * Features:
  * - Format-agnostic document operations
- * - Automatic server/WASM mode selection
  * - Two-tier caching (Memory + IndexedDB)
  * - Prefetching for adjacent pages/chapters
- * - Offline support via WASM
+ * - Offline-capable via WASM
  *
  * @example
  * ```typescript
- * const provider = new HybridDocumentProvider({
- *   serverBaseUrl: 'http://localhost:3000',
- * });
- *
- * await provider.initialize();
+ * const provider = await createHybridDocumentProvider({ pluginPath: '...' });
  * const doc = await provider.loadDocument(pdfOrEpubData, 'document.pdf');
  * const pageBlob = await provider.renderItem(doc.id, 0, { scale: 1.5 });
  * ```
  */
 
-import { ApiClient, getApiClient } from './api-client';
 import { DocumentBridge, getSharedDocumentBridge, destroySharedDocumentBridge } from './document-bridge';
 import type { ParsedDocument, StructuredText, SearchResult, DocumentFormat } from './document-worker';
 import { getTileEngine, type TileCoordinate } from './pdf/tile-render-engine';
 import { getRenderCoordinator, type RenderCoordinator } from './pdf/render-coordinator';
+import { getTargetScaleTier, SCALE_TIERS } from './pdf/progressive-tile-renderer';
 import type { ParsedPdf, PdfTextLayerData, TocEntry } from './types';
 import type { PdfContentProvider } from './pdf/pdf-renderer';
+import {
+  getThumbnailIdbCache,
+  generateDocumentHash,
+  imageToWebPBlob,
+  blobToImageBitmap,
+} from './pdf/thumbnail-idb-cache';
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export type ProviderMode = 'server' | 'wasm' | 'auto';
-
 export interface HybridDocumentProviderConfig {
-  /** Server base URL */
-  serverBaseUrl?: string;
-  /**
-   * Preferred provider mode:
-   * - 'server': Use server for all operations
-   * - 'wasm': Use local WASM for operations (faster, offline capable)
-   * - 'auto': Use WASM if available, fallback to server
-   */
-  preferMode?: ProviderMode;
-  /** Timeout for server health check in ms */
-  healthCheckTimeout?: number;
-  /** Device ID for server requests */
-  deviceId?: string;
+  /** Plugin base path for loading WASM files */
+  pluginPath?: string;
   /** Enable caching (default: true) */
   enableCache?: boolean;
   /** Enable prefetching (default: true) */
   enablePrefetch?: boolean;
   /** Number of items to prefetch ahead/behind (default: 2) */
   prefetchCount?: number;
-  /** Enable WASM rendering when available (default: true) */
-  enableWasm?: boolean;
 }
 
 export interface ProviderStatus {
-  activeMode: 'server' | 'wasm';
-  serverAvailable: boolean;
   wasmAvailable: boolean;
   documentId: string | null;
   format: DocumentFormat | null;
@@ -84,6 +68,14 @@ export interface TileRenderOptions extends RenderOptions {
   tileSize?: number;
 }
 
+/**
+ * Provider mode for document handling.
+ * - 'auto': Use server when available, fallback to WASM
+ * - 'wasm': Always use WASM (offline mode)
+ * - 'server': Always use server (legacy mode)
+ */
+export type ProviderMode = 'auto' | 'wasm' | 'server';
+
 // ============================================================================
 // Cache Implementation
 // ============================================================================
@@ -93,23 +85,88 @@ interface CacheEntry {
   timestamp: number;
 }
 
+/** Thumbnail scale for IndexedDB persistence (must match THUMBNAIL_SCALE in provider) */
+const THUMBNAIL_SCALE = 0.5;
+
 class DocumentCache {
   private memoryCache = new Map<string, CacheEntry>();
   private maxMemoryEntries = 100;
   private maxMemoryBytes = 100 * 1024 * 1024; // 100MB
   private currentBytes = 0;
 
+  /** Map docId to document hash for IndexedDB lookups */
+  private docHashMap = new Map<string, string>();
+
+  /** Track IndexedDB cache hit stats */
+  private idbHits = 0;
+  private idbMisses = 0;
+
   private makeCacheKey(docId: string, itemIndex: number, scale: number): string {
     return `${docId}-${itemIndex}-${scale.toFixed(2)}`;
+  }
+
+  /**
+   * Set the document hash for a docId (needed for IndexedDB lookups)
+   */
+  setDocumentHash(docId: string, docHash: string): void {
+    this.docHashMap.set(docId, docHash);
+  }
+
+  /**
+   * Get document hash for a docId
+   */
+  getDocumentHash(docId: string): string | null {
+    return this.docHashMap.get(docId) ?? null;
   }
 
   async get(docId: string, itemIndex: number, scale: number): Promise<Blob | null> {
     const key = this.makeCacheKey(docId, itemIndex, scale);
     const entry = this.memoryCache.get(key);
-    return entry?.blob ?? null;
+
+    // Memory cache hit
+    if (entry?.blob) {
+      return entry.blob;
+    }
+
+    // For thumbnail scale, check IndexedDB as L2
+    const isThumbnail = Math.abs(scale - THUMBNAIL_SCALE) < 0.01;
+    if (isThumbnail) {
+      const docHash = this.docHashMap.get(docId);
+      if (docHash) {
+        try {
+          const idbCache = getThumbnailIdbCache();
+          // Pages are 1-indexed in IndexedDB, items are 0-indexed
+          const idbEntry = await idbCache.get(docHash, itemIndex + 1);
+
+          if (idbEntry) {
+            this.idbHits++;
+            // Warm memory cache from IndexedDB
+            await this.set(docId, itemIndex, scale, idbEntry.blob, false); // Don't re-persist
+            console.log(`[DocumentCache] IDB hit: page ${itemIndex + 1} (${this.idbHits} hits, ${this.idbMisses} misses)`);
+            return idbEntry.blob;
+          } else {
+            this.idbMisses++;
+          }
+        } catch (err) {
+          console.warn('[DocumentCache] IndexedDB get error:', err);
+        }
+      }
+    }
+
+    return null;
   }
 
-  async set(docId: string, itemIndex: number, scale: number, blob: Blob): Promise<void> {
+  /**
+   * Store a cached item
+   * @param persistToIdb Whether to also persist to IndexedDB (default: true for thumbnails)
+   */
+  async set(
+    docId: string,
+    itemIndex: number,
+    scale: number,
+    blob: Blob,
+    persistToIdb: boolean = true
+  ): Promise<void> {
     const key = this.makeCacheKey(docId, itemIndex, scale);
     const size = blob.size;
 
@@ -125,11 +182,132 @@ class DocumentCache {
 
     this.memoryCache.set(key, { blob, timestamp: Date.now() });
     this.currentBytes += size;
+
+    // Persist thumbnails to IndexedDB for cross-session caching
+    const isThumbnail = Math.abs(scale - THUMBNAIL_SCALE) < 0.01;
+    if (isThumbnail && persistToIdb) {
+      const docHash = this.docHashMap.get(docId);
+      if (docHash) {
+        // Persist to IndexedDB in background (non-blocking)
+        this.persistThumbnailToIdb(docHash, itemIndex, blob).catch((err) => {
+          console.warn('[DocumentCache] IndexedDB persist error:', err);
+        });
+      }
+    }
+  }
+
+  /**
+   * Persist a thumbnail to IndexedDB
+   */
+  private async persistThumbnailToIdb(docHash: string, itemIndex: number, blob: Blob): Promise<void> {
+    const idbCache = getThumbnailIdbCache();
+
+    // Convert to WebP for better compression if not already WebP
+    let persistBlob = blob;
+    let width = 0;
+    let height = 0;
+
+    if (blob.type !== 'image/webp') {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        width = bitmap.width;
+        height = bitmap.height;
+        persistBlob = await imageToWebPBlob(bitmap, 0.8);
+        bitmap.close();
+      } catch {
+        // If WebP conversion fails, store as-is
+        width = 100; // Estimate
+        height = 100;
+      }
+    } else {
+      // Already WebP, get dimensions
+      try {
+        const bitmap = await createImageBitmap(blob);
+        width = bitmap.width;
+        height = bitmap.height;
+        bitmap.close();
+      } catch {
+        width = 100;
+        height = 100;
+      }
+    }
+
+    // Pages are 1-indexed in IndexedDB
+    await idbCache.set(docHash, itemIndex + 1, persistBlob, width, height);
   }
 
   async has(docId: string, itemIndex: number, scale: number): Promise<boolean> {
     const key = this.makeCacheKey(docId, itemIndex, scale);
-    return this.memoryCache.has(key);
+
+    // Check memory first
+    if (this.memoryCache.has(key)) {
+      return true;
+    }
+
+    // For thumbnail scale, check IndexedDB
+    const isThumbnail = Math.abs(scale - THUMBNAIL_SCALE) < 0.01;
+    if (isThumbnail) {
+      const docHash = this.docHashMap.get(docId);
+      if (docHash) {
+        try {
+          const idbCache = getThumbnailIdbCache();
+          return await idbCache.has(docHash, itemIndex + 1);
+        } catch {
+          return false;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Pre-warm memory cache from IndexedDB for a document
+   * Called when document opens for instant thumbnail display
+   *
+   * Uses parallel batch retrieval (getMany) instead of sequential loop
+   * to avoid blocking time-to-first-paint.
+   */
+  async warmFromIndexedDB(docId: string, docHash: string, pageCount: number): Promise<number> {
+    this.setDocumentHash(docId, docHash);
+
+    const startTime = performance.now();
+    let warmed = 0;
+
+    try {
+      const idbCache = getThumbnailIdbCache();
+      const cachedPages = await idbCache.getCachedPages(docHash);
+
+      if (cachedPages.length === 0) {
+        console.log(`[DocumentCache] No cached thumbnails for document ${docHash.slice(0, 8)}...`);
+        return 0;
+      }
+
+      // Warm first 20 pages for initial view
+      const pagesToWarm = cachedPages.slice(0, Math.min(20, pageCount));
+
+      // Use batch retrieval for parallel IndexedDB reads instead of sequential loop
+      // This significantly reduces warm time (20 sequential reads → 1 batch)
+      const entries = await idbCache.getMany(docHash, pagesToWarm);
+
+      // Process retrieved entries (memory cache writes are fast, don't need parallelization)
+      for (const [page, entry] of entries) {
+        // Pages are 1-indexed, items are 0-indexed
+        const itemIndex = page - 1;
+        await this.set(docId, itemIndex, THUMBNAIL_SCALE, entry.blob, false);
+        warmed++;
+      }
+
+      const duration = performance.now() - startTime;
+      console.log(
+        `[DocumentCache] Warmed ${warmed}/${cachedPages.length} thumbnails from IndexedDB in ${duration.toFixed(0)}ms`
+      );
+
+      return warmed;
+    } catch (err) {
+      console.warn('[DocumentCache] IndexedDB warm error:', err);
+      return 0;
+    }
   }
 
   private evictOldest(): void {
@@ -162,18 +340,30 @@ class DocumentCache {
         this.memoryCache.delete(key);
       }
     }
+    this.docHashMap.delete(docId);
   }
 
   clear(): void {
     this.memoryCache.clear();
+    this.docHashMap.clear();
     this.currentBytes = 0;
+    this.idbHits = 0;
+    this.idbMisses = 0;
   }
 
-  getStats(): { size: number; bytes: number; maxBytes: number } {
+  getStats(): {
+    size: number;
+    bytes: number;
+    maxBytes: number;
+    idbHits: number;
+    idbMisses: number;
+  } {
     return {
       size: this.memoryCache.size,
       bytes: this.currentBytes,
       maxBytes: this.maxMemoryBytes,
+      idbHits: this.idbHits,
+      idbMisses: this.idbMisses,
     };
   }
 }
@@ -184,13 +374,10 @@ class DocumentCache {
 
 export class HybridDocumentProvider {
   private config: Required<HybridDocumentProviderConfig>;
-  private apiClient: ApiClient | null = null;
-  private serverAvailable = false;
   private wasmBridge: DocumentBridge | null = null;
   private wasmAvailable = false;
 
   // Current document state
-  private documentId: string | null = null;
   private wasmDocumentId: string | null = null;
   private parsedDocument: ParsedDocument | null = null;
   private documentData: ArrayBuffer | null = null;
@@ -202,20 +389,20 @@ export class HybridDocumentProvider {
   private prefetchQueue: number[] = [];
   private isPrefetching = false;
   private isDestroyed = false;
+  private lastPrefetchCenter = -1;
 
-  // RenderCoordinator for PDF tile management (Phase 1: HybridPdfProvider migration)
+  /** Maximum prefetch queue size to prevent runaway background rendering */
+  private static readonly MAX_PREFETCH_QUEUE_SIZE = 6;
+
+  // RenderCoordinator for PDF tile management
   private renderCoordinator: RenderCoordinator | null = null;
 
   constructor(config: HybridDocumentProviderConfig = {}) {
     this.config = {
-      serverBaseUrl: config.serverBaseUrl ?? '',
-      preferMode: config.preferMode ?? 'auto',
-      healthCheckTimeout: config.healthCheckTimeout ?? 5000,
-      deviceId: config.deviceId ?? 'document-provider',
+      pluginPath: config.pluginPath ?? '',
       enableCache: config.enableCache ?? true,
       enablePrefetch: config.enablePrefetch ?? true,
       prefetchCount: config.prefetchCount ?? 2,
-      enableWasm: config.enableWasm ?? true,
     };
   }
 
@@ -224,54 +411,18 @@ export class HybridDocumentProvider {
   // ============================================================================
 
   /**
-   * Initialize the provider - checks server and WASM availability
+   * Initialize the provider - initializes WASM bridge
    */
   async initialize(): Promise<void> {
-    // Initialize WASM bridge if enabled
-    if (this.config.enableWasm) {
-      try {
-        const startTime = performance.now();
-        this.wasmBridge = await getSharedDocumentBridge();
-        this.wasmAvailable = true;
-        console.log(`[HybridDocumentProvider] WASM bridge initialized in ${(performance.now() - startTime).toFixed(1)}ms`);
-      } catch (error) {
-        console.warn('[HybridDocumentProvider] WASM initialization failed:', error);
-        this.wasmAvailable = false;
-      }
-    }
-
-    // Check server availability
-    if (await this.checkServerHealth()) {
-      this.apiClient = getApiClient();
-    } else if (!this.wasmAvailable) {
-      throw new Error('No document provider available. Both server and WASM are unavailable.');
-    } else {
-      console.log('[HybridDocumentProvider] Server unavailable, using WASM-only mode');
-    }
-  }
-
-  /**
-   * Check if server is available
-   */
-  private async checkServerHealth(): Promise<boolean> {
-    if (!this.config.serverBaseUrl) {
-      return false;
-    }
-
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.healthCheckTimeout);
-
-      const response = await fetch(`${this.config.serverBaseUrl}/health`, {
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-      this.serverAvailable = response.ok;
-      return this.serverAvailable;
-    } catch {
-      this.serverAvailable = false;
-      return false;
+      const startTime = performance.now();
+      this.wasmBridge = await getSharedDocumentBridge();
+      this.wasmAvailable = true;
+      console.log(`[HybridDocumentProvider] WASM bridge initialized in ${(performance.now() - startTime).toFixed(1)}ms`);
+    } catch (error) {
+      console.warn('[HybridDocumentProvider] WASM initialization failed:', error);
+      this.wasmAvailable = false;
+      throw new Error('WASM document provider unavailable.');
     }
   }
 
@@ -280,23 +431,11 @@ export class HybridDocumentProvider {
    */
   getStatus(): ProviderStatus {
     return {
-      activeMode: this.shouldUseWasm() ? 'wasm' : 'server',
-      serverAvailable: this.serverAvailable,
       wasmAvailable: this.wasmAvailable,
-      documentId: this.documentId ?? this.wasmDocumentId,
+      documentId: this.wasmDocumentId,
       format: this.parsedDocument?.format ?? null,
       itemCount: this.parsedDocument?.itemCount ?? 0,
     };
-  }
-
-  /**
-   * Check if WASM should be used
-   */
-  private shouldUseWasm(): boolean {
-    if (!this.config.enableWasm || !this.wasmAvailable) return false;
-    if (this.config.preferMode === 'wasm') return true;
-    if (this.config.preferMode === 'auto') return true;
-    return false;
   }
 
   // ============================================================================
@@ -309,79 +448,40 @@ export class HybridDocumentProvider {
    * @param filename Optional filename for identification and format detection
    */
   async loadDocument(data: ArrayBuffer, filename?: string): Promise<ParsedDocument> {
-    if (!this.apiClient && !this.wasmAvailable) {
+    if (!this.wasmAvailable) {
       throw new Error('Provider not initialized. Call initialize() first.');
     }
 
     this.documentData = data;
 
-    // Load into WASM in parallel
-    const wasmLoadPromise = this.loadDocumentToWasm(data, filename);
+    // Generate document hash BEFORE loading (for IndexedDB lookups)
+    // This allows us to warm the cache while WASM loads
+    const docHashPromise = generateDocumentHash(data);
 
-    // Try server if available
-    if (this.apiClient && this.serverAvailable) {
-      try {
-        // Use unified documents API
-        const response = await fetch(`${this.config.serverBaseUrl}/api/v1/documents`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Document-Filename': filename ?? 'document',
-          },
-          body: data,
-        });
-
-        if (response.ok) {
-          const result = await response.json();
-          this.parsedDocument = {
-            id: result.id,
-            format: result.format,
-            metadata: result.metadata,
-            toc: result.toc ?? [],
-            itemCount: result.item_count,
-            hasTextLayer: result.has_text_layer,
-          };
-          this.documentId = result.id;
-          console.log('[HybridDocumentProvider] Loaded via server:', result.id);
-
-          // Wait for WASM load to complete
-          await wasmLoadPromise;
-
-          // Set up TileEngine for PDF documents (non-blocking)
-          if (this.parsedDocument.format === 'pdf') {
-            this.setupTileEngine().catch((err) => {
-              console.warn('[HybridDocumentProvider] TileEngine setup failed:', err);
-            });
-            // Set up RenderCoordinator if it was already created before document load
-            if (this.renderCoordinator) {
-              this.setupRenderCoordinator();
-            }
-          }
-
-          // Start background thumbnail generation (non-blocking)
-          this.generateThumbnails(this.parsedDocument.itemCount).catch((err) => {
-            console.warn('[HybridDocumentProvider] Thumbnail generation failed:', err);
-          });
-
-          return this.parsedDocument;
-        }
-      } catch (error) {
-        console.warn('[HybridDocumentProvider] Server load failed:', error);
-      }
-    }
-
-    // Fallback to WASM-only
-    const wasmResult = await wasmLoadPromise;
+    // Load via WASM
+    const wasmResult = await this.loadDocumentToWasm(data, filename);
     if (wasmResult) {
       this.parsedDocument = wasmResult.document;
       this.wasmDocumentId = wasmResult.id;
-      this.documentId = wasmResult.id;
+      this.wasmDocumentId = wasmResult.id;
 
-      // Set up TileEngine for PDF documents (non-blocking)
+      // Get document hash (should be ready by now)
+      const docHash = await docHashPromise;
+      const docId = wasmResult.id;
+
+      // Warm thumbnail cache from IndexedDB in background
+      // This makes re-opens instant (~200ms instead of 4-5s)
+      this.cache.warmFromIndexedDB(docId, docHash, this.parsedDocument.itemCount).catch((err) => {
+        console.warn('[HybridDocumentProvider] IndexedDB warm failed:', err);
+      });
+
+      // Set up TileEngine for PDF documents (MUST await - updatePageDimensions needs this)
       if (this.parsedDocument.format === 'pdf') {
-        this.setupTileEngine().catch((err) => {
+        try {
+          await this.setupTileEngine();
+        } catch (err) {
           console.warn('[HybridDocumentProvider] TileEngine setup failed:', err);
-        });
+        }
         // Set up RenderCoordinator if it was already created before document load
         if (this.renderCoordinator) {
           this.setupRenderCoordinator();
@@ -389,6 +489,7 @@ export class HybridDocumentProvider {
       }
 
       // Start background thumbnail generation (non-blocking)
+      // This will use cached thumbnails if available, or generate new ones
       this.generateThumbnails(this.parsedDocument.itemCount).catch((err) => {
         console.warn('[HybridDocumentProvider] Thumbnail generation failed:', err);
       });
@@ -433,53 +534,63 @@ export class HybridDocumentProvider {
    * @param options Render options
    */
   async renderItem(itemIndex: number, options?: RenderOptions): Promise<Blob> {
-    if (!this.documentId && !this.wasmDocumentId) {
+    if (!this.wasmDocumentId && !this.wasmDocumentId) {
       throw new Error('No document loaded');
     }
 
-    const scale = Math.min(options?.scale ?? 1.5, 12.0);
+    // PERF FIX: Quantize scale to valid SCALE_TIERS for cache hits.
+    // Arbitrary scales like 6.112... can't be cached and cause cache misses.
+    const rawScale = Math.min(options?.scale ?? 1.5, 32.0); // Cap increased to max tier
+    let scale: number = SCALE_TIERS[0];
+    let prevTier: number = SCALE_TIERS[0];
+    for (const tier of SCALE_TIERS) {
+      if (tier >= rawScale) {
+        const distToPrev = rawScale - prevTier;
+        const distToCurrent = tier - rawScale;
+        scale = distToCurrent < distToPrev ? tier : prevTier;
+        break;
+      }
+      prevTier = tier;
+      scale = tier; // Use max tier if rawScale exceeds all
+    }
 
     // Check cache
     if (this.config.enableCache) {
-      const docId = this.documentId ?? this.wasmDocumentId!;
+      const docId = this.wasmDocumentId ?? this.wasmDocumentId!;
       const cached = await this.cache.get(docId, itemIndex, scale);
       if (cached) {
-        this.triggerPrefetch(itemIndex, scale);
+        // PERF FIX: Disable full-page prefetch. In tiled mode, tiles have their own
+        // prefetch system (scroll strategy). Full-page prefetch causes worker starvation
+        // by rendering pages 100+ away while user waits for visible tiles.
+        // this.triggerPrefetch(itemIndex, scale);
         return cached;
       }
     }
 
     let blob: Blob;
 
-    // Use WASM if available
-    if (this.shouldUseWasm() && this.wasmBridge && this.wasmDocumentId) {
+    // Render via WASM
+    if (this.wasmBridge && this.wasmDocumentId) {
       const startTime = performance.now();
       const result = await this.wasmBridge.renderItem(this.wasmDocumentId, itemIndex, scale);
       // Create a new Uint8Array to ensure proper ArrayBuffer type for Blob
       const data = new Uint8Array(result.data);
       blob = new Blob([data], { type: 'image/png' });
       console.log(`[HybridDocumentProvider] WASM rendered item ${itemIndex} @ ${scale}x in ${(performance.now() - startTime).toFixed(1)}ms`);
-    } else if (this.apiClient && this.documentId) {
-      // Fallback to server
-      const response = await fetch(
-        `${this.config.serverBaseUrl}/api/v1/documents/${this.documentId}/items/${itemIndex}/render?scale=${scale}`
-      );
-      if (!response.ok) {
-        throw new Error(`Server render failed: ${response.statusText}`);
-      }
-      blob = await response.blob();
     } else {
       throw new Error('No rendering backend available');
     }
 
     // Cache result
     if (this.config.enableCache) {
-      const docId = this.documentId ?? this.wasmDocumentId!;
+      const docId = this.wasmDocumentId ?? this.wasmDocumentId!;
       await this.cache.set(docId, itemIndex, scale, blob);
     }
 
-    // Trigger prefetch
-    this.triggerPrefetch(itemIndex, scale);
+    // PERF FIX: Disable full-page prefetch. In tiled mode, tiles have their own
+    // prefetch system (scroll strategy). Full-page prefetch causes worker starvation
+    // by rendering pages 100+ away while user waits for visible tiles.
+    // this.triggerPrefetch(itemIndex, scale);
 
     return blob;
   }
@@ -522,24 +633,12 @@ export class HybridDocumentProvider {
    * Get structured text with character positions
    */
   async getStructuredText(itemIndex: number): Promise<StructuredText> {
-    if (!this.documentId && !this.wasmDocumentId) {
+    if (!this.wasmDocumentId) {
       throw new Error('No document loaded');
     }
 
-    // Prefer WASM for accurate character positions
-    if (this.shouldUseWasm() && this.wasmBridge && this.wasmDocumentId) {
+    if (this.wasmBridge && this.wasmDocumentId) {
       return this.wasmBridge.getStructuredText(this.wasmDocumentId, itemIndex);
-    }
-
-    // Fallback to server
-    if (this.apiClient && this.documentId) {
-      const response = await fetch(
-        `${this.config.serverBaseUrl}/api/v1/documents/${this.documentId}/items/${itemIndex}/text`
-      );
-      if (!response.ok) {
-        throw new Error(`Server text extraction failed: ${response.statusText}`);
-      }
-      return response.json();
     }
 
     throw new Error('No text extraction backend available');
@@ -549,29 +648,12 @@ export class HybridDocumentProvider {
    * Search document
    */
   async search(query: string, limit: number = 50, includeContext: boolean = true): Promise<SearchResult[]> {
-    if (!this.documentId && !this.wasmDocumentId) {
+    if (!this.wasmDocumentId) {
       throw new Error('No document loaded');
     }
 
-    // Use WASM for search
-    if (this.shouldUseWasm() && this.wasmBridge && this.wasmDocumentId) {
+    if (this.wasmBridge && this.wasmDocumentId) {
       return this.wasmBridge.search(this.wasmDocumentId, query, limit, includeContext);
-    }
-
-    // Fallback to server
-    if (this.apiClient && this.documentId) {
-      const params = new URLSearchParams({
-        query,
-        limit: String(limit),
-        include_context: String(includeContext),
-      });
-      const response = await fetch(
-        `${this.config.serverBaseUrl}/api/v1/documents/${this.documentId}/search?${params}`
-      );
-      if (!response.ok) {
-        throw new Error(`Server search failed: ${response.statusText}`);
-      }
-      return response.json();
     }
 
     throw new Error('No search backend available');
@@ -593,17 +675,6 @@ export class HybridDocumentProvider {
       return this.wasmBridge.getEpubChapter(this.wasmDocumentId, chapterIndex);
     }
 
-    // Server fallback
-    if (this.apiClient && this.documentId) {
-      const response = await fetch(
-        `${this.config.serverBaseUrl}/api/v1/documents/${this.documentId}/items/${chapterIndex}/content`
-      );
-      if (!response.ok) {
-        throw new Error(`Server chapter fetch failed: ${response.statusText}`);
-      }
-      return response.text();
-    }
-
     throw new Error('No chapter content backend available');
   }
 
@@ -616,9 +687,19 @@ export class HybridDocumentProvider {
    */
   async getItemDimensions(itemIndex: number): Promise<{ width: number; height: number }> {
     if (this.wasmBridge && this.wasmDocumentId) {
-      return this.wasmBridge.getItemDimensions(this.wasmDocumentId, itemIndex);
+      const dims = await this.wasmBridge.getItemDimensions(this.wasmDocumentId, itemIndex);
+      
+      // DIAGNOSTIC: Log WASM dimensions for first page (amnesia-e4i)
+      if (itemIndex === 0) {
+        console.log(`[getItemDimensions] WASM returned: ${dims.width.toFixed(1)}x${dims.height.toFixed(1)} for page 0`);
+      }
+      
+      return dims;
     }
 
+    // DIAGNOSTIC: Log fallback usage (amnesia-e4i)
+    console.warn(`[getItemDimensions] Using FALLBACK dimensions (no WASM): wasmBridge=${!!this.wasmBridge}, wasmDocId=${!!this.wasmDocumentId}`);
+    
     // Default dimensions
     return { width: 612, height: 792 }; // US Letter at 72 DPI
   }
@@ -680,7 +761,7 @@ export class HybridDocumentProvider {
       return;
     }
 
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     const count = itemCount ?? this.getItemCount();
 
     if (!docId || count === 0) {
@@ -691,68 +772,49 @@ export class HybridDocumentProvider {
     this.isGeneratingThumbnails = true;
     const startTime = performance.now();
 
-    // Two-phase thumbnail generation
-    const IMMEDIATE_BATCH = 20; // First 20 for instant perceived load
-    const BACKGROUND_BATCH = 5; // Rest in smaller batches with yields
+    // PERF FIX: Sequential thumbnail generation to avoid blocking tile renders.
+    //
+    // Previous implementation used Promise.all to render 20 thumbnails in parallel,
+    // which saturated the 4-worker pool and caused tiles to wait 9+ seconds.
+    //
+    // Now we render thumbnails sequentially with yields, giving priority to tiles.
+    // This is slower for thumbnail generation but ensures tiles render smoothly.
+    const BACKGROUND_BATCH = 1; // One at a time to minimize blocking
+    const YIELD_DELAY_MS = 50; // Yield to let tiles render
     const thumbnailScale = HybridDocumentProvider.THUMBNAIL_SCALE;
 
     try {
       let generated = 0;
 
-      // PHASE 1: First batch without yields for immediate availability
-      if (count > 0) {
-        const phase1End = Math.min(IMMEDIATE_BATCH, count);
-        await Promise.all(
-          Array.from({ length: phase1End }, (_, i) => i).map(async (item) => {
-            // Skip if already cached
-            const isCached = await this.cache.has(docId, item, thumbnailScale);
-            if (isCached) return;
-
-            try {
-              await this.renderItem(item, { scale: thumbnailScale });
-              generated++;
-            } catch (err) {
-              console.warn(`[HybridDocumentProvider] Thumbnail failed for item ${item}:`, err);
-            }
-          })
-        );
-        console.log(
-          `[HybridDocumentProvider] Phase 1 complete: ${generated} thumbnails in ${(performance.now() - startTime).toFixed(0)}ms`
-        );
-      }
-
-      // PHASE 2: Remaining items with yields to avoid UI blocking
-      for (let i = IMMEDIATE_BATCH; i < count; i += BACKGROUND_BATCH) {
+      // Render all thumbnails sequentially with yields
+      for (let item = 0; item < count; item++) {
         // Check if we should stop (e.g., document changed)
-        const currentDocId = this.documentId ?? this.wasmDocumentId;
+        const currentDocId = this.wasmDocumentId ?? this.wasmDocumentId;
         if (this.isDestroyed || currentDocId !== docId) {
           console.log('[HybridDocumentProvider] Stopping thumbnail generation - document changed');
           break;
         }
 
-        const batchEnd = Math.min(i + BACKGROUND_BATCH, count);
-        const batch: number[] = [];
+        // Skip if already cached
+        const isCached = await this.cache.has(docId, item, thumbnailScale);
+        if (isCached) continue;
 
-        // Build batch of items that need thumbnails
-        for (let item = i; item < batchEnd; item++) {
-          const isCached = await this.cache.has(docId, item, thumbnailScale);
-          if (!isCached) {
-            batch.push(item);
-          }
+        try {
+          await this.renderItem(item, { scale: thumbnailScale });
+          generated++;
+        } catch (err) {
+          console.warn(`[HybridDocumentProvider] Thumbnail failed for item ${item}:`, err);
         }
 
-        // Render batch
-        for (const item of batch) {
-          try {
-            await this.renderItem(item, { scale: thumbnailScale });
-            generated++;
-          } catch (err) {
-            console.warn(`[HybridDocumentProvider] Thumbnail failed for item ${item}:`, err);
-          }
-        }
+        // Yield to let tiles render - critical for scrolling performance
+        await new Promise((resolve) => setTimeout(resolve, YIELD_DELAY_MS));
 
-        // Yield to UI thread
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        // Log progress every 20 items
+        if ((item + 1) % 20 === 0) {
+          console.log(
+            `[HybridDocumentProvider] Thumbnail progress: ${item + 1}/${count} in ${(performance.now() - startTime).toFixed(0)}ms`
+          );
+        }
       }
 
       console.log(
@@ -768,7 +830,7 @@ export class HybridDocumentProvider {
    * Returns null if thumbnail not yet generated
    */
   async getThumbnail(itemIndex: number): Promise<Blob | null> {
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     if (!docId) return null;
 
     return this.cache.get(docId, itemIndex, HybridDocumentProvider.THUMBNAIL_SCALE);
@@ -778,7 +840,7 @@ export class HybridDocumentProvider {
    * Check if a thumbnail exists for an item
    */
   async hasThumbnail(itemIndex: number): Promise<boolean> {
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     if (!docId) return false;
 
     return this.cache.has(docId, itemIndex, HybridDocumentProvider.THUMBNAIL_SCALE);
@@ -802,7 +864,7 @@ export class HybridDocumentProvider {
     isFullQuality: boolean;
     upgradePromise?: Promise<Blob>;
   }> {
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     if (!docId) {
       throw new Error('No document loaded');
     }
@@ -869,6 +931,15 @@ export class HybridDocumentProvider {
       const dims = await this.getItemDimensions(i);
       // TileEngine uses 1-indexed pages
       dimensionsMap.set(i + 1, dims);
+      
+      // DIAGNOSTIC: Log first page dimensions to trace source (amnesia-e4i)
+      if (i === 0) {
+        console.log(`[getPageDimensionsMap] page 1 dims: ${dims.width.toFixed(1)}x${dims.height.toFixed(1)}, hasWasmBridge=${!!this.wasmBridge}, wasmDocId=${this.wasmDocumentId?.slice(0,20)}`);
+        if (dims.width < 500 || dims.height < 600) {
+          console.warn(`[getPageDimensionsMap] WARNING: Layout dimensions!`);
+          console.trace('[getPageDimensionsMap] Stack:');
+        }
+      }
     }
 
     return dimensionsMap;
@@ -878,7 +949,7 @@ export class HybridDocumentProvider {
    * Get document ID for TileEngine
    */
   getDocumentId(): string | null {
-    return this.documentId ?? this.wasmDocumentId;
+    return this.wasmDocumentId ?? this.wasmDocumentId;
   }
 
   /**
@@ -887,7 +958,7 @@ export class HybridDocumentProvider {
    * Should be called after loading a PDF document.
    */
   async setupTileEngine(): Promise<void> {
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     const format = this.getFormat();
 
     if (!docId || format !== 'pdf') {
@@ -910,7 +981,11 @@ export class HybridDocumentProvider {
     tileEngine.setRenderCallback(async (tile: TileCoordinate, _docId: string) => {
       // Convert TileCoordinate to our renderTile format (0-indexed itemIndex)
       const itemIndex = tile.page - 1; // TileEngine uses 1-indexed pages
-      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+      // amnesia-e4i FIX: Pass tileSize from TileCoordinate to ensure render matches grid
+      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { 
+        scale: tile.scale,
+        tileSize: tile.tileSize,
+      });
     });
 
     console.log(`[HybridDocumentProvider] TileEngine configured for ${pageCount} pages`);
@@ -923,12 +998,16 @@ export class HybridDocumentProvider {
   createTileRenderCallback(): (tile: TileCoordinate, docId: string) => Promise<Blob> {
     return async (tile: TileCoordinate, _docId: string): Promise<Blob> => {
       const itemIndex = tile.page - 1; // TileEngine uses 1-indexed pages
-      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+      // amnesia-e4i FIX: Pass tileSize from TileCoordinate to ensure render matches grid
+      return this.renderTile(itemIndex, tile.tileX, tile.tileY, { 
+        scale: tile.scale,
+        tileSize: tile.tileSize,
+      });
     };
   }
 
   // ============================================================================
-  // RenderCoordinator Integration (Phase 1: HybridPdfProvider migration)
+  // RenderCoordinator Integration
   // ============================================================================
 
   /**
@@ -940,7 +1019,7 @@ export class HybridDocumentProvider {
     if (!this.renderCoordinator) {
       this.renderCoordinator = getRenderCoordinator();
       // Only setup if document is already loaded (avoids timing race)
-      const docId = this.documentId ?? this.wasmDocumentId;
+      const docId = this.wasmDocumentId ?? this.wasmDocumentId;
       if (docId) {
         this.setupRenderCoordinator();
       }
@@ -956,7 +1035,7 @@ export class HybridDocumentProvider {
   private setupRenderCoordinator(): void {
     if (!this.renderCoordinator) return;
 
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     if (!docId) {
       // This shouldn't happen if callers check document state first
       console.warn('[HybridDocumentProvider] setupRenderCoordinator called without document');
@@ -967,11 +1046,31 @@ export class HybridDocumentProvider {
     this.renderCoordinator.setRenderCallbacks({
       renderTile: async (tile: TileCoordinate, _docId: string) => {
         const itemIndex = tile.page - 1; // Convert 1-indexed to 0-indexed
-        return this.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+        // amnesia-e4i FIX: Pass tileSize from TileCoordinate to ensure render matches grid.
+        // Without this, tiles render at 256px but grid uses 512px, causing seams.
+        return this.renderTile(itemIndex, tile.tileX, tile.tileY, { 
+          scale: tile.scale,
+          tileSize: tile.tileSize,  // Pass through from TileCoordinate
+        });
       },
       renderPage: async (page: number, scale: number, _docId: string) => {
         const itemIndex = page - 1; // Convert 1-indexed to 0-indexed
-        return this.renderItem(itemIndex, { scale });
+        // PERF FIX: Quantize scale to valid SCALE_TIERS for cache hits.
+        // Arbitrary scales like 6.112... can't be cached and block tile renders.
+        // Round to nearest valid tier using same logic as TileCacheManager.quantizeScale()
+        let quantizedScale: number = SCALE_TIERS[0];
+        let prevTier: number = SCALE_TIERS[0];
+        for (const tier of SCALE_TIERS) {
+          if (tier >= scale) {
+            const distToPrev = scale - prevTier;
+            const distToCurrent = tier - scale;
+            quantizedScale = distToCurrent < distToPrev ? tier : prevTier;
+            break;
+          }
+          prevTier = tier;
+          quantizedScale = tier; // Use max tier if scale exceeds all
+        }
+        return this.renderItem(itemIndex, { scale: quantizedScale });
       },
     });
 
@@ -985,12 +1084,30 @@ export class HybridDocumentProvider {
   // ============================================================================
 
   /**
-   * Trigger prefetch of adjacent items
+   * Trigger prefetch of adjacent items.
+   *
+   * PERF FIX: Clear stale queue items when user navigates far.
+   * This prevents runaway prefetching of pages 100+ away while user waits.
    */
   private triggerPrefetch(currentItem: number, scale: number): void {
     if (!this.config.enablePrefetch) return;
 
     const itemCount = this.getItemCount();
+
+    // PERF FIX: If user jumped far (>10 pages), clear the stale queue
+    // This prevents rendering pages 300+ when user is viewing page 20
+    if (this.lastPrefetchCenter >= 0 && Math.abs(currentItem - this.lastPrefetchCenter) > 10) {
+      this.prefetchQueue = [];
+    }
+    this.lastPrefetchCenter = currentItem;
+
+    // PERF FIX: Prune queue items that are now far from current position
+    // Only keep items within ±5 pages of current view
+    const MAX_DISTANCE = 5;
+    this.prefetchQueue = this.prefetchQueue.filter(
+      item => Math.abs(item - currentItem) <= MAX_DISTANCE
+    );
+
     const toFetch: number[] = [];
 
     for (let i = 1; i <= this.config.prefetchCount; i++) {
@@ -1000,6 +1117,10 @@ export class HybridDocumentProvider {
 
     for (const item of toFetch) {
       if (!this.prefetchQueue.includes(item)) {
+        // PERF FIX: Enforce queue size limit
+        if (this.prefetchQueue.length >= HybridDocumentProvider.MAX_PREFETCH_QUEUE_SIZE) {
+          break;
+        }
         this.prefetchQueue.push(item);
       }
     }
@@ -1008,24 +1129,48 @@ export class HybridDocumentProvider {
   }
 
   /**
-   * Process prefetch queue
+   * Process prefetch queue.
+   *
+   * PERF FIX: Skip items that are now stale (far from current view).
+   * Each render takes 800-1000ms, during which user may have navigated.
    */
   private async processPrefetchQueue(scale: number): Promise<void> {
     if (this.isPrefetching || this.prefetchQueue.length === 0) return;
 
     this.isPrefetching = true;
 
+    // PERF FIX: Quantize scale to valid SCALE_TIERS for cache hits.
+    let quantizedScale: number = scale;
+    let prevTier: number = SCALE_TIERS[0];
+    for (const tier of SCALE_TIERS) {
+      if (tier >= scale) {
+        const distToPrev = scale - prevTier;
+        const distToCurrent = tier - scale;
+        quantizedScale = distToCurrent < distToPrev ? tier : prevTier;
+        break;
+      }
+      prevTier = tier;
+      quantizedScale = tier; // Use max tier if scale exceeds all
+    }
+
     while (this.prefetchQueue.length > 0 && !this.isDestroyed) {
       const item = this.prefetchQueue.shift()!;
-      const docId = this.documentId ?? this.wasmDocumentId;
+      const docId = this.wasmDocumentId ?? this.wasmDocumentId;
 
       if (!docId) break;
 
+      // PERF FIX: Skip items that are now far from user's current position
+      // This handles cases where user navigated during a previous long render
+      if (this.lastPrefetchCenter >= 0 && Math.abs(item - this.lastPrefetchCenter) > 10) {
+        continue; // Skip stale item
+      }
+
       try {
-        const isCached = await this.cache.has(docId, item, scale);
+        const isCached = await this.cache.has(docId, item, quantizedScale);
         if (!isCached) {
-          const blob = await this.renderItem(item, { scale });
-          console.log(`[HybridDocumentProvider] Prefetched item ${item}`);
+          await this.renderItem(item, { scale: quantizedScale });
+          // Reduce log spam - only log if verbose debugging needed
+          // console.log(`[HybridDocumentProvider] Prefetched item ${item}`);
         }
       } catch (error) {
         console.warn(`[HybridDocumentProvider] Prefetch failed for item ${item}:`, error);
@@ -1044,8 +1189,6 @@ export class HybridDocumentProvider {
 
   /**
    * Create a PdfContentProvider adapter for use with PdfRenderer.
-   * This allows HybridDocumentProvider to be used as a drop-in replacement
-   * for HybridPdfProvider in ServerReaderContainer.
    *
    * @returns PdfContentProvider-compatible object with additional methods
    */
@@ -1073,8 +1216,25 @@ export class HybridDocumentProvider {
       async getPdfPage(_id: string, page: number, options?: { scale?: number; format?: string }): Promise<Blob> {
         // PdfRenderer uses 1-indexed pages, our API uses 0-indexed
         const itemIndex = page - 1;
+        // PERF FIX: Quantize scale to valid SCALE_TIERS for cache hits.
+        let quantizedScale: number | undefined = options?.scale;
+        if (quantizedScale !== undefined) {
+          let prevTier: number = SCALE_TIERS[0];
+          for (const tier of SCALE_TIERS) {
+            if (tier >= quantizedScale) {
+              const distToPrev = quantizedScale - prevTier;
+              const distToCurrent = tier - quantizedScale;
+              quantizedScale = distToCurrent < distToPrev ? tier : prevTier;
+              break;
+            }
+            prevTier = tier;
+            if (tier === SCALE_TIERS[SCALE_TIERS.length - 1]) {
+              quantizedScale = tier; // Use max tier if scale exceeds all
+            }
+          }
+        }
         return provider.renderItem(itemIndex, {
-          scale: options?.scale,
+          scale: quantizedScale,
           format: options?.format as 'png' | 'jpeg' | 'webp' | undefined,
         });
       },
@@ -1103,20 +1263,20 @@ export class HybridDocumentProvider {
       // Tile rendering methods
       renderTile: async (tile: TileCoordinate): Promise<Blob> => {
         const itemIndex = tile.page - 1;
-        return provider.renderTile(itemIndex, tile.tileX, tile.tileY, { scale: tile.scale });
+        // amnesia-e4i FIX: Pass tileSize from TileCoordinate to ensure render matches grid
+        return provider.renderTile(itemIndex, tile.tileX, tile.tileY, { 
+          scale: tile.scale,
+          tileSize: tile.tileSize,
+        });
       },
 
       isTileRenderingAvailable: () => provider.isTileRenderingAvailable(),
 
-      // RenderCoordinator for PDF tile management (Phase 1 addition)
       getRenderCoordinator: () => provider.getRenderCoordinator(),
 
-      // SVG text layer stub (Phase 1 addition)
-      // Note: This feature was referenced in ServerReaderContainer but not implemented
-      // in HybridPdfProvider. Stubbed here for API compatibility.
       async getPdfSvgTextLayer(_id: string, _page: number): Promise<string> {
-        console.warn('[HybridDocumentProvider] SVG text layer not implemented - using standard text layer');
-        return ''; // Return empty string as fallback
+        // SVG text layer not implemented - use standard text layer
+        return '';
       },
     };
   }
@@ -1188,7 +1348,7 @@ export class HybridDocumentProvider {
    * Clear cache for current document
    */
   async clearCache(): Promise<void> {
-    const docId = this.documentId ?? this.wasmDocumentId;
+    const docId = this.wasmDocumentId ?? this.wasmDocumentId;
     if (docId) {
       this.cache.clearDocument(docId);
     }
@@ -1216,11 +1376,9 @@ export class HybridDocumentProvider {
     // Clear cache
     this.cache.clear();
 
-    this.documentId = null;
     this.wasmDocumentId = null;
     this.parsedDocument = null;
     this.documentData = null;
-    this.apiClient = null;
   }
 }
 

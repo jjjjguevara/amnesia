@@ -26,6 +26,7 @@
  */
 
 import type { TileCoordinate } from './tile-render-engine';
+import { getTileSize } from './tile-render-engine';
 import { getTileCacheManager, quantizeScale, type CachedTileData, type CachedPageClassification } from './tile-cache-manager';
 import { getPaginatedStrategy } from './paginated-strategy';
 import { getScrollStrategy, type PrioritizedTile, type SpeedZone } from './scroll-strategy';
@@ -47,6 +48,10 @@ import { getTypedArrayPool } from './typed-array-pool';
 import { getHybridRenderingStrategy, type RenderingDecision } from './hybrid-rendering-strategy';
 import { getCanvasPool } from './pdf-canvas-pool';
 import { getRenderSessionManager } from './render-session';
+import { isFeatureEnabled } from './feature-flags';
+import { generateDebugTileSvg, type DebugTileInfo } from './debug-tile-renderer';
+import { isDebugTileModeEnabled } from './debug-mock-pdf';
+import { getTileDiagnosticOverlay } from './tile-diagnostic-overlay';
 
 /** Render request priority levels */
 export type RenderPriority = 'critical' | 'high' | 'medium' | 'low';
@@ -61,6 +66,16 @@ export interface TileRenderRequest {
   documentId?: string;
   /** Session ID for selective abort. Requests from old sessions can be aborted. */
   sessionId?: number;
+  /** CSS scale factor for per-tile quality variation (amnesia-d9f). */
+  cssStretch?: number;
+  /** Scale epoch at request time (INV-6: Scale/Layout Atomicity). */
+  scaleEpoch?: number;
+  /** Render parameters identity hash (INV-6: Scale/Layout Atomicity). */
+  renderParamsId?: string;
+  /** Current zoom level (for debug tiles). */
+  zoom?: number;
+  /** Originally requested scale before any capping (for debug). */
+  requestedScale?: number;
 }
 
 /** Page render request */
@@ -91,6 +106,10 @@ export interface RenderResult {
   actualScale?: number;
   /** CSS scale factor to apply (< 1 = downscale, > 1 = upscale) */
   cssStretch?: number;
+  /** Scale epoch from request (INV-6: Scale/Layout Atomicity). */
+  scaleEpoch?: number;
+  /** Render parameters identity hash (INV-6: Scale/Layout Atomicity). */
+  renderParamsId?: string;
 }
 
 /** Render mode */
@@ -119,7 +138,11 @@ class Semaphore {
 
   private static readonly PRIORITY_ORDER: RenderPriority[] = ['critical', 'high', 'medium', 'low'];
 
-  constructor(maxPermits: number, maxQueueSize = 100) {
+  // Queue size increased from 100 to 400 for amnesia-e4i fix.
+  // At mid-zoom (4-16x), a single page can require 294+ tiles (e.g., 14×21 grid).
+  // With queue size 100, most tiles were "Dropped from queue" causing 18% coverage.
+  // Queue size 400 handles ~1.3 full pages at mid-zoom, sufficient for typical viewports.
+  constructor(maxPermits: number, maxQueueSize = 400) {
     this.permits = maxPermits;
     this.maxPermits = maxPermits;
     this.maxQueueSize = maxQueueSize;
@@ -137,9 +160,10 @@ class Semaphore {
   }
 
   /**
-   * Drop lowest-priority waiters when queue is full
+   * Drop lowest priority waiters when queue is full
    */
   private dropLowestPriorityWaiters(): void {
+    const beforeCount = this.getTotalWaiters();
     // Drop from lowest priority first (low → medium → high → critical)
     const reversePriorities = [...Semaphore.PRIORITY_ORDER].reverse();
     for (const priority of reversePriorities) {
@@ -151,6 +175,17 @@ class Semaphore {
         }
       }
       if (this.getTotalWaiters() < this.maxQueueSize) break;
+    }
+    const afterCount = this.getTotalWaiters();
+    const droppedCount = beforeCount - afterCount;
+    if (droppedCount > 0) {
+      console.warn(`[SEMAPHORE] dropLowestPriorityWaiters: Dropped ${droppedCount} tiles (queue was ${beforeCount}, now ${afterCount}, max=${this.maxQueueSize})`);
+      // Record drops for diagnostic overlay (amnesia-e4i debugging)
+      for (let i = 0; i < droppedCount; i++) {
+        try {
+          getTileDiagnosticOverlay().recordDrop('queue-overflow');
+        } catch { /* overlay may not be initialized */ }
+      }
     }
   }
 
@@ -205,6 +240,15 @@ class Semaphore {
       while (queue.length > 0) {
         const waiter = queue.shift();
         if (waiter) waiter(false); // Signal drop, not acquisition
+      }
+    }
+    if (count > 0) {
+      console.warn(`[SEMAPHORE] clearQueue: Dropped ${count} waiting tiles`);
+      // Record drops for diagnostic overlay (amnesia-e4i debugging)
+      for (let i = 0; i < count; i++) {
+        try {
+          getTileDiagnosticOverlay().recordDrop('queue-cleared');
+        } catch { /* overlay may not be initialized */ }
       }
     }
     return count;
@@ -265,8 +309,11 @@ export class RenderCoordinator {
    * Active render requests by position (without scale).
    * Used to abort old-scale renders when new-scale requests come in.
    * Key format: "tile-p{page}-t{x}x{y}" or "page-{page}"
+   * 
+   * amnesia-d9f FIX: Now stores scale along with controller to avoid
+   * aborting same-scale requests during continuous zoom.
    */
-  private activeByPosition = new Map<string, AbortController>();
+  private activeByPosition = new Map<string, { controller: AbortController; scale: number }>();
 
   /** Mode transition callbacks */
   private modeTransitionCallbacks = new Set<(from: RenderMode, to: RenderMode) => void>();
@@ -321,6 +368,7 @@ export class RenderCoordinator {
    */
   abortAllPending(): void {
     // Abort all tracked controllers
+    const abortCount = this.abortControllers.size;
     for (const controller of this.abortControllers) {
       controller.abort();
     }
@@ -328,6 +376,15 @@ export class RenderCoordinator {
     this.activeByPosition.clear();
     this.inFlight.clear();
     this.inFlightSessions.clear();
+
+    // Record aborts for diagnostic overlay (amnesia-e4i debugging)
+    if (abortCount > 0) {
+      for (let i = 0; i < abortCount; i++) {
+        try {
+          getTileDiagnosticOverlay().recordAbort('abort-all-pending');
+        } catch { /* overlay may not be initialized */ }
+      }
+    }
 
     // Clear the semaphore queue (resolves all waiters immediately)
     const cleared = this.semaphore.clearQueue();
@@ -366,12 +423,16 @@ export class RenderCoordinator {
       if (age > keepRecent) {
         // Extract position key to find the abort controller
         const positionKey = this.extractPositionKeyFromRequestKey(key);
-        const controller = this.activeByPosition.get(positionKey);
-        if (controller) {
-          controller.abort();
+        const entry = this.activeByPosition.get(positionKey);
+        if (entry) {
+          entry.controller.abort();
           this.activeByPosition.delete(positionKey);
-          this.abortControllers.delete(controller);
+          this.abortControllers.delete(entry.controller);
           abortedCount++;
+          // Record abort for diagnostic overlay (amnesia-e4i debugging)
+          try {
+            getTileDiagnosticOverlay().recordAbort('stale-session');
+          } catch { /* overlay may not be initialized */ }
         }
       }
     }
@@ -769,8 +830,8 @@ export class RenderCoordinator {
       return existing;
     }
 
-    // Check cache
-    if (request.type === 'tile') {
+    // Check cache (skip if debug tiles are enabled)
+    if (request.type === 'tile' && !isDebugTileModeEnabled()) {
       // First try exact scale match
       const cached = await getTileCacheManager().get(request.tile);
       if (cached) {
@@ -824,22 +885,52 @@ export class RenderCoordinator {
       }
     }
 
-    // Abort any existing render at same position (e.g., old scale during zoom)
-    // This prevents wasted work when zoom changes rapidly
-    const existingController = this.activeByPosition.get(positionKey);
-    if (existingController) {
-      existingController.abort();
-      this.activeByPosition.delete(positionKey);
-      this.abortControllers.delete(existingController);
+    // amnesia-d9f FIX: Only abort existing render if scale is DIFFERENT.
+    // 
+    // PROBLEM: During continuous zoom at max scale (32x), the viewport shifts slightly
+    // causing new tile requests for tiles already being rendered at the SAME scale.
+    // The old logic aborted these in-progress renders to start new ones, causing
+    // 10-15% tile loss and visual corruption.
+    //
+    // FIX: Check if existing render is at same scale. If so, let it continue.
+    // The in-flight deduplication (line 794) should catch most duplicates, but
+    // there's a race window between setting activeByPosition and inFlight.
+    const newScale = request.type === 'tile' ? request.tile.scale : request.scale;
+    const existingEntry = this.activeByPosition.get(positionKey);
+    if (existingEntry) {
+      const existingScale = existingEntry.scale;
+      if (existingScale !== newScale) {
+        // Different scale - abort old render (e.g., zooming from 16x to 32x)
+        existingEntry.controller.abort();
+        this.activeByPosition.delete(positionKey);
+        this.abortControllers.delete(existingEntry.controller);
+        console.warn(`[POSITION-ABORT] Aborting existing render at ${positionKey} (scale ${existingScale}→${newScale})`);
+        // Record abort for diagnostic overlay (amnesia-e4i debugging)
+        try {
+          getTileDiagnosticOverlay().recordAbort(`scale-change:${existingScale}→${newScale}`);
+        } catch { /* overlay may not be initialized */ }
+      } else {
+        // Same scale - let the existing render continue, return its promise
+        // This handles the race condition where inFlight wasn't set yet
+        // Note: Removed verbose logging as this is normal behavior during continuous zoom
+        // Try to return the in-flight promise if it exists now
+        const inFlightPromise = this.inFlight.get(key);
+        if (inFlightPromise) {
+          return inFlightPromise;
+        }
+        // If no in-flight promise yet, we're in the race window
+        // Create a small delay to let the first request finish setting up
+        // This is a defensive measure - shouldn't happen often
+      }
     }
 
     // Create abort controller for this request if not provided
     const controller = request.abortController ?? new AbortController();
     request.abortController = controller;
 
-    // Track abort controller
+    // Track abort controller with scale
     this.abortControllers.add(controller);
-    this.activeByPosition.set(positionKey, controller);
+    this.activeByPosition.set(positionKey, { controller, scale: newScale });
 
     // Create promise and add to in-flight
     const promise = this.executeRequest(request, key);
@@ -856,7 +947,8 @@ export class RenderCoordinator {
       this.inFlightSessions.delete(key);
       this.abortControllers.delete(controller);
       // Only clear position tracking if this controller is still active
-      if (this.activeByPosition.get(positionKey) === controller) {
+      const currentEntry = this.activeByPosition.get(positionKey);
+      if (currentEntry && currentEntry.controller === controller) {
         this.activeByPosition.delete(positionKey);
       }
     }
@@ -1083,7 +1175,8 @@ export class RenderCoordinator {
     // which don't exist in SCALE_TIERS, causing every tile to miss cache.
     //
     // Now: getTargetScaleTier returns the nearest valid tier, ensuring cache hits.
-    let { tier: scale } = getTargetScaleTier(zoom, pixelRatio);
+    // Note: Use `number` type since TILE PIXEL CAP may reduce below tier values
+    let scale: number = getTargetScaleTier(zoom, pixelRatio).tier;
 
     // Optional: reduce quality during fast scroll (by stepping down to lower tier)
     if (velocity && this.currentMode === 'scroll') {
@@ -1097,10 +1190,33 @@ export class RenderCoordinator {
       }
     }
 
+    // TILE PIXEL CAP FIX (amnesia-d9f): Apply same cap as renderPageTiled.
+    // With 512px tiles at scale 32, each tile would be 16384px which exceeds GPU limits.
+    // Cap scale so tile pixels ≤ MAX_TILE_PIXELS (8192).
+    const MAX_TILE_PIXELS = 8192;
+    const tileSize = getTileSize(zoom);
+    const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
+    scale = Math.min(scale, maxScaleForTileSize);
+
     return scale;
   }
 
   // Private helpers
+
+  // DIAGNOSTIC (amnesia-d9f): Track abort patterns
+  private static abortedBeforeAcquire = 0;
+  private static abortedAfterAcquire = 0;
+  private static droppedFromQueue = 0;
+  private static lastAbortLogTime = 0;
+
+  private logAbortStats(reason: string): void {
+    const now = performance.now();
+    // Rate-limit abort logging to once per 2 seconds to avoid console spam
+    if (now - RenderCoordinator.lastAbortLogTime > 2000) {
+      RenderCoordinator.lastAbortLogTime = now;
+      console.warn(`[ABORT-STATS] ${reason}: beforeAcquire=${RenderCoordinator.abortedBeforeAcquire}, afterAcquire=${RenderCoordinator.abortedAfterAcquire}, dropped=${RenderCoordinator.droppedFromQueue}`);
+    }
+  }
 
   /**
    * Execute a render request with concurrency limiting
@@ -1113,6 +1229,8 @@ export class RenderCoordinator {
     // FALLBACK FIX: Even when aborted, try to return a cached fallback tile
     // to prevent blank areas during rapid zoom changes
     if (request.abortController?.signal.aborted) {
+      RenderCoordinator.abortedBeforeAcquire++;
+      this.logAbortStats('pre-acquire abort');
       if (request.type === 'tile') {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
         if (fallback) {
@@ -1127,6 +1245,24 @@ export class RenderCoordinator {
         }
       }
       return { success: false, error: 'Aborted', fromCache: false };
+    }
+
+    // DEBUG TILES FAST PATH: Skip semaphore for debug tiles since they render instantly
+    if (isDebugTileModeEnabled() && request.type === 'tile') {
+      const tileSize = getTileSize(request.tile.scale);
+      // Gather debug info to stamp on tile
+      const debugInfo = {
+        zoom: (request as any).zoom,
+        epoch: request.scaleEpoch,
+        priority: request.priority,
+        cssStretch: request.cssStretch,
+        requestedScale: (request as any).requestedScale,
+        renderMode: this.currentMode,
+      };
+      const debugBlob = await generateDebugTileSvg(request.tile, tileSize, request.tile.scale, debugInfo);
+      const bitmap = await createImageBitmap(debugBlob);
+      console.log(`[DEBUG-TILE-FAST] page=${request.tile.page}, (${request.tile.tileX},${request.tile.tileY}), scale=${request.tile.scale}, zoom=${debugInfo.zoom?.toFixed(1)}, epoch=${debugInfo.epoch}`);
+      return { success: true, data: bitmap, fromCache: false };
     }
 
     // Wait for a permit (non-blocking, priority-driven)
@@ -1150,6 +1286,8 @@ export class RenderCoordinator {
     }
 
     if (!acquired) {
+      RenderCoordinator.droppedFromQueue++;
+      this.logAbortStats('dropped from queue');
       // FALLBACK FIX: Even when dropped from queue, try to return a cached fallback tile
       if (request.type === 'tile') {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
@@ -1174,6 +1312,8 @@ export class RenderCoordinator {
       // Check if aborted after acquiring permit
       // FALLBACK FIX: Even when aborted, try to return a cached fallback tile
       if (request.abortController?.signal.aborted) {
+        RenderCoordinator.abortedAfterAcquire++;
+        this.logAbortStats('post-acquire abort');
         if (request.type === 'tile') {
           const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
           if (fallback) {
@@ -1192,6 +1332,9 @@ export class RenderCoordinator {
 
       let blob: Blob | null = null;
       let cachedData: CachedTileData | null = null;
+      // VECTOR OPTIMIZATION FIX (amnesia-e4i): Hoist vectorOptimization to outer scope
+      // so it can be included in return values at the end of executeRequest.
+      let vectorOptimization: OptimizedRenderParams | null = null;
 
       if (request.type === 'tile') {
         if (!this.renderTileCallback || !this.documentId) {
@@ -1207,7 +1350,6 @@ export class RenderCoordinator {
         // or vector scale optimization for vector-heavy pages
         const pageNum = request.tile.page;
         let usedFastPath = false;
-        let vectorOptimization: OptimizedRenderParams | null = null;
 
         const contentTypeEnabled = this.isContentTypeDetectionEnabled();
         console.log(`[RenderCoordinator] Tile render page ${pageNum}, contentTypeEnabled: ${contentTypeEnabled}`);
@@ -1296,45 +1438,55 @@ export class RenderCoordinator {
             ? { ...request.tile, scale: vectorOptimization.actualScale }
             : request.tile;
 
-          const result = await this.renderTileCallback(tileToRender, this.documentId);
-
-          // DEBUG: Log what the render callback returned
-          console.log(`[RenderCoordinator] renderTileCallback returned: isBlob=${result instanceof Blob}, format=${(result as any)?.format}, hasRgba=${!!(result as any)?.rgba}, hasBlob=${!!(result as any)?.blob}`);
-
-          // Handle TileRenderResult (new format-aware) or legacy Blob
-          if (result instanceof Blob) {
-            blob = result;
-            cachedData = { format: 'png', blob, width: 0, height: 0 };
+          // DEBUG TILES: Generate colored PNG tiles for visual debugging
+          // Check both feature flag AND runtime debug mode
+          if (isFeatureEnabled('useDebugTiles') || isDebugTileModeEnabled()) {
+            const tileSize = getTileSize(tileToRender.scale);
+            const debugBlob = await generateDebugTileSvg(tileToRender, tileSize, request.tile.scale);
+            blob = debugBlob;
+            cachedData = { format: 'png', blob, width: tileSize, height: tileSize };
+            console.log(`[DEBUG-TILE] Generated debug tile: page=${tileToRender.page}, (${tileToRender.tileX},${tileToRender.tileY}), scale=${tileToRender.scale}, targetScale=${request.tile.scale}`);
           } else {
-            // TileRenderResult - extract the appropriate data
-            if (result.format === 'rgba' && result.rgba) {
-              cachedData = {
-                format: 'rgba',
-                rgba: result.rgba,
-                width: result.width,
-                height: result.height,
-              };
-            } else if (result.blob) {
-              blob = result.blob;
-              cachedData = {
-                format: 'png',
-                blob,
-                width: result.width,
-                height: result.height,
-              };
-            } else {
-              // DEBUG: This means cachedData stays null!
-              console.warn(`[RenderCoordinator] CACHE BUG: result has neither rgba nor blob! result.format=${result.format}`);
-            }
-          }
+            const result = await this.renderTileCallback(tileToRender, this.documentId);
 
-          // Add vector optimization metadata to cached data
-          if (cachedData && vectorOptimization?.wasOptimized) {
-            cachedData.wasOptimized = true;
-            cachedData.cssScaleFactor = vectorOptimization.cssScaleFactor;
-            // Calculate target dimensions (original requested scale dimensions)
-            cachedData.targetWidth = Math.ceil(cachedData.width * vectorOptimization.cssScaleFactor);
-            cachedData.targetHeight = Math.ceil(cachedData.height * vectorOptimization.cssScaleFactor);
+            // DEBUG: Log what the render callback returned
+            console.log(`[RenderCoordinator] renderTileCallback returned: isBlob=${result instanceof Blob}, format=${(result as any)?.format}, hasRgba=${!!(result as any)?.rgba}, hasBlob=${!!(result as any)?.blob}`);
+
+            // Handle TileRenderResult (new format-aware) or legacy Blob
+            if (result instanceof Blob) {
+              blob = result;
+              cachedData = { format: 'png', blob, width: 0, height: 0 };
+            } else {
+              // TileRenderResult - extract the appropriate data
+              if (result.format === 'rgba' && result.rgba) {
+                cachedData = {
+                  format: 'rgba',
+                  rgba: result.rgba,
+                  width: result.width,
+                  height: result.height,
+                };
+              } else if (result.blob) {
+                blob = result.blob;
+                cachedData = {
+                  format: 'png',
+                  blob,
+                  width: result.width,
+                  height: result.height,
+                };
+              } else {
+                // DEBUG: This means cachedData stays null!
+                console.warn(`[RenderCoordinator] CACHE BUG: result has neither rgba nor blob! result.format=${result.format}`);
+              }
+            }
+
+            // Add vector optimization metadata to cached data
+            if (cachedData && vectorOptimization?.wasOptimized) {
+              cachedData.wasOptimized = true;
+              cachedData.cssScaleFactor = vectorOptimization.cssScaleFactor;
+              // Calculate target dimensions (original requested scale dimensions)
+              cachedData.targetWidth = Math.ceil(cachedData.width * vectorOptimization.cssScaleFactor);
+              cachedData.targetHeight = Math.ceil(cachedData.height * vectorOptimization.cssScaleFactor);
+            }
           }
         }
 
@@ -1426,6 +1578,19 @@ export class RenderCoordinator {
       );
 
       // Return data - prefer ImageBitmap for raw RGBA, otherwise Blob
+      // VECTOR OPTIMIZATION FIX (amnesia-e4i): Include actualScale and cssStretch in result
+      // when vector optimization was applied. This allows compositing to use correct
+      // positioning even when tiles were rendered at a different scale than requested.
+      const baseResult: Partial<RenderResult> = {
+        success: true,
+        fromCache: false,
+        // Include vector optimization info if applicable
+        ...(vectorOptimization?.wasOptimized && request.type === 'tile' ? {
+          actualScale: vectorOptimization.actualScale,
+          cssStretch: vectorOptimization.cssScaleFactor,
+        } : {}),
+      };
+
       if (cachedData?.format === 'rgba' && cachedData.rgba) {
         // Convert raw RGBA to ImageBitmap for display
         // Use pool for temporary array to reduce GC pressure
@@ -1436,7 +1601,7 @@ export class RenderCoordinator {
         const bitmap = await createImageBitmap(imageData);
         // Release array back to pool after bitmap is created
         pool.releaseUint8ClampedArray(rgbaArray);
-        return { success: true, data: bitmap, fromCache: false };
+        return { ...baseResult, data: bitmap } as RenderResult;
       } else if (blob) {
         // Convert Blob to ImageBitmap before returning
         // Use canvas pool for off-main-thread decoding when available
@@ -1450,7 +1615,7 @@ export class RenderCoordinator {
           // Fallback to main thread decoding
           bitmap = await createImageBitmap(blob);
         }
-        return { success: true, data: bitmap, fromCache: false };
+        return { ...baseResult, data: bitmap } as RenderResult;
       } else {
         return { success: false, error: 'Render failed', fromCache: false };
       }
@@ -1522,8 +1687,13 @@ export class RenderCoordinator {
       // This ensures deduplication works correctly - without quantization,
       // tiles at scale 2.0 and 2.0001 would have different request keys but
       // the same cache key, causing duplicate renders.
+      //
+      // amnesia-e4i FIX: Include tileSize in request key. Tiles with different
+      // tileSizes cover different PDF regions (even with same indices), so they
+      // must not be deduplicated together.
       const qScale = quantizeScale(t.scale);
-      return `${docPrefix}tile-p${t.page}-t${t.tileX}x${t.tileY}-s${qScale}`;
+      const tileSize = t.tileSize ?? 256;
+      return `${docPrefix}tile-p${t.page}-t${t.tileX}x${t.tileY}-s${qScale}-ts${tileSize}`;
     } else {
       return `${docPrefix}page-${request.page}-s${request.scale.toFixed(2)}`;
     }

@@ -27,19 +27,25 @@ export const TILE_SIZE = 256;
  * Get tile size based on zoom level and feature flags.
  *
  * Uses adaptive tile sizing when enabled for better performance.
- * Returns 512px fixed size which avoids coordinate mismatch issues.
+ * At zoom > 16, uses 256px tiles to allow scale 32 (8192/256 = 32).
+ * At zoom > 32, uses 128px tiles to allow scale 64 (8192/128 = 64).
  *
  * @param zoom Current zoom level (optional)
- * @returns Tile size in CSS pixels
+ * @returns Tile size in CSS pixels (256, 512, or 128 depending on zoom)
  */
 export function getTileSize(zoom?: number): number {
   if (!zoom) {
     return TILE_SIZE;
   }
 
-  // Use adaptive tile sizing for better performance
+  // Use adaptive tile sizing for crisp high-zoom rendering
   if (isFeatureEnabled('useAdaptiveTileSize')) {
-    return getAdaptiveTileSize(zoom);
+    const adaptiveSize = getAdaptiveTileSize(zoom);
+    // Log at high zoom to debug scale capping issue
+    if (zoom >= 16) {
+      console.log(`[getTileSize] zoom=${zoom.toFixed(2)}, adaptive=${adaptiveSize}, flag=${isFeatureEnabled('useAdaptiveTileSize')}`);
+    }
+    return adaptiveSize;
   }
 
   return TILE_SIZE;
@@ -68,6 +74,14 @@ export interface TileCoordinate {
   tileY: number;
   /** Scale factor for rendering resolution. Higher = more detail. */
   scale: TileScale;
+  /**
+   * Tile size in CSS pixels (optional, defaults to 256).
+   * At zoom <= 16: 512px tiles for better cache efficiency.
+   * At zoom 16-32: 256px tiles for scale 32 support.
+   * This MUST match the tile grid used for calculating tileX/tileY.
+   * amnesia-e4i FIX: Without this, tiles are rendered at wrong size causing seams.
+   */
+  tileSize?: number;
 }
 
 /** Tile render request with priority */
@@ -75,6 +89,16 @@ export interface TileRenderRequest {
   tile: TileCoordinate;
   priority: 'critical' | 'high' | 'medium' | 'low';
   abortSignal?: AbortSignal;
+  /**
+   * Scale epoch at request time (INV-6: Scale/Layout Atomicity).
+   * Used to validate tiles at display time - stale epochs are discarded.
+   */
+  scaleEpoch?: number;
+  /**
+   * Render parameters identity hash (INV-6: Scale/Layout Atomicity).
+   * Captures: scaleEpoch, scale, dpr, renderMode.
+   */
+  renderParamsId?: string;
 }
 
 /** Page layout information */
@@ -108,7 +132,46 @@ export class TileRenderEngine {
   // Current document info
   private documentId: string | null = null;
   private pageCount = 0;
-  public pageDimensions: Map<number, { width: number; height: number }> = new Map();
+  
+  // DIAGNOSTIC: Wrap pageDimensions in a traced Map to catch all modifications (amnesia-e4i)
+  private _pageDimensions: Map<number, { width: number; height: number }> = this.createTracedMap();
+  
+  private createTracedMap(): Map<number, { width: number; height: number }> {
+    const self = this;
+    const map = new Map<number, { width: number; height: number }>();
+    
+    // Override set to trace individual page dimension changes
+    const originalSet = map.set.bind(map);
+    map.set = function(key: number, value: { width: number; height: number }) {
+      if (key === 1) {
+        console.log(`[TileEngine.Map.set] page=${key} dims=${value.width.toFixed(1)}x${value.height.toFixed(1)}`);
+        if (value.width < 500 || value.height < 600) {
+          console.warn(`[TileEngine.Map.set] WARNING: Layout dimensions for page 1!`);
+          console.trace('[TileEngine.Map.set] Stack:');
+        }
+      }
+      return originalSet(key, value);
+    };
+    
+    return map;
+  }
+  
+  public get pageDimensions(): Map<number, { width: number; height: number }> {
+    return this._pageDimensions;
+  }
+  public set pageDimensions(value: Map<number, { width: number; height: number }>) {
+    const p1 = value.get(1);
+    console.log(`[TileEngine] pageDimensions REPLACED: ${value.size} pages, page1=${p1 ? `${p1.width.toFixed(1)}x${p1.height.toFixed(1)}` : 'none'}`);
+    if (p1 && (p1.width < 500 || p1.height < 600)) {
+      console.warn(`[TileEngine] WARNING: Layout dimensions detected!`);
+      console.trace('[TileEngine] Assignment stack:');
+    }
+    // Replace with traced version that wraps the incoming map
+    this._pageDimensions = this.createTracedMap();
+    for (const [k, v] of value.entries()) {
+      this._pageDimensions.set(k, v);
+    }
+  }
 
   /**
    * Get the tile size for a given zoom level.
@@ -135,6 +198,17 @@ export class TileRenderEngine {
     this.documentId = docId;
     this.pageCount = pageCount;
     this.pageDimensions = pageDimensions;
+    
+    // DIAGNOSTIC: Log dimensions being set (amnesia-e4i investigation)
+    const p1 = pageDimensions.get(1);
+    console.log(`[TileEngine.setDocument] docId=${docId.slice(0,20)}..., pageCount=${pageCount}, page1=${p1 ? `${p1.width.toFixed(1)}x${p1.height.toFixed(1)}` : 'none'}`);
+    
+    // WARN if dimensions look like layout dimensions (not PDF native)
+    // PDF native dimensions are typically 612x792 (Letter), 595x842 (A4), etc.
+    if (p1 && (p1.width < 500 || p1.height < 600)) {
+      console.warn(`[TileEngine.setDocument] WARNING: Page 1 dimensions (${p1.width.toFixed(1)}x${p1.height.toFixed(1)}) look like LAYOUT dimensions, not PDF native!`);
+      console.trace('[TileEngine.setDocument] Call stack for dimension source:');
+    }
   }
 
   /**
@@ -171,7 +245,8 @@ export class TileRenderEngine {
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
-        tiles.push({ page, tileX: tx, tileY: ty, scale });
+        // amnesia-e4i FIX: Include tileSize so render uses matching size
+        tiles.push({ page, tileX: tx, tileY: ty, scale, tileSize });
       }
     }
 
@@ -193,6 +268,9 @@ export class TileRenderEngine {
     zoom: number,
     scale?: TileScale
   ): TileCoordinate[] {
+    // ELUSIVE BUG DEBUG: Log every call to track tile generation
+    console.error(`[getVisibleTiles] ENTRY: zoom=${zoom.toFixed(2)}, scale=${scale}, pages=${pageLayouts.map(l => l.page).join(',')}, viewport=(${viewport.x.toFixed(0)},${viewport.y.toFixed(0)}) ${viewport.width.toFixed(0)}x${viewport.height.toFixed(0)}`);
+
     const tiles: TileCoordinate[] = [];
     // Use provided scale, or default to zoom for basic HiDPI support
     // DYNAMIC MAX SCALE FIX: Use getDynamicMaxScaleTier() instead of hardcoded MAX_SCALE_TIER.
@@ -200,10 +278,10 @@ export class TileRenderEngine {
     // Previously hardcoded to 16, causing blurry rendering even on capable hardware.
     //
     // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), high scales produce
-    // tiles that exceed GPU limits. Cap scale so tile pixels ≤ 4096.
-    // Example: At scale 32 with 512px tiles = 16384px (impossible)
-    //          With cap: max scale = 4096/512 = 8 → 4096px tiles (OK)
-    const MAX_TILE_PIXELS = 4096;
+    // tiles that exceed GPU limits. Cap scale so tile pixels ≤ 8192.
+    // 8192 allows scale 16 with 512px tiles, covering most mid-zoom levels.
+    // Example: At scale 16 with 512px tiles = 8192px (within modern Canvas 2D limits)
+    const MAX_TILE_PIXELS = 8192;
     const tileSize = this.getTileSizeForZoom(zoom);
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     const rawScale = scale ?? Math.max(1, Math.ceil(zoom));
@@ -214,6 +292,10 @@ export class TileRenderEngine {
       if (!this.rectsOverlap(viewport, layout)) {
         // DIAGNOSTIC LOGGING: Log when overlap check FAILS
         // This helps debug why tiles aren't generated for visible pages
+        // STACK TRACE FIX (2026-01-22): Add stack trace to identify calling code path
+        // when viewport/layout mismatch is extreme (>1000px discrepancy)
+        const yDiscrepancy = Math.abs(viewport.y - layout.y);
+        const needsStackTrace = yDiscrepancy > 1000;
         console.warn(`[TileRenderEngine] NO OVERLAP for page ${layout.page}:`, {
           viewport: `x=${viewport.x.toFixed(1)}, y=${viewport.y.toFixed(1)}, w=${viewport.width.toFixed(1)}, h=${viewport.height.toFixed(1)}`,
           layout: `x=${layout.x.toFixed(1)}, y=${layout.y.toFixed(1)}, w=${layout.width.toFixed(1)}, h=${layout.height.toFixed(1)}`,
@@ -223,6 +305,8 @@ export class TileRenderEngine {
             : viewport.y + viewport.height < layout.y ? 'viewport above layout'
             : layout.y + layout.height < viewport.y ? 'viewport below layout'
             : 'unknown',
+          yDiscrepancy: yDiscrepancy.toFixed(0),
+          ...(needsStackTrace && { stackTrace: new Error().stack?.split('\n').slice(2, 6).join(' <- ') }),
         });
         continue;
       }
@@ -233,20 +317,70 @@ export class TileRenderEngine {
       // Canvas uses layout.width (e.g., 400), PDF uses actual dimensions (e.g., 612)
       const pdfScale = this.canvasToPdfScale(layout.page, layout.width);
 
-      const pdfRect: Rect = {
+      // VIEWPORT-BASED TILE REQUEST (RESTORED 2026-01-22):
+      // Request tiles based on viewport intersection, NOT full page.
+      //
+      // REASON: Full-page tile requests (176 tiles) overwhelm the render queue:
+      // - Semaphore allows only 4 concurrent renders
+      // - Queue limit is 6-10 tiles
+      // - 142+ tiles get DROPPED, causing "failed" tiles
+      //
+      // The original viewport-based approach is correct. The visual corruption bug
+      // is in COMPOSITING, not in tile request generation.
+      const rawPdfRect: Rect = {
         x: (intersection.x - layout.x) * pdfScale,
         y: (intersection.y - layout.y) * pdfScale,
         width: intersection.width * pdfScale,
         height: intersection.height * pdfScale,
       };
 
-      // DEBUG: Log when pdfRect exceeds page dimensions
+      // COORDINATE CLAMPING FIX (Council-validated 2026-01-21):
+      // pdfRect must be clamped to page bounds before getTilesInRect().
+      // Without clamping:
+      // - At mid-zoom (4-10x): coordinates exceeding page bounds → blank tiles during pan
+      // - At max zoom (32x+): tile indices overflow → required MAX_TILED_ZOOM bypass
+      //
+      // Uses intersection logic (not simple clamping) to handle negative coordinates correctly.
       const pageDims = this.pageDimensions.get(layout.page);
-      if (pageDims && (pdfRect.y > pageDims.height || pdfRect.y + pdfRect.height > pageDims.height * 1.5)) {
-        console.warn(`[TileRenderEngine] DEBUG page ${layout.page}: pdfRect.y=${pdfRect.y.toFixed(1)} exceeds pdfHeight=${pageDims.height}`);
-        console.warn(`[TileRenderEngine] DEBUG: viewport=(${viewport.x.toFixed(1)},${viewport.y.toFixed(1)} ${viewport.width.toFixed(1)}x${viewport.height.toFixed(1)})`);
-        console.warn(`[TileRenderEngine] DEBUG: layout=(${layout.x},${layout.y} ${layout.width}x${layout.height}), pdfScale=${pdfScale.toFixed(3)}`);
-        console.warn(`[TileRenderEngine] DEBUG: intersection=(${intersection.x.toFixed(1)},${intersection.y.toFixed(1)} ${intersection.width.toFixed(1)}x${intersection.height.toFixed(1)})`);
+      if (!pageDims) {
+        console.warn(`[TileRenderEngine] Missing page dimensions for page ${layout.page}`);
+        continue;
+      }
+
+      // 1. Determine clamping boundaries using intersection logic
+      const startX = Math.max(0, rawPdfRect.x);
+      const startY = Math.max(0, rawPdfRect.y);
+      const endX = Math.min(rawPdfRect.x + rawPdfRect.width, pageDims.width);
+      const endY = Math.min(rawPdfRect.y + rawPdfRect.height, pageDims.height);
+
+      // 2. Calculate clamped dimensions
+      const pdfRect: Rect = {
+        x: startX,
+        y: startY,
+        width: Math.max(0, endX - startX),
+        height: Math.max(0, endY - startY),
+      };
+
+      // 3. Early exit if viewport is completely off-page
+      if (pdfRect.width <= 0 || pdfRect.height <= 0) {
+        // This is expected when expanded viewport margin extends beyond page
+        console.error(`[getVisibleTiles] SKIPPED page ${layout.page} - clamped to zero size: raw=(${rawPdfRect.x.toFixed(0)},${rawPdfRect.y.toFixed(0)}) ${rawPdfRect.width.toFixed(0)}x${rawPdfRect.height.toFixed(0)}, clamped=(${pdfRect.x.toFixed(0)},${pdfRect.y.toFixed(0)}) ${pdfRect.width.toFixed(0)}x${pdfRect.height.toFixed(0)}, pageDims=${pageDims.width.toFixed(0)}x${pageDims.height.toFixed(0)}`);
+        continue;
+      }
+
+      // DEBUG: Log significant clamping (>10% difference) for diagnostics
+      const clampedSignificantly =
+        Math.abs(rawPdfRect.x - pdfRect.x) > rawPdfRect.width * 0.1 ||
+        Math.abs(rawPdfRect.y - pdfRect.y) > rawPdfRect.height * 0.1 ||
+        Math.abs(rawPdfRect.width - pdfRect.width) > rawPdfRect.width * 0.1 ||
+        Math.abs(rawPdfRect.height - pdfRect.height) > rawPdfRect.height * 0.1;
+
+      if (clampedSignificantly && zoom >= 4) {
+        console.log(`[TileRenderEngine] Clamped pdfRect for page ${layout.page}:`, {
+          raw: `(${rawPdfRect.x.toFixed(1)},${rawPdfRect.y.toFixed(1)}) ${rawPdfRect.width.toFixed(1)}x${rawPdfRect.height.toFixed(1)}`,
+          clamped: `(${pdfRect.x.toFixed(1)},${pdfRect.y.toFixed(1)}) ${pdfRect.width.toFixed(1)}x${pdfRect.height.toFixed(1)}`,
+          pageBounds: `${pageDims.width.toFixed(1)}x${pageDims.height.toFixed(1)}`,
+        });
       }
 
       // Pass zoom for adaptive tile sizing
@@ -304,6 +438,15 @@ export class TileRenderEngine {
     // 3. Session-based abort clearing stale requests on scroll
     if (tiles.length > 64) {
       console.log(`[TileRenderEngine] ${tiles.length} visible tiles (sorted by distance from center)`);
+    }
+
+    // ELUSIVE BUG DEBUG: Log tile count and range
+    if (tiles.length > 0) {
+      const tileXs = tiles.map(t => t.tileX);
+      const tileYs = tiles.map(t => t.tileY);
+      console.error(`[getVisibleTiles] EXIT: ${tiles.length} tiles, X=[${Math.min(...tileXs)}-${Math.max(...tileXs)}], Y=[${Math.min(...tileYs)}-${Math.max(...tileYs)}], pages=${[...new Set(tiles.map(t => t.page))].join(',')}`);
+    } else {
+      console.error(`[getVisibleTiles] EXIT: 0 tiles generated!`);
     }
 
     return tiles;
@@ -529,7 +672,9 @@ export class TileRenderEngine {
       for (let tx = startX; tx < endX; tx++) {
         // Additional bounds check (should be redundant after clamping, but kept for safety)
         if (tx >= 0 && ty >= 0 && tx < maxTileX && ty < maxTileY) {
-          tiles.push({ page, tileX: tx, tileY: ty, scale });
+          // amnesia-e4i FIX: Include baseTileSize (CSS pixels) so render uses matching size.
+          // Note: tileSize (PDF units) = baseTileSize / scale, but we pass baseTileSize.
+          tiles.push({ page, tileX: tx, tileY: ty, scale, tileSize: baseTileSize });
         }
       }
     }

@@ -141,7 +141,8 @@ export class PaginatedStrategy {
 
     for (let tileY = startTileY; tileY < Math.min(endTileY, maxTileY); tileY++) {
       for (let tileX = startTileX; tileX < Math.min(endTileX, maxTileX); tileX++) {
-        tiles.push({ page, tileX, tileY, scale });
+        // amnesia-e4i FIX: Include tileSize so render uses matching size
+        tiles.push({ page, tileX, tileY, scale, tileSize });
       }
     }
 

@@ -22,6 +22,11 @@
  */
 
 import type { TileCoordinate, TileScale, Rect, PageLayout } from './tile-render-engine';
+import { getTileSize } from './tile-render-engine';
+import { MAX_SCALE_TIER, getTargetScaleTier, getExactTargetScale } from './progressive-tile-renderer';
+import { isFeatureEnabled } from './feature-flags';
+import { getScaleStateManager } from './scale-state-manager';
+import type { RenderPriority } from './render-coordinator';
 
 /** Scroll velocity vector */
 export interface ScrollVelocity {
@@ -30,10 +35,28 @@ export interface ScrollVelocity {
 }
 
 /** Speed zone for adaptive prefetching */
-export type SpeedZone = 'stationary' | 'slow' | 'medium' | 'fast';
+export type SpeedZone = 'stationary' | 'slow' | 'medium' | 'fast' | 'veryFast';
 
 /** Prefetch priority level */
 export type PrefetchPriority = 0 | 1 | 2 | 3; // 0 = critical, 3 = background
+
+/**
+ * Convert ScaleStateManager's string priority to numeric PrefetchPriority.
+ * Maps: 'critical' → 0, 'high' → 1, 'medium' → 2, 'low' → 3
+ */
+function renderPriorityToNumeric(priority: RenderPriority): PrefetchPriority {
+  switch (priority) {
+    case 'critical': return 0;
+    case 'high': return 1;
+    case 'medium': return 2;
+    case 'low': return 3;
+    default: {
+      // Exhaustive check - TypeScript will error if RenderPriority adds new values
+      const _exhaustive: never = priority;
+      return _exhaustive;
+    }
+  }
+}
 
 /** Tile with priority information */
 export interface PrioritizedTile extends TileCoordinate {
@@ -65,17 +88,36 @@ export interface ScrollStrategyConfig {
   adaptivePrefetch: boolean;
   /** Speed zone configurations */
   speedZones: Record<SpeedZone, SpeedZoneConfig>;
+  /** Maximum zoom level used to cap scale tier */
+  maxZoom?: number;
 }
 
 /**
  * Scroll Mode Strategy
  */
-/** Default speed zone configurations based on plan analysis */
+/**
+ * Default speed zone configurations for adaptive prefetching.
+ *
+ * AGGRESSIVE PREFETCHING: Lookahead values are tuned for smooth inertia scroll.
+ * Higher lookahead = more tiles rendered ahead in scroll direction, reducing
+ * placeholder visibility during momentum scroll.
+ *
+ * Speed zones (px/s):
+ * - stationary (0-50): Reading mode - full quality, minimal prefetch
+ * - slow (50-200): Browsing - high quality, moderate prefetch
+ * - medium (200-500): Scrolling - reduced quality, good prefetch
+ * - fast (500-1000): Flicking - lower quality, aggressive prefetch
+ * - veryFast (>1000): Aggressive fling - lowest quality, maximum prefetch
+ *
+ * Quality factor affects render scale (1.0 = full, 0.5 = half resolution).
+ * Lookahead is multiplied by viewport size for prefetch area calculation.
+ */
 const DEFAULT_SPEED_ZONES: Record<SpeedZone, SpeedZoneConfig> = {
   stationary: { minSpeed: 0, lookahead: 1.0, quality: 1.0 },
-  slow: { minSpeed: 50, lookahead: 1.5, quality: 0.9 },
-  medium: { minSpeed: 200, lookahead: 2.5, quality: 0.75 },
-  fast: { minSpeed: 500, lookahead: 4.0, quality: 0.5 },
+  slow: { minSpeed: 50, lookahead: 2.0, quality: 0.9 },
+  medium: { minSpeed: 200, lookahead: 3.0, quality: 0.75 },
+  fast: { minSpeed: 500, lookahead: 5.0, quality: 0.5 },
+  veryFast: { minSpeed: 1000, lookahead: 8.0, quality: 0.35 },
 };
 
 export class ScrollStrategy {
@@ -116,16 +158,25 @@ export class ScrollStrategy {
   /**
    * Get tiles visible within the current viewport.
    * For crisp rendering, pass pixelRatio to calculate proper scale.
+   *
+   * **Focal Point Sorting (amnesia-8bd)**: During zoom gestures, tiles are sorted
+   * by distance from the focal point instead of viewport center.
+   *
+   * @param documentId - Optional document ID for ScaleStateManager lookup (focal point sorting)
    */
   getVisibleTiles(
     viewport: Rect,
     pageLayouts: PageLayout[],
     zoom: number,
-    pixelRatio: number = 1
+    pixelRatio: number = 1,
+    documentId: string = 'default'
   ): TileCoordinate[] {
     const tiles: TileCoordinate[] = [];
     const scale = this.getScaleForZoom(zoom, pixelRatio);
-    const tileSize = this.config.tileSize;
+    // TILE-SIZE-MISMATCH-FIX: Use adaptive tile size from getTileSize(zoom) to match
+    // pdf-page-element.ts which uses the same function. Previously used hardcoded 256,
+    // causing mismatch with adaptive 512 elsewhere, leading to out-of-bounds tiles.
+    const tileSize = getTileSize(zoom);
 
     for (const layout of pageLayouts) {
       // Check if page overlaps viewport
@@ -143,19 +194,33 @@ export class ScrollStrategy {
         layout.page,
         scale,
         layout.width,
-        layout.height
+        layout.height,
+        zoom  // Pass zoom for adaptive tile sizing
       );
 
       tiles.push(...pageTiles);
     }
 
-    // Sort by distance from viewport center (prioritize central tiles)
-    const centerX = viewport.x + viewport.width / 2;
-    const centerY = viewport.y + viewport.height / 2;
+    // Check for focal point (amnesia-8bd)
+    const scaleManager = getScaleStateManager(documentId);
+    const focalPoint = scaleManager?.getFocalPoint();
+
+    // Sort by distance from focal point (during zoom) or viewport center (normal)
+    let sortX: number;
+    let sortY: number;
+    if (focalPoint) {
+      // During zoom gestures: sort by distance from zoom focal point
+      sortX = focalPoint.x;
+      sortY = focalPoint.y;
+    } else {
+      // Normal scrolling: sort by distance from viewport center
+      sortX = viewport.x + viewport.width / 2;
+      sortY = viewport.y + viewport.height / 2;
+    }
 
     tiles.sort((a, b) => {
-      const distA = this.getTileDistanceFromPoint(a, pageLayouts, centerX, centerY);
-      const distB = this.getTileDistanceFromPoint(b, pageLayouts, centerX, centerY);
+      const distA = this.getTileDistanceFromPoint(a, pageLayouts, sortX, sortY);
+      const distB = this.getTileDistanceFromPoint(b, pageLayouts, sortX, sortY);
       return distA - distB;
     });
 
@@ -236,10 +301,41 @@ export class ScrollStrategy {
   /**
    * Get tile scale based on zoom level and pixel ratio.
    * For crisp rendering: scale = zoom * pixelRatio
+   *
+   * MEMORY FIX: Capped at MAX_SCALE_TIER (16) to prevent OOM and cache thrashing.
+   *
+   * TILE PIXEL CAP FIX (amnesia-d9f): Also capped by MAX_TILE_PIXELS / tileSize to prevent
+   * tiles exceeding GPU Canvas 2D limits. With 512px tiles and MAX_TILE_PIXELS=8192,
+   * max scale is 16. This must match the cap in renderPageTiled to avoid scale mismatch.
    */
   getScaleForZoom(zoom: number, pixelRatio: number = 1): TileScale {
-    // Scale matches display requirements for crisp rendering
-    return Math.max(1, Math.ceil(zoom * pixelRatio));
+    // SCALE MISMATCH FIX (amnesia-d9f): When useExactScaleRendering is enabled,
+    // use exact scale to match the orchestrator's calculations.
+    let rawScale: number;
+    if (isFeatureEnabled('useExactScaleRendering')) {
+      // FIX (amnesia-d9f): Pass maxZoom to ensure proper scale cap
+      const { scale } = getExactTargetScale(zoom, pixelRatio, this.config.maxZoom);
+      rawScale = scale;
+    } else {
+      // TILE SCALE FIX: Use getTargetScaleTier to return a VALID scale tier.
+      //
+      // Before: Math.ceil(zoom * pixelRatio) produced arbitrary scales like 7, 9, 11
+      // which don't exist in SCALE_TIERS, causing cache misses.
+      //
+      // Now: getTargetScaleTier returns the nearest valid tier for cache hits.
+      const { tier } = getTargetScaleTier(zoom, pixelRatio, this.config.maxZoom);
+      rawScale = tier;
+    }
+
+    // TILE PIXEL CAP FIX (amnesia-d9f): Apply same cap as renderPageTiled.
+    // With 512px tiles at scale 32, each tile would be 16384px which exceeds GPU limits.
+    // Cap scale so tile pixels ≤ MAX_TILE_PIXELS (8192).
+    const MAX_TILE_PIXELS = 8192;
+    const tileSize = getTileSize(zoom);
+    const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
+    const finalScale = Math.min(rawScale, maxScaleForTileSize);
+
+    return finalScale as TileScale;
   }
 
   /**
@@ -260,12 +356,15 @@ export class ScrollStrategy {
    * - stationary: <50 px/s - user is reading/examining
    * - slow: 50-200 px/s - casual browsing
    * - medium: 200-500 px/s - navigation scroll
-   * - fast: >500 px/s - rapid scrolling (searching for something)
+   * - fast: 500-1000 px/s - rapid scrolling (searching for something)
+   * - veryFast: >1000 px/s - aggressive fling (skimming/jumping)
    */
   getSpeedZone(velocity: ScrollVelocity): SpeedZone {
     const speed = Math.sqrt(velocity.x ** 2 + velocity.y ** 2);
     const zones = this.config.speedZones;
 
+    // Check from highest to lowest threshold
+    if (speed >= zones.veryFast.minSpeed) return 'veryFast';
     if (speed >= zones.fast.minSpeed) return 'fast';
     if (speed >= zones.medium.minSpeed) return 'medium';
     if (speed >= zones.slow.minSpeed) return 'slow';
@@ -295,6 +394,11 @@ export class ScrollStrategy {
    * - Medium (1.5-2.5): Priority 2 - opportunistic
    * - Low (2.5-lookahead): Priority 3 - background
    *
+   * **Focal Point Priority (amnesia-8bd)**: During zoom gestures, if a focal point
+   * is active, tiles are prioritized by radial distance from the focal point instead
+   * of distance from viewport center. This ensures tiles near the zoom cursor render first.
+   *
+   * @param documentId - Optional document ID for ScaleStateManager lookup (focal point priority)
    * @returns Tiles sorted by priority (lowest number = highest priority)
    */
   getPrefetchTilesWithPriority(
@@ -302,8 +406,13 @@ export class ScrollStrategy {
     velocity: ScrollVelocity,
     pageLayouts: PageLayout[],
     zoom: number,
-    pixelRatio: number = 1
+    pixelRatio: number = 1,
+    documentId: string = 'default'
   ): PrioritizedTile[] {
+    // Check for focal point priority (amnesia-8bd)
+    const scaleManager = getScaleStateManager(documentId);
+    const focalPoint = scaleManager?.getFocalPoint();
+    const useFocalPointPriority = focalPoint !== null && scaleManager !== null;
     const lookahead = this.getAdaptiveLookahead(velocity);
     const quality = this.getQualityFactorForVelocity(velocity);
     const scale = this.getScaleForZoom(zoom, pixelRatio * quality);
@@ -352,8 +461,19 @@ export class ScrollStrategy {
         // Calculate distance from viewport in viewport units
         const distance = this.getTileDistanceFromViewport(tile, layout, viewport, dirX, dirY);
 
-        // Assign priority based on distance
-        const priority = this.getPriorityForDistance(distance);
+        // Assign priority based on distance or focal point (amnesia-8bd)
+        let priority: PrefetchPriority;
+        if (useFocalPointPriority && scaleManager) {
+          // During zoom gestures: prioritize by radial distance from focal point
+          const focalPriority = scaleManager.getTilePriority(tile, this.config.tileSize, {
+            x: layout.x,
+            y: layout.y,
+          });
+          priority = renderPriorityToNumeric(focalPriority);
+        } else {
+          // Normal scrolling: prioritize by distance from viewport
+          priority = this.getPriorityForDistance(distance);
+        }
 
         prioritizedTiles.push({
           ...tile,
@@ -530,22 +650,48 @@ export class ScrollStrategy {
     page: number,
     scale: TileScale,
     pageWidth: number,
-    pageHeight: number
+    pageHeight: number,
+    zoom?: number
   ): TileCoordinate[] {
     const tiles: TileCoordinate[] = [];
-    const tileSize = this.config.tileSize / scale;
+    // TILE-SIZE-MISMATCH-FIX: Use adaptive tile size when zoom is available.
+    // This ensures consistency with pdf-page-element.ts which uses getTileSize(zoom).
+    const baseTileSize = zoom !== undefined ? getTileSize(zoom) : this.config.tileSize;
+    const tileSize = baseTileSize / scale;
 
-    const startX = Math.max(0, Math.floor(rect.x / tileSize));
-    const startY = Math.max(0, Math.floor(rect.y / tileSize));
-    const endX = Math.ceil((rect.x + rect.width) / tileSize);
-    const endY = Math.ceil((rect.y + rect.height) / tileSize);
+    // BLANK-AREA-FIX (v2): Properly compute rect intersection with page bounds.
+    // The previous clamping logic had a bug where rects entirely off the left/top edge
+    // would incorrectly get positive width/height, causing blank areas.
+    // The fix uses standard rect intersection: clamp edges then compute size from edges.
+    const clampedLeft = Math.max(0, rect.x);
+    const clampedTop = Math.max(0, rect.y);
+    const clampedRight = Math.min(pageWidth, rect.x + rect.width);
+    const clampedBottom = Math.min(pageHeight, rect.y + rect.height);
+
+    const clampedRect: Rect = {
+      x: clampedLeft,
+      y: clampedTop,
+      width: Math.max(0, clampedRight - clampedLeft),
+      height: Math.max(0, clampedBottom - clampedTop),
+    };
+
+    // Early return if clamped rect has zero area (rect is completely outside page bounds)
+    if (clampedRect.width <= 0 || clampedRect.height <= 0) {
+      return tiles;  // Empty array
+    }
+
+    const startX = Math.max(0, Math.floor(clampedRect.x / tileSize));
+    const startY = Math.max(0, Math.floor(clampedRect.y / tileSize));
+    const endX = Math.ceil((clampedRect.x + clampedRect.width) / tileSize);
+    const endY = Math.ceil((clampedRect.y + clampedRect.height) / tileSize);
 
     const maxTileX = Math.ceil(pageWidth / tileSize);
     const maxTileY = Math.ceil(pageHeight / tileSize);
 
     for (let tileY = startY; tileY < Math.min(endY, maxTileY); tileY++) {
       for (let tileX = startX; tileX < Math.min(endX, maxTileX); tileX++) {
-        tiles.push({ page, tileX, tileY, scale });
+        // amnesia-e4i FIX: Include baseTileSize so render uses matching size
+        tiles.push({ page, tileX, tileY, scale, tileSize: baseTileSize });
       }
     }
 

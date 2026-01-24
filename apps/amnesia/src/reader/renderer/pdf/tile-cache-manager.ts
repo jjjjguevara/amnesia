@@ -38,6 +38,240 @@ import type { RenderFormat } from './mupdf-bridge';
 import { SCALE_TIERS, getDynamicMaxScaleTier, roundScaleForCache, type ScaleTier } from './progressive-tile-renderer';
 import { getTypedArrayPool } from './typed-array-pool';
 import { isFeatureEnabled } from './feature-flags';
+import { getTileSize } from './tile-render-engine';
+
+// ============================================================================
+// TILE COMPLIANCE VALIDATOR (amnesia-e4i)
+// ============================================================================
+// Validates tiles at cache boundaries to detect and log scale/grid mismatches
+// that cause visual corruption during zoom+pan operations.
+// ============================================================================
+
+/**
+ * Tile compliance validation result
+ */
+export interface TileComplianceResult {
+  isCompliant: boolean;
+  violations: string[];
+  expectedCacheKey: string;
+  actualCacheKey: string;
+  caller: string;
+}
+
+/**
+ * Global tile compliance statistics for debugging
+ */
+export interface TileComplianceStats {
+  totalChecked: number;
+  totalViolations: number;
+  violationsByType: Record<string, number>;
+  recentViolations: Array<{
+    timestamp: number;
+    tile: TileCoordinate;
+    violation: string;
+    caller: string;
+    stack: string;
+  }>;
+}
+
+// Global compliance stats singleton
+let complianceStats: TileComplianceStats = {
+  totalChecked: 0,
+  totalViolations: 0,
+  violationsByType: {},
+  recentViolations: [],
+};
+
+const MAX_RECENT_VIOLATIONS = 50;
+
+/**
+ * Reset compliance statistics (useful for testing)
+ */
+export function resetTileComplianceStats(): void {
+  complianceStats = {
+    totalChecked: 0,
+    totalViolations: 0,
+    violationsByType: {},
+    recentViolations: [],
+  };
+}
+
+/**
+ * Get current compliance statistics
+ */
+export function getTileComplianceStats(): TileComplianceStats {
+  return { ...complianceStats };
+}
+
+/**
+ * Validate a tile against expected grid parameters.
+ * 
+ * This function checks that:
+ * 1. The tile scale matches the expected quantized scale for the cache key
+ * 2. The tile coordinates are valid for the given scale (non-negative, within reasonable bounds)
+ * 3. The caller stack is captured for debugging
+ * 
+ * @param tile The tile coordinate to validate
+ * @param expectedScale The scale that SHOULD be used for this tile (from grid calculation)
+ * @param currentZoom Current zoom level (for context)
+ * @param caller Description of the calling code path
+ * @returns Compliance result with any violations found
+ */
+export function validateTileCompliance(
+  tile: TileCoordinate,
+  expectedScale: number | undefined,
+  currentZoom: number,
+  caller: string
+): TileComplianceResult {
+  const violations: string[] = [];
+  
+  // Get what the cache key WOULD be for this tile
+  const actualCacheKey = `p${tile.page}-t${tile.tileX}x${tile.tileY}-s${getScaleForCacheKey(tile.scale)}`;
+  const expectedCacheKey = expectedScale !== undefined 
+    ? `p${tile.page}-t${tile.tileX}x${tile.tileY}-s${getScaleForCacheKey(expectedScale)}`
+    : actualCacheKey;
+  
+  complianceStats.totalChecked++;
+  
+  // VIOLATION 1: Scale mismatch between tile and expected grid scale
+  if (expectedScale !== undefined) {
+    const tileScaleForKey = getScaleForCacheKey(tile.scale);
+    const expectedScaleForKey = getScaleForCacheKey(expectedScale);
+    
+    if (tileScaleForKey !== expectedScaleForKey) {
+      violations.push(
+        `SCALE_MISMATCH: tile.scale=${tile.scale} (key=${tileScaleForKey}) ` +
+        `vs expected=${expectedScale} (key=${expectedScaleForKey})`
+      );
+    }
+  }
+  
+  // VIOLATION 2: Invalid tile coordinates
+  if (tile.tileX < 0 || tile.tileY < 0) {
+    violations.push(`NEGATIVE_COORDS: tileX=${tile.tileX}, tileY=${tile.tileY}`);
+  }
+  
+  // VIOLATION 3: Extremely large tile coordinates (likely calculation error)
+  // At scale 32 with 256px tiles, a 612x792 PDF has ~76x99 tiles max
+  const tileSize = getTileSize(currentZoom);
+  const maxReasonableTileIndex = Math.ceil(2000 / (tileSize / tile.scale)); // 2000 PDF units is huge
+  if (tile.tileX > maxReasonableTileIndex || tile.tileY > maxReasonableTileIndex) {
+    violations.push(
+      `EXTREME_COORDS: tileX=${tile.tileX}, tileY=${tile.tileY} ` +
+      `(max reasonable ~${maxReasonableTileIndex} at scale=${tile.scale})`
+    );
+  }
+  
+  // VIOLATION 4: Scale doesn't match zoom expectation
+  // At zoom Z with pixelRatio 2, expected scale is ~Z*2, quantized
+  // Allow 4x range for fallbacks (e.g., scale 4 at zoom 8 is a 2x fallback)
+  const idealScale = currentZoom * 2; // Assuming pixelRatio 2
+  const quantizedIdeal = quantizeScale(idealScale);
+  const tileScaleForKey = getScaleForCacheKey(tile.scale);
+  const scaleRatio = Math.max(quantizedIdeal, tileScaleForKey) / Math.min(quantizedIdeal, tileScaleForKey);
+  
+  if (scaleRatio > 4 && currentZoom >= 4) {
+    violations.push(
+      `SCALE_ZOOM_MISMATCH: tile.scale=${tile.scale} is ${scaleRatio.toFixed(1)}x off ` +
+      `from ideal=${quantizedIdeal} at zoom=${currentZoom.toFixed(2)}`
+    );
+  }
+  
+  // Record violations
+  if (violations.length > 0) {
+    complianceStats.totalViolations++;
+    
+    for (const v of violations) {
+      const vType = v.split(':')[0];
+      complianceStats.violationsByType[vType] = (complianceStats.violationsByType[vType] || 0) + 1;
+    }
+    
+    // Capture stack trace for debugging
+    const stack = new Error().stack?.split('\n').slice(2, 6).join(' <- ') || 'no stack';
+    
+    complianceStats.recentViolations.push({
+      timestamp: Date.now(),
+      tile: { ...tile },
+      violation: violations.join('; '),
+      caller,
+      stack,
+    });
+    
+    // Keep only recent violations
+    if (complianceStats.recentViolations.length > MAX_RECENT_VIOLATIONS) {
+      complianceStats.recentViolations.shift();
+    }
+    
+    // Log violation with full context
+    console.error(
+      `[TILE-COMPLIANCE-VIOLATION] ${caller}:`,
+      {
+        tile: `p${tile.page} (${tile.tileX},${tile.tileY}) s${tile.scale}`,
+        violations,
+        expectedCacheKey,
+        actualCacheKey,
+        currentZoom: currentZoom.toFixed(2),
+        stack: stack.substring(0, 200),
+      }
+    );
+  }
+  
+  return {
+    isCompliant: violations.length === 0,
+    violations,
+    expectedCacheKey,
+    actualCacheKey,
+    caller,
+  };
+}
+
+/**
+ * Validate a batch of tiles and return summary
+ */
+export function validateTileBatchCompliance(
+  tiles: TileCoordinate[],
+  expectedScale: number | undefined,
+  currentZoom: number,
+  caller: string
+): { compliant: number; violations: number; details: TileComplianceResult[] } {
+  let compliant = 0;
+  let violations = 0;
+  const details: TileComplianceResult[] = [];
+  
+  for (const tile of tiles) {
+    const result = validateTileCompliance(tile, expectedScale, currentZoom, caller);
+    if (result.isCompliant) {
+      compliant++;
+    } else {
+      violations++;
+      details.push(result);
+    }
+  }
+  
+  // Log batch summary if there are violations
+  if (violations > 0) {
+    console.error(
+      `[TILE-BATCH-COMPLIANCE] ${caller}: ${violations}/${tiles.length} tiles have violations`,
+      {
+        zoom: currentZoom.toFixed(2),
+        expectedScale,
+        uniqueViolationTypes: [...new Set(details.flatMap(d => d.violations.map(v => v.split(':')[0])))],
+      }
+    );
+  }
+  
+  return { compliant, violations, details };
+}
+
+// Expose compliance stats on window for debugging
+if (typeof window !== 'undefined') {
+  (window as unknown as Record<string, unknown>).getTileComplianceStats = getTileComplianceStats;
+  (window as unknown as Record<string, unknown>).resetTileComplianceStats = resetTileComplianceStats;
+}
+
+// ============================================================================
+// END TILE COMPLIANCE VALIDATOR
+// ============================================================================
 
 /**
  * Quantize a scale to the nearest cache-friendly tier.
@@ -321,6 +555,12 @@ export class TileCacheManager {
   /** L2 cache max size for memory pressure calculation */
   private l2MaxSize: number;
 
+  /**
+   * Priority function for focal-point-aware eviction (amnesia-x6q).
+   * When set, eviction prefers low-priority tiles over high-priority ones.
+   */
+  private priorityFunction: ((page: number, tileX: number, tileY: number) => number) | null = null;
+
   constructor(options?: {
     l1MaxSize?: number;
     l2MaxSize?: number;
@@ -417,10 +657,17 @@ export class TileCacheManager {
    * Note: Scale is processed for cache-friendly keys:
    * - Legacy mode: Quantized to nearest tier for better cache hit rates
    * - Exact scale mode: Precision-rounded for exact-scale rendering
+   *
+   * amnesia-e4i FIX: Cache key now includes tileSize because tile indices map to
+   * different PDF regions depending on tileSize. Without this, a tile(2,2)@s8
+   * rendered with tileSize=256 (covering PDF 64,64) would collide with tile(2,2)@s8
+   * rendered with tileSize=512 (covering PDF 128,128).
    */
   private getTileKey(tile: TileCoordinate): string {
     const cacheScale = getScaleForCacheKey(tile.scale);
-    return `${this.documentId}-p${tile.page}-t${tile.tileX}x${tile.tileY}-s${cacheScale}`;
+    // Use 256 as default for backward compatibility with pre-adaptive tiles
+    const tileSize = tile.tileSize ?? 256;
+    return `${this.documentId}-p${tile.page}-t${tile.tileX}x${tile.tileY}-s${cacheScale}-ts${tileSize}`;
   }
 
   /**
@@ -648,13 +895,40 @@ export class TileCacheManager {
    * @param tile Tile coordinate
    * @param data Cached tile data (CachedTileData or Blob for legacy compatibility)
    * @param tier Which tier to cache in ('L1' for hot, 'L2' for prefetch)
+   * @param validationContext Optional context for compliance validation
    */
   async set(
     tile: TileCoordinate,
     data: CachedTileData | Blob,
-    tier: 'L1' | 'L2' = 'L2'
+    tier: 'L1' | 'L2' = 'L2',
+    validationContext?: { expectedScale?: number; currentZoom?: number; caller?: string }
   ): Promise<void> {
     const key = this.getTileKey(tile);
+
+    // TILE COMPLIANCE CHECK (amnesia-e4i): Validate tile before caching
+    // This catches scale mismatches at the source before they cause visual corruption
+    if (validationContext && isFeatureEnabled('useTileComplianceValidation')) {
+      const result = validateTileCompliance(
+        tile,
+        validationContext.expectedScale,
+        validationContext.currentZoom ?? 1,
+        validationContext.caller ?? 'TileCacheManager.set'
+      );
+      
+      if (!result.isCompliant) {
+        // Log but don't reject - we want to see what happens downstream
+        console.warn(
+          `[TILE-CACHE-SET-VIOLATION] Caching non-compliant tile:`,
+          {
+            key,
+            tile: `p${tile.page} (${tile.tileX},${tile.tileY}) s${tile.scale}`,
+            violations: result.violations,
+            expectedScale: validationContext.expectedScale,
+            zoom: validationContext.currentZoom?.toFixed(2),
+          }
+        );
+      }
+    }
 
     // Convert Blob to CachedTileData for legacy compatibility
     let cacheData: CachedTileData;
@@ -1070,7 +1344,19 @@ export class TileCacheManager {
    * If the exact requested scale isn't available, returns the highest
    * cached scale that's still below the requested scale.
    *
+   * CRITICAL FIX (amnesia-e4i): Tile coordinates are SCALE-DEPENDENT!
+   * Tile (5,3) at scale 12 covers DIFFERENT PDF content than (5,3) at scale 8.
+   * - At scale 12: tileSize = 256/12 ≈ 21.33 PDF units, so (5,3) covers (106.65, 64)
+   * - At scale 8: tileSize = 256/8 = 32 PDF units, so (5,3) covers (160, 96)
+   *
+   * The old code returned tiles with same (tileX, tileY) but different scale,
+   * which caused visual corruption during pan (content from wrong PDF position).
+   *
+   * FIX: Calculate PDF position first, then find which tile at fallback scale
+   * covers that same PDF position.
+   *
    * @param tile Tile coordinate with preferred scale
+   * @param tileSize Optional tile size in CSS pixels (default 256)
    * @returns Tile data and actual scale, or null if nothing cached
    *
    * @example
@@ -1078,14 +1364,36 @@ export class TileCacheManager {
    * const result = await cache.getBestAvailable({ page: 1, tileX: 0, tileY: 0, scale: 32 });
    * // result = { data: CachedTileData, actualScale: 8, cssStretch: 4 }
    */
-  async getBestAvailable(
-    tile: TileCoordinate
+   async getBestAvailable(
+    tile: TileCoordinate,
+    tileSize: number = 256
   ): Promise<{ data: CachedTileData; actualScale: number; cssStretch: number } | null> {
     // First, check if exact scale is available
     const exactData = this.getCachedData(tile);
     if (exactData) {
       return { data: exactData, actualScale: tile.scale, cssStretch: 1 };
     }
+
+    // amnesia-e4i FIX: Use tile.tileSize if available (from TileCoordinate),
+    // otherwise fall back to the parameter. This ensures PDF position
+    // calculation matches the tile grid that generated the indices.
+    const effectiveTileSize = tile.tileSize ?? tileSize;
+
+    // Calculate the PDF position this tile covers
+    // PDF position = tileIndex * (tileSize / scale)
+    const pdfTileSize = effectiveTileSize / tile.scale;
+    const pdfX = tile.tileX * pdfTileSize;
+    const pdfY = tile.tileY * pdfTileSize;
+
+    // Helper: find the tile at a given scale that covers the same PDF position
+    const getTileAtScaleForPdfPosition = (scaleTier: number): TileCoordinate => {
+      // amnesia-e4i FIX: Use effectiveTileSize (from tile.tileSize or parameter)
+      const fallbackPdfTileSize = effectiveTileSize / scaleTier;
+      const fallbackTileX = Math.floor(pdfX / fallbackPdfTileSize);
+      const fallbackTileY = Math.floor(pdfY / fallbackPdfTileSize);
+      // amnesia-e4i FIX: Include tileSize so render uses matching size
+      return { page: tile.page, tileX: fallbackTileX, tileY: fallbackTileY, scale: scaleTier, tileSize: effectiveTileSize };
+    };
 
     // ZOOM-OUT FIX: Check for HIGHER scales first (can be CSS-downscaled)
     // Downscaling high-res content looks better than upscaling low-res content
@@ -1094,11 +1402,20 @@ export class TileCacheManager {
       const scaleTier = SCALE_TIERS[i];
       if (scaleTier <= tile.scale) continue; // Skip scales at or below requested
 
-      const fallbackTile: TileCoordinate = { ...tile, scale: scaleTier };
+      // COORDINATE FIX (amnesia-e4i): Find the tile at this scale that covers the SAME PDF position
+      const fallbackTile = getTileAtScaleForPdfPosition(scaleTier);
       const fallbackData = this.getCachedData(fallbackTile);
       if (fallbackData) {
         // cssStretch < 1 means downscale (e.g., have scale 16, need 8 → stretch 0.5)
         const cssStretch = tile.scale / scaleTier;
+        
+        // Log when fallback tile indices differ from requested (indicates the fix is working)
+        if (fallbackTile.tileX !== tile.tileX || fallbackTile.tileY !== tile.tileY) {
+          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale} ` +
+            `→ using (${fallbackTile.tileX},${fallbackTile.tileY})@s${scaleTier} ` +
+            `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
+        }
+        
         return { data: fallbackData, actualScale: scaleTier, cssStretch };
       }
     }
@@ -1108,11 +1425,20 @@ export class TileCacheManager {
       const scaleTier = SCALE_TIERS[i];
       if (scaleTier >= tile.scale) continue; // Skip scales at or above requested
 
-      const fallbackTile: TileCoordinate = { ...tile, scale: scaleTier };
+      // COORDINATE FIX (amnesia-e4i): Find the tile at this scale that covers the SAME PDF position
+      const fallbackTile = getTileAtScaleForPdfPosition(scaleTier);
       const fallbackData = this.getCachedData(fallbackTile);
       if (fallbackData) {
         // cssStretch > 1 means upscale (e.g., have scale 4, need 8 → stretch 2)
         const cssStretch = tile.scale / scaleTier;
+        
+        // Log when fallback tile indices differ from requested (indicates the fix is working)
+        if (fallbackTile.tileX !== tile.tileX || fallbackTile.tileY !== tile.tileY) {
+          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale} ` +
+            `→ using (${fallbackTile.tileX},${fallbackTile.tileY})@s${scaleTier} ` +
+            `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
+        }
+        
         return { data: fallbackData, actualScale: scaleTier, cssStretch };
       }
     }
@@ -1126,20 +1452,125 @@ export class TileCacheManager {
    * Convenience wrapper around getBestAvailable that returns ImageBitmap.
    * The caller owns the returned ImageBitmap and should close() it after use.
    *
+   * amnesia-e4i ENHANCEMENT: If no tile is cached at any scale, try to extract
+   * the tile region from a cached full-page image. This guarantees a fallback
+   * exists when tiles are dropped from the render queue due to overflow.
+   *
    * @param tile Tile coordinate with preferred scale
+   * @param tileSize Optional tile size in pixels (default 256)
    * @returns ImageBitmap and metadata, or null if nothing cached
    */
   async getBestAvailableBitmap(
-    tile: TileCoordinate
+    tile: TileCoordinate,
+    tileSize: number = 256
   ): Promise<{ bitmap: ImageBitmap; actualScale: number; cssStretch: number } | null> {
-    const result = await this.getBestAvailable(tile);
-    if (!result) return null;
+    // amnesia-e4i FIX: Use tile.tileSize if available for correct PDF position calculation
+    const effectiveTileSize = tile.tileSize ?? tileSize;
+    
+    // First, try to find a cached tile at any scale
+    const result = await this.getBestAvailable(tile, effectiveTileSize);
+    if (result) {
+      try {
+        const bitmap = await this.createBitmapFromCachedData(result.data);
+        return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch };
+      } catch (error) {
+        console.warn('[TileCacheManager] Failed to create bitmap from best available:', error);
+        // Fall through to full-page fallback
+      }
+    }
+
+    // amnesia-e4i: If no tile cached, try to extract from full-page cache
+    // This is the "guaranteed fallback" for queue overflow scenarios
+    const fullPageResult = await this.extractTileFromFullPageCache(tile, effectiveTileSize);
+    if (fullPageResult) {
+      console.log(`[TileCacheManager] Using full-page fallback for tile page=${tile.page} ` +
+        `(${tile.tileX},${tile.tileY}) at scale ${tile.scale}, actual=${fullPageResult.actualScale}`);
+      return fullPageResult;
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract a tile region from a cached full-page image (amnesia-e4i).
+   *
+   * When tile cache misses but full-page cache has content, we can slice
+   * the relevant region from the full-page image. This provides a guaranteed
+   * fallback when high-res tile requests are dropped from the queue.
+   *
+   * @param tile Tile coordinate to extract
+   * @param tileSize Tile size in pixels (default 256)
+   * @returns Extracted tile bitmap and metadata, or null if no full-page cached
+   */
+  private async extractTileFromFullPageCache(
+    tile: TileCoordinate,
+    tileSize: number = 256
+  ): Promise<{ bitmap: ImageBitmap; actualScale: number; cssStretch: number } | null> {
+    // Find best available full-page image (any scale)
+    const fullPageResult = this.getBestAvailableFullPage(tile.page, tile.scale);
+    if (!fullPageResult) return null;
 
     try {
-      const bitmap = await this.createBitmapFromCachedData(result.data);
-      return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch };
+      // Create bitmap from full-page cache
+      const fullPageBitmap = await this.createBitmapFromCachedData(fullPageResult.data);
+      
+      // Calculate tile position in full-page coordinate space
+      // The full-page is at actualScale, tile coordinates are at tile.scale
+      const scaleRatio = tile.scale / fullPageResult.actualScale;
+      
+      // Tile coordinates in the full-page bitmap
+      // Use the cached data dimensions to ensure correct slicing
+      const srcX = (tile.tileX * tileSize) / scaleRatio;
+      const srcY = (tile.tileY * tileSize) / scaleRatio;
+      const srcW = Math.min(tileSize / scaleRatio, fullPageBitmap.width - srcX);
+      const srcH = Math.min(tileSize / scaleRatio, fullPageBitmap.height - srcY);
+
+      // Skip if tile is completely outside the full-page bounds
+      if (srcX >= fullPageBitmap.width || srcY >= fullPageBitmap.height || srcW <= 0 || srcH <= 0) {
+        fullPageBitmap.close();
+        return null;
+      }
+
+      // Create offscreen canvas for the tile
+      const offscreen = new OffscreenCanvas(tileSize, tileSize);
+      const ctx = offscreen.getContext('2d');
+      if (!ctx) {
+        fullPageBitmap.close();
+        return null;
+      }
+
+      // Clear to white (in case tile extends beyond page bounds)
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, tileSize, tileSize);
+
+      // Calculate destination dimensions (may be smaller than tileSize for edge tiles)
+      const dstW = srcW * scaleRatio;
+      const dstH = srcH * scaleRatio;
+
+      // Draw the tile region from the full-page bitmap
+      ctx.drawImage(
+        fullPageBitmap,
+        srcX, srcY, srcW, srcH,  // Source region
+        0, 0, dstW, dstH  // Destination (scaled to fit)
+      );
+
+      // Clean up full-page bitmap
+      fullPageBitmap.close();
+
+      // Create tile bitmap from offscreen canvas
+      const tileBitmap = await createImageBitmap(offscreen);
+
+      // Calculate CSS stretch factor
+      // If full-page was at scale 2 and tile needs scale 16, cssStretch = 8
+      const cssStretch = tile.scale / fullPageResult.actualScale;
+
+      return {
+        bitmap: tileBitmap,
+        actualScale: fullPageResult.actualScale,
+        cssStretch,
+      };
     } catch (error) {
-      console.warn('[TileCacheManager] Failed to create bitmap from best available:', error);
+      console.warn('[TileCacheManager] Failed to extract tile from full-page cache:', error);
       return null;
     }
   }
@@ -1740,7 +2171,8 @@ export class TileCacheManager {
 
     for (let tileX = 0; tileX < tilesX; tileX++) {
       for (let tileY = 0; tileY < tilesY; tileY++) {
-        const tile: TileCoordinate = { page, tileX, tileY, scale };
+        // amnesia-e4i FIX: Include tileSize so render uses matching size
+        const tile: TileCoordinate = { page, tileX, tileY, scale, tileSize };
         if (!this.has(tile)) {
           renderPromises.push(
             renderCallback(tile).then((data) => {
@@ -1752,6 +2184,109 @@ export class TileCacheManager {
     }
 
     await Promise.all(renderPromises);
+  }
+
+  /**
+   * Populate tile cache from a full-page image (amnesia-e4i: Fallback tile system).
+   *
+   * This method solves the queue overflow problem at mid-zoom:
+   * - At zoom 8x, a page needs 294 tiles (14×21 grid)
+   * - Queue max is 400, but with multiple pages visible, tiles get dropped
+   * - Dropped tiles cause gaps (blank regions) in the rendered page
+   *
+   * Solution: Before requesting high-res tiles, render a single low-res full-page
+   * image and slice it into tile-sized chunks. These chunks serve as guaranteed
+   * fallbacks when high-res tiles fail.
+   *
+   * Performance:
+   * - One MuPDF render at scale 2 (~100ms) instead of 294 individual tile renders
+   * - Slicing is pure CPU work (~10ms for 294 chunks)
+   * - Result: Every tile position has SOMETHING cached
+   *
+   * @param page Page number
+   * @param fullPageBitmap Full-page ImageBitmap rendered at low scale
+   * @param sourceScale The scale at which fullPageBitmap was rendered
+   * @param pageDimensions Page dimensions at scale 1
+   * @param targetScale The tile scale we're caching for (usually = sourceScale)
+   * @param tileSize Tile size in CSS pixels (default 256)
+   * @returns Number of tile chunks cached
+   */
+  async populateTileCacheFromFullPage(
+    page: number,
+    fullPageBitmap: ImageBitmap,
+    sourceScale: number,
+    pageDimensions: { width: number; height: number },
+    targetScale: number = sourceScale,
+    tileSize: number = 256
+  ): Promise<number> {
+    // Calculate how many tiles this page needs at the target scale
+    const scaledWidth = pageDimensions.width * targetScale;
+    const scaledHeight = pageDimensions.height * targetScale;
+    const tilesX = Math.ceil(scaledWidth / tileSize);
+    const tilesY = Math.ceil(scaledHeight / tileSize);
+
+    // Create an offscreen canvas to slice the full-page image
+    const offscreen = new OffscreenCanvas(tileSize, tileSize);
+    const ctx = offscreen.getContext('2d');
+    if (!ctx) {
+      console.error('[TileCacheManager] Failed to get offscreen canvas context');
+      return 0;
+    }
+
+    // Scale factor from source bitmap to target tile scale
+    // If sourceScale = 2 and targetScale = 2, scaleRatio = 1 (no scaling needed)
+    // If sourceScale = 2 and targetScale = 16, scaleRatio = 8 (each chunk is 8x smaller)
+    const scaleRatio = targetScale / sourceScale;
+
+    let cachedCount = 0;
+
+    for (let tileY = 0; tileY < tilesY; tileY++) {
+      for (let tileX = 0; tileX < tilesX; tileX++) {
+        // Calculate source rectangle in the full-page bitmap
+        // Source is at sourceScale, so coordinates need adjustment
+        const srcX = (tileX * tileSize) / scaleRatio;
+        const srcY = (tileY * tileSize) / scaleRatio;
+        const srcW = tileSize / scaleRatio;
+        const srcH = tileSize / scaleRatio;
+
+        // Clear and draw the tile chunk
+        ctx.clearRect(0, 0, tileSize, tileSize);
+        ctx.drawImage(
+          fullPageBitmap,
+          srcX, srcY, srcW, srcH,  // Source rectangle
+          0, 0, tileSize, tileSize  // Destination (full tile)
+        );
+
+        // Convert to blob for cache storage
+        const blob = await offscreen.convertToBlob({ type: 'image/png' });
+
+        // Create tile coordinate
+        const tile: TileCoordinate = {
+          page,
+          tileX,
+          tileY,
+          scale: targetScale,
+        };
+
+        // Only cache if we don't already have this tile (don't overwrite high-res)
+        if (!this.has(tile)) {
+          const cacheData: CachedTileData = {
+            format: 'png',
+            blob,
+            width: tileSize,
+            height: tileSize,
+          };
+          this.set(tile, cacheData, 'L2');
+          cachedCount++;
+        }
+      }
+    }
+
+    console.log(`[TileCacheManager] populateTileCacheFromFullPage: page=${page}, ` +
+      `sourceScale=${sourceScale}, targetScale=${targetScale}, ` +
+      `grid=${tilesX}×${tilesY}=${tilesX * tilesY} tiles, cached=${cachedCount} new`);
+
+    return cachedCount;
   }
 
   /**
@@ -1778,6 +2313,85 @@ export class TileCacheManager {
     for (const key of keysToEvict) {
       this.l1Cache.delete(key);
     }
+  }
+
+  /**
+   * Set the priority function for focal-point-aware eviction (amnesia-x6q).
+   * Higher priority values = less important (evicted first).
+   *
+   * @param fn Function that returns priority (0=critical, 3=low) for a tile
+   */
+  setPriorityFunction(fn: ((page: number, tileX: number, tileY: number) => number) | null): void {
+    this.priorityFunction = fn;
+    console.log(`[TileCacheManager] Priority function ${fn ? 'set' : 'cleared'}`);
+  }
+
+  /**
+   * Evict tiles by priority, removing lowest-priority tiles first (amnesia-x6q).
+   * Uses the priority function if set, otherwise falls back to page distance.
+   *
+   * @param targetCount Number of tiles to evict
+   * @param currentPage Current visible page (for fallback distance calculation)
+   * @returns Number of tiles actually evicted
+   */
+  evictByPriority(targetCount: number, currentPage: number = 1): number {
+    let evicted = 0;
+
+    // Collect tiles with their priorities
+    type TileWithPriority = { key: string; priority: number; cache: 'l1' | 'l2' };
+    const tilesWithPriority: TileWithPriority[] = [];
+
+    // Collect from both caches
+    for (const key of this.l1Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+
+      let priority: number;
+      if (this.priorityFunction && 'tileX' in parsed) {
+        // Use focal-point priority function
+        priority = this.priorityFunction(parsed.page, parsed.tileX!, parsed.tileY!);
+      } else {
+        // Fallback: priority by page distance (further = higher priority = evicted first)
+        priority = Math.abs(parsed.page - currentPage);
+      }
+
+      tilesWithPriority.push({ key, priority, cache: 'l1' });
+    }
+
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+
+      let priority: number;
+      if (this.priorityFunction && 'tileX' in parsed) {
+        priority = this.priorityFunction(parsed.page, parsed.tileX!, parsed.tileY!);
+      } else {
+        priority = Math.abs(parsed.page - currentPage);
+      }
+
+      tilesWithPriority.push({ key, priority, cache: 'l2' });
+    }
+
+    // Sort by priority descending (highest priority value = least important = evict first)
+    tilesWithPriority.sort((a, b) => b.priority - a.priority);
+
+    // Evict up to targetCount tiles, starting from least important
+    for (const tile of tilesWithPriority) {
+      if (evicted >= targetCount) break;
+
+      if (tile.cache === 'l1') {
+        this.l1Cache.delete(tile.key);
+      } else {
+        this.l2Cache.delete(tile.key);
+      }
+      evicted++;
+    }
+
+    if (evicted > 0) {
+      console.log(`[TileCacheManager] evictByPriority: evicted ${evicted}/${targetCount} tiles`);
+    }
+
+    return evicted;
   }
 
   /**
@@ -1818,26 +2432,42 @@ export class TileCacheManager {
 
     switch (level) {
       case 1: // Moderate pressure - reduce L2 limits by 25%
+        // amnesia-x6q: Use priority-based eviction if available
+        if (this.priorityFunction) {
+          evictedCount = this.evictByPriority(Math.floor(this.l2Cache.size * 0.25));
+        }
         this.l2Cache.resize({
           maxSize: Math.floor(baseL2Size * 0.75),
           maxBytes: Math.floor(baseL2Bytes * 0.75),
         });
-        console.log('[TileCacheManager] Memory pressure level 1: Reduced L2 cache to 75%');
+        console.log(`[TileCacheManager] Memory pressure level 1: Reduced L2 to 75%, evicted ${evictedCount} by priority`);
         break;
 
-      case 2: // High pressure - reduce L2 by 50%, clear L1
-        this.l1Cache.clear();
+      case 2: // High pressure - reduce L2 by 50%, evict by priority
+        // amnesia-x6q: Use priority-based eviction instead of clearing all L1
+        if (this.priorityFunction) {
+          // Evict 50% of tiles by priority (keeps high-priority tiles in L1)
+          evictedCount = this.evictByPriority(Math.floor((this.l1Cache.size + this.l2Cache.size) * 0.5));
+        } else {
+          this.l1Cache.clear();
+          evictedCount = this.l1Cache.size;
+        }
         this.l2Cache.resize({
           maxSize: Math.floor(baseL2Size * 0.5),
           maxBytes: Math.floor(baseL2Bytes * 0.5),
         });
-        evictedCount = this.l1Cache.size;
-        console.log('[TileCacheManager] Memory pressure level 2: Cleared L1, reduced L2 to 50%');
+        console.log(`[TileCacheManager] Memory pressure level 2: Reduced L2 to 50%, evicted ${evictedCount} tiles`);
         break;
 
       case 3: // Critical pressure - aggressive reduction
-        this.l1Cache.clear();
-        evictedCount = this.evictIntermediateScales();
+        // amnesia-x6q: Even at critical, use priority to keep the most important tiles
+        if (this.priorityFunction) {
+          // Keep only ~10% of tiles (the highest priority ones)
+          evictedCount = this.evictByPriority(Math.floor((this.l1Cache.size + this.l2Cache.size) * 0.9));
+        } else {
+          this.l1Cache.clear();
+          evictedCount = this.evictIntermediateScales();
+        }
         this.l2Cache.resize({
           maxSize: Math.floor(baseL2Size * 0.25),
           maxBytes: Math.floor(baseL2Bytes * 0.25),
