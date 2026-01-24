@@ -1,0 +1,577 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "created": "2026-01-14",
+    "author": "Amnesia Development Team",
+    "status": "approved",
+    "description": "EPUB renderer specification for MuPDF WASM migration - comprehensive blueprint for hybrid rendering approach",
+    "references": {
+      "planFile": "docs/plans/epub-migration/2026-01-14/migration-plan.md",
+      "mupdfWasmSpec": "docs/specifications/mupdf-wasm-compiler-spec.json",
+      "apiSpec": "docs/specifications/API/api-v1.0.md"
+    }
+  },
+
+  "goals": [
+    "Unified MuPDF backend for PDF + EPUB parsing",
+    "Full feature parity with current Shadow DOM implementation",
+    "NEW: Fixed-layout EPUB support via MuPDF pixmap rendering",
+    "~200KB bundle reduction (remove epub-cfi-resolver dependency)",
+    "30-50% faster EPUB loading via native WASM parsing"
+  ],
+
+  "nonGoals": [
+    "Replacing Shadow DOM rendering for reflowable EPUBs",
+    "Changing CSS multi-column pagination",
+    "Modifying CSS Custom Highlight API integration",
+    "Altering user-facing settings UI",
+    "Supporting DRM-protected EPUBs"
+  ],
+
+  "currentArchitecture": {
+    "keep": [
+      {"file": "src/reader/shadow-dom-renderer.ts", "lines": 1854, "reason": "Modern Shadow DOM rendering"},
+      {"file": "src/reader/shadow-dom-view.ts", "lines": 500, "reason": "Shadow DOM setup and lifecycle"},
+      {"file": "src/reader/navigator/paginated-navigator.ts", "lines": 2128, "reason": "CSS multi-column pagination"},
+      {"file": "src/reader/navigator/scrolled-navigator.ts", "lines": 1144, "reason": "Virtual scrolling mode"},
+      {"file": "src/reader/navigator/navigator-interface.ts", "lines": 483, "reason": "Navigator abstraction"},
+      {"file": "src/reader/navigator/navigator-factory.ts", "lines": 100, "reason": "Mode selection"},
+      {"file": "src/reader/renderer/css-highlights.ts", "lines": 400, "reason": "CSS Custom Highlight API"},
+      {"file": "src/reader/renderer/selection.ts", "lines": 300, "reason": "Text selection handling"},
+      {"file": "src/reader/renderer/inline-highlights.ts", "lines": 200, "reason": "Fallback highlight rendering"}
+    ],
+    "remove": [
+      {"file": "src/reader/renderer/renderer.ts", "lines": 3764, "reason": "Legacy iframe-based EpubRenderer"},
+      {"file": "src/reader/renderer/api-client.ts", "lines": 150, "reason": "Server-based content provider (unused)"}
+    ],
+    "modify": [
+      {"file": "src/reader/shadow-dom-renderer.ts", "changes": "Swap ContentProvider to MuPDF-based"},
+      {"file": "src/reader/renderer/cfi-utils.ts", "changes": "Replace epub-cfi-resolver with MuPDF or internal implementation"},
+      {"file": "src/reader/renderer/document-renderer.ts", "changes": "Add EPUB format handlers"},
+      {"file": "src/reader/renderer/hybrid-document-provider.ts", "changes": "EPUB integration via MuPDF"},
+      {"file": "src/reader/renderer/pdf/mupdf-worker.ts", "changes": "Add EPUB message types"},
+      {"file": "src/reader/renderer/pdf/mupdf-bridge.ts", "changes": "Add EPUB methods"}
+    ],
+    "create": [
+      {"file": "src/reader/renderer/epub/mupdf-epub-bridge.ts", "lines": 400, "purpose": "MuPDF EPUB bridge"},
+      {"file": "src/reader/renderer/epub/mupdf-epub-content-provider.ts", "lines": 300, "purpose": "ContentProvider implementation"},
+      {"file": "src/reader/renderer/epub/fixed-layout-epub-renderer.ts", "lines": 600, "purpose": "Fixed-layout support"},
+      {"file": "src/reader/renderer/epub/epub-format-detector.ts", "lines": 100, "purpose": "Format detection"},
+      {"file": "src/reader/renderer/epub/mupdf-epub-search.ts", "lines": 200, "purpose": "Search integration"}
+    ]
+  },
+
+  "mupdfApiRequirements": {
+    "documentLifecycle": {
+      "openEpub": {
+        "signature": "(data: ArrayBuffer) => Promise<{ docId: string; metadata: EpubMetadata }>",
+        "description": "Open EPUB from ArrayBuffer, returns document ID and metadata"
+      },
+      "closeDocument": {
+        "signature": "(docId: string) => Promise<void>",
+        "description": "Close document and free resources"
+      },
+      "getMetadata": {
+        "signature": "(docId: string) => Promise<EpubMetadata>",
+        "description": "Get document metadata (title, author, publisher, etc.)"
+      }
+    },
+    "structure": {
+      "getChapterCount": {
+        "signature": "(docId: string) => Promise<number>",
+        "description": "Get total number of chapters/spine items"
+      },
+      "getSpine": {
+        "signature": "(docId: string) => Promise<SpineItem[]>",
+        "description": "Get spine items with href, title, linear flag"
+      },
+      "getToc": {
+        "signature": "(docId: string) => Promise<TocEntry[]>",
+        "description": "Get hierarchical table of contents"
+      },
+      "getChapterHtml": {
+        "signature": "(docId: string, chapterIndex: number) => Promise<string>",
+        "description": "Get raw HTML content for a chapter"
+      },
+      "getChapterText": {
+        "signature": "(docId: string, chapterIndex: number) => Promise<string>",
+        "description": "Get plain text content for a chapter"
+      }
+    },
+    "search": {
+      "searchText": {
+        "signature": "(docId: string, query: string, maxHits: number) => Promise<SearchResult[]>",
+        "description": "Full-text search across entire document"
+      },
+      "searchChapter": {
+        "signature": "(docId: string, chapterIndex: number, query: string) => Promise<SearchResult[]>",
+        "description": "Search within a specific chapter"
+      }
+    },
+    "fixedLayout": {
+      "isFixedLayout": {
+        "signature": "(docId: string) => Promise<boolean>",
+        "description": "Check if document is fixed-layout or reflowable"
+      },
+      "getPageCount": {
+        "signature": "(docId: string) => Promise<number>",
+        "description": "Get total page count for fixed-layout"
+      },
+      "getPageDimensions": {
+        "signature": "(docId: string, pageNum: number) => Promise<{ width: number; height: number }>",
+        "description": "Get page dimensions in points"
+      },
+      "renderPage": {
+        "signature": "(docId: string, pageNum: number, scale: number, format: 'rgba' | 'png') => Promise<Uint8Array>",
+        "description": "Render entire page as RGBA or PNG"
+      },
+      "renderTile": {
+        "signature": "(docId: string, pageNum: number, tileX: number, tileY: number, tileSize: number, scale: number) => Promise<Uint8Array>",
+        "description": "Render tile for tiled rendering"
+      }
+    },
+    "resources": {
+      "getResource": {
+        "signature": "(docId: string, href: string) => Promise<ArrayBuffer>",
+        "description": "Get embedded resource (images, fonts, etc.)"
+      },
+      "getResourceAsDataUrl": {
+        "signature": "(docId: string, href: string) => Promise<string>",
+        "description": "Get resource as base64 data URL"
+      }
+    }
+  },
+
+  "features": {
+    "displayModes": {
+      "paginated": {
+        "description": "CSS multi-column pagination with horizontal navigation",
+        "renderer": "Shadow DOM + CSS multi-column",
+        "navigation": "translate3d transforms",
+        "columnLayouts": ["single", "dual", "auto"],
+        "pageAnimations": ["none", "slide", "curl"],
+        "scrollSnap": true,
+        "integerForcing": true,
+        "driftPrevention": true
+      },
+      "scrolled": {
+        "description": "Continuous vertical scrolling with virtual DOM",
+        "renderer": "Shadow DOM + virtual scrolling",
+        "navigation": "scrollTop with smooth scroll",
+        "chapterWindowing": {
+          "default": 5,
+          "min": 3,
+          "max": 10,
+          "description": "Number of chapters kept in DOM"
+        },
+        "intersectionObserver": true,
+        "momentumScrolling": true
+      },
+      "fixedLayout": {
+        "description": "MuPDF pixmap rendering for fixed-layout EPUBs",
+        "renderer": "MuPDF pixmap → Canvas (like PDF)",
+        "navigation": "Tile-based with 3-tier cache",
+        "zoomRange": [0.5, 16],
+        "tileSize": 256,
+        "status": "NEW",
+        "reusesPdfInfrastructure": [
+          "tile-cache-manager.ts",
+          "tile-render-engine.ts",
+          "render-coordinator.ts",
+          "scroll-strategy.ts"
+        ]
+      }
+    },
+
+    "typography": {
+      "fontSize": {
+        "min": 10,
+        "max": 40,
+        "default": 18,
+        "unit": "px",
+        "step": 1
+      },
+      "fontFamily": {
+        "builtIn": ["serif", "sans-serif", "Georgia", "Palatino", "Times New Roman", "Arial", "Helvetica", "Open Sans", "monospace"],
+        "accessibility": ["OpenDyslexic"],
+        "obsidianFonts": true,
+        "customWebFonts": false
+      },
+      "lineHeight": {
+        "min": 1.0,
+        "max": 3.0,
+        "default": 1.5,
+        "step": 0.1
+      },
+      "textAlign": {
+        "options": ["left", "justify", "right", "center"],
+        "default": "justify"
+      },
+      "margins": {
+        "min": 0,
+        "max": 100,
+        "default": 40,
+        "unit": "px",
+        "perSide": true,
+        "sides": ["top", "bottom", "left", "right"]
+      },
+      "letterSpacing": {
+        "min": -2,
+        "max": 10,
+        "default": 0,
+        "unit": "px"
+      },
+      "wordSpacing": {
+        "min": -2,
+        "max": 10,
+        "default": 0,
+        "unit": "px"
+      },
+      "disabledForFixedLayout": true
+    },
+
+    "themes": {
+      "presets": {
+        "system": {
+          "bg": "inherit",
+          "fg": "inherit",
+          "link": "inherit",
+          "description": "Inherits from Obsidian theme"
+        },
+        "light": {
+          "bg": "#ffffff",
+          "fg": "#1a1a1a",
+          "link": "#0066cc"
+        },
+        "dark": {
+          "bg": "#1a1a1a",
+          "fg": "#e0e0e0",
+          "link": "#6bb3ff"
+        },
+        "sepia": {
+          "bg": "#f4ecd8",
+          "fg": "#5b4636",
+          "link": "#7c5e3c"
+        },
+        "night": {
+          "bg": "#000000",
+          "fg": "#ffcc66",
+          "link": "#ffcc66",
+          "description": "OLED-friendly true black"
+        },
+        "paper": {
+          "bg": "#f5f5f0",
+          "fg": "#1a1a1a",
+          "link": "#4a5568"
+        },
+        "forest": {
+          "bg": "#1a2e1a",
+          "fg": "#a8d8a8",
+          "link": "#7cb87c"
+        }
+      },
+      "customThemes": {
+        "enabled": true,
+        "savedThemesLimit": 10,
+        "customizableProperties": ["bg", "fg", "link", "highlight"]
+      },
+      "themeObserver": true,
+      "cssVariablesOverride": true
+    },
+
+    "highlights": {
+      "colors": ["yellow", "green", "blue", "pink", "purple", "orange"],
+      "types": ["highlight", "underline"],
+      "anchoring": {
+        "primary": "CFI (Canonical Fragment Identifier)",
+        "fallback": ["TextQuote with context", "TextPosition"],
+        "confidenceScoring": true
+      },
+      "rendering": {
+        "primary": "CSS Custom Highlight API",
+        "fallback": "Inline <mark> elements",
+        "browserSupport": "Chrome 105+, Safari 17.2+, Firefox 140+"
+      },
+      "features": {
+        "instantHighlight": true,
+        "defaultColor": "yellow",
+        "autoCopyToClipboard": false,
+        "confirmDelete": true,
+        "blinkAnimation": true
+      },
+      "persistence": "highlight-service.ts",
+      "sync": "Unified sync engine (Calibre, Server, File adapters)"
+    },
+
+    "navigation": {
+      "toc": {
+        "unlimitedNesting": true,
+        "perChapterProgress": true,
+        "expandedStatePersistence": true,
+        "autoExpandToCurrent": true,
+        "keyboardNavigation": true
+      },
+      "search": {
+        "fullText": true,
+        "resultsPerChapter": true,
+        "progressive": true,
+        "maxResults": 1000,
+        "contextWindow": {
+          "before": 50,
+          "after": 50
+        }
+      },
+      "bookmarks": true,
+      "tapZones": {
+        "left": "prev-page",
+        "right": "next-page",
+        "center": "toggle-ui",
+        "top": "show-toolbar",
+        "bottom": "show-progress",
+        "configurable": true
+      },
+      "keyboard": {
+        "ArrowLeft": "prev",
+        "ArrowRight": "next",
+        "ArrowUp": "prev-chapter",
+        "ArrowDown": "next-chapter",
+        "Home": "first-page",
+        "End": "last-page",
+        "Space": "next-page",
+        "Shift+Space": "prev-page"
+      },
+      "gestures": {
+        "swipeLeft": "next-page",
+        "swipeRight": "prev-page",
+        "pinchZoom": true,
+        "doubleTap": "toggle-zoom"
+      }
+    },
+
+    "perBookSettings": {
+      "overridable": [
+        "fontSize",
+        "fontFamily",
+        "lineHeight",
+        "theme",
+        "flow",
+        "spreads",
+        "columns",
+        "textAlign",
+        "margins",
+        "brightness",
+        "pageAnimation"
+      ],
+      "storage": "plugin data.json per book ID",
+      "persistence": "book-settings-store.ts"
+    }
+  },
+
+  "performanceBenchmarks": {
+    "loading": {
+      "openEpub100Chapters": {
+        "target": "<500ms",
+        "current": "800-1200ms",
+        "improvement": "30-50%"
+      },
+      "firstChapterRender": {
+        "target": "<150ms",
+        "current": "300ms",
+        "improvement": "50%"
+      },
+      "tocExtraction": {
+        "target": "<50ms"
+      },
+      "metadataExtraction": {
+        "target": "<20ms"
+      }
+    },
+    "navigation": {
+      "pageTurn": {
+        "target": "<16ms",
+        "fps": 60
+      },
+      "chapterSwitch": {
+        "target": "<100ms"
+      },
+      "scrollFps": {
+        "target": 60,
+        "minimum": 45
+      },
+      "inputLatency": {
+        "target": "<50ms"
+      }
+    },
+    "search": {
+      "fullText800Pages": {
+        "target": "<1000ms"
+      },
+      "perChapter": {
+        "target": "<50ms"
+      },
+      "progressive": true
+    },
+    "memory": {
+      "100Chapters": {
+        "target": "<50MB"
+      },
+      "chapterWindowSize": {
+        "default": 5,
+        "configurable": true
+      },
+      "highlightCacheLimit": {
+        "default": 1000
+      }
+    },
+    "fixedLayout": {
+      "tileRender256x256at2x": {
+        "target": "<50ms"
+      },
+      "cacheL1": {
+        "size": "100 tiles",
+        "eviction": "LRU"
+      },
+      "cacheL2": {
+        "storage": "IndexedDB",
+        "size": "unlimited"
+      },
+      "workerPoolSize": 4
+    }
+  },
+
+  "settingsUI": {
+    "tabs": ["Display", "Typography", "Theme", "Navigation", "Advanced"],
+    "displayTab": {
+      "settings": ["mode", "columns", "pageAnimation", "fixedLayoutFit"],
+      "conditionalVisibility": {
+        "fixedLayoutFit": "onlyWhenFixedLayout"
+      }
+    },
+    "typographyTab": {
+      "settings": ["fontSize", "fontFamily", "lineHeight", "textAlign", "margins", "letterSpacing", "wordSpacing"],
+      "conditionalVisibility": {
+        "all": "disabledForFixedLayout"
+      }
+    },
+    "themeTab": {
+      "settings": ["preset", "customColors", "savedThemes"]
+    },
+    "navigationTab": {
+      "settings": ["tapZones", "gestures", "keyboard", "autoScroll"]
+    },
+    "advancedTab": {
+      "settings": ["chapterCacheSize", "prefetchStrategy", "memoryLimit", "debug"]
+    }
+  },
+
+  "workerMessages": {
+    "epubRequests": [
+      "LOAD_EPUB",
+      "UNLOAD_EPUB",
+      "GET_EPUB_METADATA",
+      "GET_EPUB_TOC",
+      "GET_EPUB_SPINE",
+      "GET_CHAPTER_HTML",
+      "GET_CHAPTER_TEXT",
+      "SEARCH_EPUB",
+      "SEARCH_CHAPTER",
+      "GET_RESOURCE",
+      "GET_RESOURCE_DATA_URL",
+      "IS_FIXED_LAYOUT",
+      "RENDER_FIXED_PAGE",
+      "RENDER_FIXED_TILE"
+    ],
+    "epubResponses": [
+      "EPUB_LOADED",
+      "EPUB_LOAD_ERROR",
+      "EPUB_METADATA",
+      "EPUB_TOC",
+      "EPUB_SPINE",
+      "CHAPTER_HTML",
+      "CHAPTER_TEXT",
+      "SEARCH_RESULTS",
+      "RESOURCE",
+      "RESOURCE_DATA_URL",
+      "FIXED_LAYOUT_STATUS",
+      "FIXED_PAGE_RENDERED",
+      "FIXED_TILE_RENDERED"
+    ]
+  },
+
+  "successMetrics": {
+    "functional": [
+      "All 7 themes render correctly",
+      "Typography controls affect display",
+      "Highlights persist across sessions",
+      "TOC navigation works with all nesting levels",
+      "Search returns accurate results",
+      "Per-book settings override globals",
+      "Fixed-layout EPUBs render as tiles",
+      "Zoom/pan works for fixed-layout",
+      "CFI anchoring survives reflow"
+    ],
+    "performance": [
+      "Open EPUB <500ms",
+      "Page turn <16ms (60 FPS)",
+      "Search <1000ms for 800 pages",
+      "Memory <50MB for 100 chapters",
+      "Fixed-layout tile render <50ms at 2x scale"
+    ],
+    "quality": [
+      "No sub-pixel drift in pagination",
+      "Smooth 60fps scrolling",
+      "CSS highlights work in Shadow DOM",
+      "No memory leaks after chapter transitions",
+      "Graceful degradation for unsupported browsers"
+    ],
+    "codeQuality": [
+      "Net code reduction ~2,314 lines",
+      "Legacy renderer.ts deleted",
+      "epub-cfi-resolver dependency removed",
+      "TypeScript strict mode passes",
+      "No lint errors"
+    ]
+  },
+
+  "testCorpus": [
+    {"name": "Small Reflowable", "chapters": 10, "size": "<1MB", "type": "reflowable"},
+    {"name": "Medium Reflowable", "chapters": 50, "size": "1-5MB", "type": "reflowable"},
+    {"name": "Large Reflowable", "chapters": 100, "size": ">10MB", "type": "reflowable"},
+    {"name": "Fixed-Layout Comic", "pages": 200, "size": "50MB", "type": "fixed-layout"},
+    {"name": "Fixed-Layout Magazine", "pages": 50, "size": "20MB", "type": "fixed-layout"},
+    {"name": "RTL Arabic", "chapters": 20, "type": "reflowable", "direction": "rtl"},
+    {"name": "CJK Vertical", "chapters": 20, "type": "reflowable", "writingMode": "vertical-rl"},
+    {"name": "SVG-heavy EPUB3", "chapters": 30, "type": "reflowable", "features": ["svg", "mathml"]},
+    {"name": "Deeply Nested TOC", "chapters": 50, "type": "reflowable", "tocDepth": 5},
+    {"name": "Image-heavy", "chapters": 100, "images": 500, "type": "reflowable"},
+    {"name": "Minimal EPUB2", "chapters": 5, "type": "reflowable", "version": "2.0"},
+    {"name": "Full EPUB3", "chapters": 50, "type": "reflowable", "version": "3.0", "features": ["media-overlays", "scripting"]}
+  ],
+
+  "riskMitigation": [
+    {
+      "risk": "MuPDF EPUB parsing differs from current pub-rs parsing",
+      "likelihood": "medium",
+      "impact": "high",
+      "mitigation": "Compare HTML output side-by-side, add normalization layer if needed"
+    },
+    {
+      "risk": "CFI generation not supported by MuPDF",
+      "likelihood": "high",
+      "impact": "medium",
+      "mitigation": "Keep epub-cfi-resolver as fallback initially, implement internal CFI later"
+    },
+    {
+      "risk": "Fixed-layout detection unreliable",
+      "likelihood": "low",
+      "impact": "medium",
+      "mitigation": "Use OPF metadata + heuristics (viewport meta, fixed dimensions)"
+    },
+    {
+      "risk": "Performance regression during migration",
+      "likelihood": "low",
+      "impact": "high",
+      "mitigation": "Feature flag for A/B testing, comprehensive benchmarks before/after"
+    }
+  ]
+}

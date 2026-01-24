@@ -1,0 +1,50 @@
+{
+  "timestamp": "2026-01-09T16:09:00.310Z",
+  "description": "Phase 1 - Raw RGBA Transfer optimization results",
+  "optimization": "Eliminated PNG encode/decode by using pixmap.getSamples() for raw RGBA transfer",
+  "summary": {
+    "totalTileRenders": 221,
+    "avgTileRenderTime": 68.14,
+    "p95TileRenderTime": 79.60,
+    "avgScale": 4.0,
+    "maxScale": 4,
+    "memoryMB": 2593.4
+  },
+  "comparison": {
+    "baseline": {
+      "avgTileRenderTime": 92.10,
+      "p95TileRenderTime": 110.50,
+      "source": "baseline-metrics-2026-01-09.json"
+    },
+    "improvement": {
+      "avgTileRenderTime": "26% faster (92.10ms → 68.14ms)",
+      "p95TileRenderTime": "28% faster (110.50ms → 79.60ms)",
+      "absoluteSavings": "~24ms per tile"
+    }
+  },
+  "flags": {
+    "useRawRGBA": true,
+    "useSharedArrayBuffer": false
+  },
+  "capabilities": {
+    "hasSharedArrayBuffer": true,
+    "hasCrossOriginIsolation": false,
+    "hasWebGL2": true,
+    "hasOffscreenCanvas": true,
+    "cpuCores": 8,
+    "deviceMemoryGB": 8,
+    "isElectron": true,
+    "chromeVersion": 124
+  },
+  "analysis": {
+    "expectedImprovement": "70-93% (based on eliminating 10-50ms PNG encode + 1-5ms decode)",
+    "actualImprovement": "26-28%",
+    "explanation": "The remaining render time (~68ms) is dominated by MuPDF page.run() which performs the actual PDF rasterization. PNG encode/decode overhead was ~24ms, not 60-90ms as initially estimated.",
+    "nextOptimizations": [
+      "Multi-worker parallelization to increase throughput",
+      "Display list caching to skip re-parsing",
+      "SharedArrayBuffer for zero-copy transfer",
+      "Multi-resolution zoom for perceived latency"
+    ]
+  }
+}

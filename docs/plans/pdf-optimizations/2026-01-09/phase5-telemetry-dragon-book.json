@@ -1,0 +1,67 @@
+{
+  "testDocument": "dragon-book-compilers.pdf (Mixed content PDF)",
+  "testDate": "2026-01-09T21:34:07.051Z",
+  "phase": "5.15 - Comprehensive Benchmarks",
+  "summary": {
+    "contentTypeDetectionWorking": true,
+    "primaryContentType": "mixed",
+    "documentType": "Technical textbook with text, diagrams, and code"
+  },
+  "performanceMetrics": {
+    "totalRenders": 46,
+    "totalTileRenders": 151,
+    "avgRenderTime": 41.5,
+    "avgTileRenderTime": 3918.27,
+    "p95RenderTime": 197.9,
+    "p95TileRenderTime": 6866.1,
+    "firstTileTime": 43.6,
+    "rendersPerSecond": 3.82
+  },
+  "cacheMetrics": {
+    "overallHitRate": 10.15,
+    "l1HitRate": 11.49,
+    "l2HitRate": 0,
+    "l3HitRate": 94.34
+  },
+  "workerMetrics": {
+    "avgUtilization": 23.13,
+    "workerCount": 4,
+    "currentActive": 1,
+    "pendingTasks": 24
+  },
+  "memoryMetrics": {
+    "avgMB": 218.14,
+    "peakMB": 221.07,
+    "currentMB": 218.85
+  },
+  "zoomMetrics": {
+    "currentZoom": 0.1,
+    "totalZoomChanges": 13,
+    "avgRenderScale": 1.17,
+    "maxRenderScale": 3
+  },
+  "scrollMetrics": {
+    "totalDistance": 0,
+    "maxVelocity": 0,
+    "avgFps": 60,
+    "jankEvents": 0,
+    "frameDropRate": 0
+  },
+  "contentTypeDistribution": {
+    "scanned-jpeg": 155,
+    "mixed": 23,
+    "text-heavy": 6,
+    "complex": 61
+  },
+  "sessionInfo": {
+    "durationSeconds": 51.63,
+    "modeTransitions": 0
+  },
+  "testNotes": [
+    "Technical textbook with mixed content types",
+    "Contains text-heavy pages (6) - first detection of text-heavy type",
+    "Contains complex pages (61) and mixed pages (23)",
+    "Unexpectedly high tile render times - may need investigation",
+    "60 FPS maintained, 0 jank events during testing"
+  ]
+}

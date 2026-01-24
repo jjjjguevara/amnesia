@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "plan_id": "trackpad-zoom-rebound-remediation",
+    "created": "2026-01-15T00:00:00Z",
+    "enforced_in_ci": false
+  },
+  "performance": {
+    "zoom_input_latency_ms": {
+      "floor": 100,
+      "target": 50,
+      "unit": "ms",
+      "measurement_method": "Time from wheel event to visual zoom change"
+    },
+    "rebound_detection_accuracy_percent": {
+      "floor": 90,
+      "target": 98,
+      "unit": "%",
+      "measurement_method": "Rebounds correctly blocked / Total rebounds observed"
+    }
+  },
+  "reliability": {
+    "zoom_drift_at_max": {
+      "floor": 0.5,
+      "target": 0.1,
+      "unit": "zoom units",
+      "measurement_method": "Max observed zoom drift after releasing at 16x"
+    },
+    "false_positive_rate_percent": {
+      "floor": 5,
+      "target": 1,
+      "unit": "%",
+      "measurement_method": "Intentional zoom-outs incorrectly blocked / Total intentional zoom-outs"
+    }
+  },
+  "custom": {
+    "vulnerability_window_coverage_percent": {
+      "floor": 95,
+      "target": 100,
+      "unit": "%",
+      "measurement_method": "Percentage of 0-150ms window protected by at least one defense layer"
+    },
+    "protection_layers_active": {
+      "floor": 2,
+      "target": 3,
+      "unit": "count",
+      "measurement_method": "Number of rebound protection layers implemented and active"
+    },
+    "cooldown_duration_ms": {
+      "target": 600,
+      "ceiling": 800,
+      "unit": "ms",
+      "measurement_method": "Duration of zoom-out blocking after reaching max zoom"
+    },
+    "extended_memory_duration_ms": {
+      "target": 800,
+      "ceiling": 1000,
+      "unit": "ms",
+      "measurement_method": "Duration of direction memory preservation near limits"
+    }
+  }
+}

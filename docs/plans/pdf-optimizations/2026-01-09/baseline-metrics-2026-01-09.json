@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-01-09T00:00:00.000Z",
+  "description": "Baseline PDF rendering performance before Phase 1 optimization (Raw RGBA Transfer)",
+  "testDocument": "Information Geometry and Its Applications - Ay, Nihat.pdf",
+  "summary": {
+    "totalRenders": 3,
+    "totalTileRenders": 1037,
+    "avgRenderTime": 68.23,
+    "avgTileRenderTime": 92.10,
+    "p50TileRenderTime": 91.60,
+    "p95TileRenderTime": 110.50,
+    "p99TileRenderTime": 113.90,
+    "cacheHitRate": 0,
+    "cacheMisses": 6588,
+    "memoryMB": 2568.7
+  },
+  "pipeline": {
+    "timingsCount": 0,
+    "stats": null,
+    "note": "Pipeline telemetry not recording - needs investigation"
+  },
+  "flags": {
+    "useRawRGBA": true,
+    "useSharedArrayBuffer": false,
+    "useMultiResZoom": true,
+    "workerCount": 4,
+    "useThumbnailCache": true,
+    "enableTelemetry": true,
+    "enablePipelineTelemetry": true
+  },
+  "capabilities": {
+    "hasSharedArrayBuffer": true,
+    "hasCrossOriginIsolation": false,
+    "hasWebGL2": true,
+    "hasOffscreenCanvas": true,
+    "cpuCores": 8,
+    "deviceMemoryGB": 8,
+    "isElectron": true,
+    "chromeVersion": 124
+  },
+  "targets": {
+    "phase1": {
+      "description": "Raw RGBA Transfer - eliminate PNG encode/decode",
+      "expectedImprovement": "70-93% tile latency reduction",
+      "targetAvgTileTime": "1-6ms (from 92ms)"
+    }
+  }
+}

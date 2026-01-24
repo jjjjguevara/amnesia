@@ -1,0 +1,242 @@
+{
+  "metadata": {
+    "timestamp": "2026-01-09T18:27:23.697Z",
+    "phase": "Phase 4 - Grid Mode Optimization",
+    "version": "1.0.0",
+    "sessionId": "benchmark-1767983243697",
+    "description": "Benchmark results after implementing Phase 4 optimizations including parallel thumbnail generation, ripple-based priority queue, IndexedDB persistence, and mode transition cache management"
+  },
+  "environment": {
+    "platform": "MacIntel",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) obsidian/1.6.x",
+    "deviceMemory": 8,
+    "hardwareConcurrency": 8,
+    "devicePixelRatio": 2
+  },
+  "configuration": {
+    "featureFlags": {
+      "useRawRGBA": "auto",
+      "useSharedArrayBuffer": "auto",
+      "useMultiResZoom": true,
+      "workerCount": "auto",
+      "useThumbnailCache": true,
+      "enableTelemetry": true,
+      "enablePipelineTelemetry": true,
+      "useAdaptiveTileSize": true,
+      "useContentTypeDetection": false,
+      "useWebGLCompositing": false
+    },
+    "workerCount": 4,
+    "phase4Features": {
+      "parallelThumbnailGeneration": true,
+      "ripplePriorityQueue": true,
+      "indexedDBThumbnailCache": true,
+      "modeTransitionCacheManagement": true
+    }
+  },
+  "telemetry": {
+    "stats": {
+      "overallHitRate": 0.0587,
+      "l1HitRate": 0.0488,
+      "l2HitRate": 0.069,
+      "l3HitRate": 0,
+      "avgRenderTime": 80.31,
+      "avgTileRenderTime": 22.14,
+      "p95RenderTime": 312,
+      "p95TileRenderTime": 28.7,
+      "firstTileTime": 5115.4,
+      "avgWorkerUtilization": 0.25,
+      "currentActiveWorkers": 1,
+      "currentTotalWorkers": 4,
+      "currentPendingTasks": 8,
+      "avgMemoryMB": 143.35,
+      "peakMemoryMB": 181.87,
+      "currentMemoryMB": 154.05,
+      "totalModeTransitions": 1,
+      "avgTransitionDuration": 0,
+      "sessionDuration": 1199.94,
+      "totalRenders": 15,
+      "totalTileRenders": 3226,
+      "rendersPerSecond": 2.7,
+      "currentZoom": 16,
+      "totalZoomChanges": 31,
+      "avgTimeAtZoomLevel": 147.27,
+      "mostUsedZoomLevel": 3,
+      "scrollTotalDistance": 0,
+      "scrollMaxVelocity": 0,
+      "scrollAvgFps": 60,
+      "scrollJankEvents": 0,
+      "scrollFrameDropRate": 0,
+      "avgRenderScale": 3,
+      "maxRenderScale": 3
+    },
+    "summary": "[PDF Telemetry Summary]\n  Cache: 5.9% hit rate (L1: 4.9%, L2: 6.9%)\n  Render: avg 80.3ms, p95 312.0ms\n  Tiles: avg 22.1ms, first 5115.4ms\n  Scale: avg 3.0x, max 3x\n  Zoom: current 16.0x, 31 changes, most used: 3.0x\n  Scroll: 60 FPS, 0 jank events, 0.0% dropped\n  Workers: 25% utilization, 8 pending\n  Memory: 154.0MB current, 181.9MB peak\n  Session: 1199.9s, 3241 renders"
+  },
+  "benchmarks": {
+    "tileRenderTimes": {
+      "sampleCount": 100,
+      "min": 12.1,
+      "p10": 15.3,
+      "p25": 18.6,
+      "median": 22.1,
+      "p75": 25.9,
+      "p90": 28.2,
+      "p95": 28.7,
+      "p99": 29.3,
+      "max": 29.3,
+      "mean": 22.14,
+      "unit": "ms",
+      "target": "<30ms"
+    },
+    "pageRenderTimes": {
+      "sampleCount": 15,
+      "min": 26.1,
+      "p25": 39.4,
+      "median": 47.4,
+      "p75": 97.3,
+      "p95": 312,
+      "max": 312,
+      "mean": 80.31,
+      "unit": "ms"
+    },
+    "workerUtilization": {
+      "avgUtilization": 0.25,
+      "totalWorkers": 4,
+      "activeWorkers": 1,
+      "pendingTasks": 8,
+      "description": "4-worker pool with document affinity load balancing"
+    },
+    "cachePerformance": {
+      "overallHitRate": 0.0587,
+      "l1HitRate": 0.0488,
+      "l2HitRate": 0.069,
+      "totalHits": 6660,
+      "totalMisses": 106853,
+      "totalAccesses": 113513,
+      "note": "Low hit rate expected during initial load/zoom exploration"
+    },
+    "memoryUsage": {
+      "currentMB": 154.05,
+      "peakMB": 181.87,
+      "avgMB": 143.35,
+      "budget": 500,
+      "withinBudget": true
+    },
+    "firstTileMetrics": {
+      "firstTileTimeMs": 5115.4,
+      "targetMs": 200,
+      "meetsTarget": false,
+      "note": "First tile time includes WASM initialization and document parsing"
+    },
+    "modeTransitions": {
+      "totalTransitions": 1,
+      "avgDurationMs": 0,
+      "transitions": [
+        {
+          "from": "paginated",
+          "to": "scroll",
+          "duration": 0,
+          "timestamp": 1767982048867
+        }
+      ]
+    },
+    "scrollPerformance": {
+      "avgFps": 60,
+      "jankEvents": 0,
+      "frameDropRate": 0,
+      "totalDistance": 0,
+      "maxVelocity": 0,
+      "target": ">55fps"
+    },
+    "renderThroughput": {
+      "totalRenders": 15,
+      "totalTileRenders": 3226,
+      "rendersPerSecond": 2.7,
+      "sessionDurationSeconds": 1199.94
+    }
+  },
+  "summary": {
+    "benchmarkDurationMs": 1,
+    "overallGrade": "C",
+    "keyMetrics": {
+      "avgTileRenderMs": 22.14,
+      "cacheHitRate": "5.9%",
+      "memoryUsageMB": "154.0",
+      "workerUtilization": "25.0%",
+      "scrollFps": 60
+    },
+    "gradeBreakdown": {
+      "tileRenderTime": {
+        "score": 25,
+        "max": 25,
+        "reason": "Median 22.1ms < 30ms target"
+      },
+      "cacheHitRate": {
+        "score": 0,
+        "max": 25,
+        "reason": "5.9% < 20% threshold (expected during exploration)"
+      },
+      "memoryUsage": {
+        "score": 25,
+        "max": 25,
+        "reason": "154MB < 200MB excellent threshold"
+      },
+      "scrollFps": {
+        "score": 25,
+        "max": 25,
+        "reason": "60 FPS >= 58 FPS target"
+      }
+    },
+    "phase4Targets": {
+      "thumbnailGeneration": {
+        "target": "100 pages in <1s",
+        "status": "implemented",
+        "implementation": "Parallel batch rendering via WorkerPoolManager.renderPageBatch()"
+      },
+      "firstThumbnails": {
+        "target": "first 9 in <200ms",
+        "status": "implemented",
+        "implementation": "Ripple priority ordering via getThumbnailRippleOrder() with critical/high/medium/low priority bands"
+      },
+      "indexedDBCache": {
+        "target": "instant reopen",
+        "status": "implemented",
+        "implementation": "ThumbnailIdbCache with 100MB LRU, 30-day expiry, document hash keys"
+      },
+      "modeTransitions": {
+        "target": "no blank pages",
+        "status": "implemented",
+        "implementation": "Enhanced setMode() with pre-transition rendering, cache preservation rules"
+      }
+    }
+  },
+  "phase4Implementation": {
+    "filesCreated": [
+      "src/reader/renderer/pdf/thumbnail-idb-cache.ts"
+    ],
+    "filesModified": [
+      "src/reader/renderer/pdf/worker-pool-manager.ts",
+      "src/reader/renderer/pdf/pooled-mupdf-bridge.ts",
+      "src/reader/renderer/pdf/wasm-renderer.ts",
+      "src/reader/renderer/pdf/hybrid-pdf-provider.ts",
+      "src/reader/renderer/pdf/grid-strategy.ts",
+      "src/reader/renderer/pdf/render-coordinator.ts",
+      "src/reader/renderer/pdf/tile-cache-manager.ts",
+      "src/reader/renderer/pdf/index.ts"
+    ],
+    "newCapabilities": {
+      "parallelBatchRendering": "WorkerPoolManager.renderPageBatch() distributes pages across 4 workers",
+      "ripplePriorityQueue": "getThumbnailRippleOrder() generates pages from center with priority bands",
+      "indexedDBPersistence": "ThumbnailIdbCache stores thumbnails as WebP with document hash keys",
+      "documentHashGeneration": "generateDocumentHash() creates content-based keys from first 8KB + size",
+      "modeTransitionCallbacks": "RenderCoordinator.onModeTransition() and setModeAsync() for smooth transitions",
+      "cacheWarmth": "TileCacheManager.getPageCacheWarmth() and prewarmPage() for pre-transition rendering"
+    }
+  },
+  "recommendations": [
+    "First tile time (5.1s) includes WASM init - consider lazy loading or preloading",
+    "Cache hit rate will improve with IndexedDB cache on document reopens",
+    "Worker utilization (25%) shows room for more parallelization",
+    "Consider increasing L1/L2 cache sizes for frequently zoomed documents"
+  ]
+}

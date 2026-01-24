@@ -1,0 +1,66 @@
+{
+  "document": "marx-reference-benchmark.pdf",
+  "testDate": "2026-01-09T20:36:00Z",
+  "phase": "5.10 - Content-Type Detection Verification",
+  "summary": {
+    "documentIdMismatchFixed": true,
+    "classificationWorking": true,
+    "jpegExtractionTested": false,
+    "reasonNotTested": "Document contains primarily complex/text-heavy pages, not scanned pages"
+  },
+  "metrics": {
+    "overallHitRate": 0.08881535044642093,
+    "l1HitRate": 0.005417085801572221,
+    "l2HitRate": 0.00528551521599065,
+    "l3HitRate": 0.9996127191194456,
+    "avgRenderTime": 127.55434782608695,
+    "avgTileRenderTime": 205.00199999928475,
+    "p95RenderTime": 202.5,
+    "p95TileRenderTime": 675.0999999940395,
+    "firstTileTime": 4706.799999982119,
+    "avgWorkerUtilization": 0.245,
+    "currentActiveWorkers": 1,
+    "currentTotalWorkers": 4,
+    "currentPendingTasks": 9,
+    "avgMemoryMB": 237.89889440674713,
+    "peakMemoryMB": 298.81067657470703,
+    "currentMemoryMB": 241.99713897705078,
+    "totalModeTransitions": 3,
+    "avgTransitionDuration": 0,
+    "sessionDuration": 346.722,
+    "totalRenders": 46,
+    "totalTileRenders": 4316,
+    "rendersPerSecond": 12.580684236939105,
+    "currentZoom": 2.616713600502358,
+    "totalZoomChanges": 75,
+    "avgTimeAtZoomLevel": 2201.675675675676,
+    "mostUsedZoomLevel": 0.5,
+    "scrollTotalDistance": 0,
+    "scrollMaxVelocity": 0,
+    "scrollAvgFps": 60,
+    "scrollJankEvents": 0,
+    "scrollFrameDropRate": 0,
+    "avgRenderScale": 2.5,
+    "maxRenderScale": 4
+  },
+  "contentTypeDistribution": {
+    "complex": 50660,
+    "scannedJpeg": 156,
+    "mixed": 334
+  },
+  "classificationTimes": {
+    "avgMs": 2.2374999970197678,
+    "count": 8
+  },
+  "workerStats": {
+    "documentWorkerPoolInitTime": 509.8,
+    "workerPoolInitTime": 759.2,
+    "workerCount": 4,
+    "avgWorker0RequestTime": 70.05
+  },
+  "cacheStats": {
+    "hits": 51906,
+    "misses": 532520,
+    "hitRate": 0.089
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "obsidian-devtools": {
+      "type": "local",
+      "command": ["node", "/Users/josueguevara/Documents/Builds/obsidian-devtools-mcp/dist/index.js"],
+      "enabled": true
+    }
+  }
+}

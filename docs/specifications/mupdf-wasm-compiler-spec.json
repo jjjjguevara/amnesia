@@ -1,0 +1,345 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "created": "2026-01-13",
+    "author": "Amnesia Development Team",
+    "status": "approved",
+    "description": "Custom MuPDF WASM build specification for maximum PDF rendering performance with EPUB support preserved",
+    "references": {
+      "currentMuPDFVersion": "1.27.0",
+      "targetMuPDFVersion": "1.26.x (latest stable)",
+      "currentWASMSize": "~2.3MB",
+      "targetWASMSize": "<1.5MB",
+      "baselinePerformance": {
+        "rawRGBAImprovement": "26%",
+        "multiResZoomLatencyReduction": "80-90%",
+        "multiWorkerThroughputGain": "3x+",
+        "jpegExtractionSpeedup": "285x"
+      }
+    }
+  },
+
+  "objectives": {
+    "primary": [
+      {
+        "goal": "Reduce WASM bundle size",
+        "target": "<1.5MB (35% reduction from 2.3MB)",
+        "rationale": "Faster worker initialization, reduced plugin download size",
+        "measurable": true
+      },
+      {
+        "goal": "Maximize PDF rendering performance",
+        "target": "<50ms MuPDF rasterization per 256x256 tile at 2x scale",
+        "rationale": "Current bottleneck is 68ms MuPDF rasterization",
+        "measurable": true
+      },
+      {
+        "goal": "Enable SIMD optimizations",
+        "target": "10-30% performance improvement on vector operations",
+        "rationale": "Modern browsers support WASM SIMD, critical for pixel manipulation",
+        "measurable": true
+      }
+    ],
+    "secondary": [
+      {
+        "goal": "Preserve EPUB rendering capability",
+        "target": "Full EPUB support maintained",
+        "rationale": "Future engine consolidation planned (EPUB + PDF unified provider)",
+        "measurable": false
+      },
+      {
+        "goal": "Optimize for 4-worker pool architecture",
+        "target": "4 concurrent workers with <100MB memory each",
+        "rationale": "Current worker-pool-manager.ts uses 4 workers max",
+        "measurable": true
+      }
+    ]
+  },
+
+  "features": {
+    "enabled": [
+      {
+        "flag": "FZ_ENABLE_PDF",
+        "value": 1,
+        "rationale": "Core PDF rendering - primary use case"
+      },
+      {
+        "flag": "FZ_ENABLE_EPUB",
+        "value": 1,
+        "rationale": "Future engine consolidation - EPUB + PDF unified provider"
+      },
+      {
+        "flag": "FZ_ENABLE_SVG",
+        "value": 1,
+        "rationale": "EPUB3 requires SVG support - kept for compatibility"
+      },
+      {
+        "flag": "FZ_ENABLE_IMG",
+        "value": 1,
+        "rationale": "Safe image handling - kept for EPUB compatibility"
+      },
+      {
+        "flag": "FZ_ENABLE_HTML_ENGINE",
+        "value": "auto",
+        "rationale": "Auto-enabled when FZ_ENABLE_EPUB=1"
+      }
+    ],
+    "disabled": [
+      {
+        "flag": "FZ_ENABLE_XPS",
+        "value": 0,
+        "rationale": "XPS format not used in Amnesia",
+        "sizeReduction": "~150KB"
+      },
+      {
+        "flag": "FZ_ENABLE_CBZ",
+        "value": 0,
+        "rationale": "Comic book format not supported",
+        "sizeReduction": "~50KB"
+      },
+      {
+        "flag": "FZ_ENABLE_HTML",
+        "value": 0,
+        "rationale": "Standalone HTML files - EPUB uses HTML_ENGINE directly",
+        "sizeReduction": "~80KB"
+      },
+      {
+        "flag": "FZ_ENABLE_JS",
+        "value": 0,
+        "rationale": "PDF JavaScript execution not needed - EPUB3 JS handled by browser",
+        "sizeReduction": "~200KB"
+      },
+      {
+        "flag": "FZ_ENABLE_MOBI",
+        "value": 0,
+        "rationale": "MOBI format not supported",
+        "sizeReduction": "~30KB"
+      },
+      {
+        "flag": "FZ_ENABLE_FB2",
+        "value": 0,
+        "rationale": "FictionBook2 format not supported",
+        "sizeReduction": "~30KB"
+      },
+      {
+        "flag": "FZ_ENABLE_TXT",
+        "value": 0,
+        "rationale": "Plain text format not needed",
+        "sizeReduction": "~20KB"
+      },
+      {
+        "flag": "FZ_ENABLE_OFFICE",
+        "value": 0,
+        "rationale": "Office document support not needed",
+        "sizeReduction": "~100KB"
+      },
+      {
+        "flag": "FZ_ENABLE_OCR_OUTPUT",
+        "value": 0,
+        "rationale": "OCR output formats not required",
+        "sizeReduction": "~100KB"
+      },
+      {
+        "flag": "FZ_ENABLE_DOCX_OUTPUT",
+        "value": 0,
+        "rationale": "DOCX export not needed",
+        "sizeReduction": "~150KB"
+      },
+      {
+        "flag": "FZ_ENABLE_ODT_OUTPUT",
+        "value": 0,
+        "rationale": "ODT export not needed",
+        "sizeReduction": "~100KB"
+      },
+      {
+        "flag": "HAVE_FONT_CJK",
+        "value": "no",
+        "rationale": "CJK font support removed for target non-CJK users",
+        "sizeReduction": "~800KB"
+      }
+    ]
+  },
+
+  "build_configuration": {
+    "emscripten": {
+      "minimumVersion": "3.1.25",
+      "recommendedVersion": "3.1.50",
+      "verificationCommand": "emcc --version",
+      "installationUrl": "https://emscripten.org/docs/getting_started/downloads.html"
+    },
+    "compiler_flags": {
+      "CFLAGS": [
+        "-O3",
+        "-msimd128",
+        "-flto",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-DNDEBUG",
+        "-DFZ_ENABLE_PDF=1",
+        "-DFZ_ENABLE_EPUB=1",
+        "-DFZ_ENABLE_SVG=1",
+        "-DFZ_ENABLE_IMG=1",
+        "-DFZ_ENABLE_XPS=0",
+        "-DFZ_ENABLE_CBZ=0",
+        "-DFZ_ENABLE_HTML=0",
+        "-DFZ_ENABLE_JS=0",
+        "-DFZ_ENABLE_MOBI=0",
+        "-DFZ_ENABLE_FB2=0",
+        "-DFZ_ENABLE_TXT=0",
+        "-DFZ_ENABLE_OFFICE=0",
+        "-DFZ_ENABLE_OCR_OUTPUT=0",
+        "-DFZ_ENABLE_DOCX_OUTPUT=0",
+        "-DFZ_ENABLE_ODT_OUTPUT=0",
+        "-DTOFU_CJK_EXT=1"
+      ],
+      "LDFLAGS": [
+        "-O3",
+        "-flto",
+        "--closure 1",
+        "-s WASM=1",
+        "-s ALLOW_MEMORY_GROWTH=1",
+        "-s INITIAL_MEMORY=33554432",
+        "-s MAXIMUM_MEMORY=536870912",
+        "-s MODULARIZE=1",
+        "-s EXPORT_ES6=1",
+        "-s EXPORT_NAME='createMuPDFModule'",
+        "-s ENVIRONMENT=worker",
+        "-s FILESYSTEM=0",
+        "-s SUPPORT_ERRNO=0",
+        "-s DISABLE_EXCEPTION_CATCHING=1",
+        "-s ASSERTIONS=0",
+        "-s MALLOC=emmalloc",
+        "-s EXPORTED_RUNTIME_METHODS=['getValue','setValue','UTF8ToString']"
+      ]
+    },
+    "makefileOverrides": {
+      "HAVE_FONT_CJK": "no",
+      "HAVE_GLUT": "no",
+      "HAVE_LIBCRYPTO": "no",
+      "HAVE_CURL": "no"
+    },
+    "memory": {
+      "initialMemory": "32MB",
+      "initialMemoryBytes": 33554432,
+      "maximumMemory": "512MB",
+      "maximumMemoryBytes": 536870912,
+      "allowGrowth": true
+    },
+    "simd": {
+      "enabled": true,
+      "flag": "-msimd128",
+      "browserSupport": "Chrome 91+, Firefox 89+, Safari 16.4+, Electron 13+",
+      "fallbackStrategy": "Provide non-SIMD build as fallback (auto-detect via WebAssembly.validate)"
+    }
+  },
+
+  "api_surface": {
+    "exported_functions": [
+      {"name": "Document.openDocument", "signature": "Document openDocument(ArrayBuffer data, string mimeType)", "required": true},
+      {"name": "Document.countPages", "signature": "int countPages()", "required": true},
+      {"name": "Document.loadPage", "signature": "Page loadPage(int pageNum)", "required": true},
+      {"name": "Document.loadOutline", "signature": "Outline[] loadOutline()", "required": true},
+      {"name": "Page.getBounds", "signature": "Rect getBounds()", "required": true},
+      {"name": "Page.run", "signature": "void run(Device device, Matrix transform)", "required": true},
+      {"name": "Page.toStructuredText", "signature": "StructuredText toStructuredText(string options)", "required": true},
+      {"name": "Page.search", "signature": "Quad[][] search(string query, int maxHits)", "required": true},
+      {"name": "Pixmap.constructor", "signature": "Pixmap(ColorSpace cs, Rect bbox, bool alpha)", "required": true},
+      {"name": "Pixmap.clear", "signature": "void clear(int value)", "required": true},
+      {"name": "Pixmap.getSamples", "signature": "Uint8Array getSamples()", "required": true},
+      {"name": "Pixmap.getWidth", "signature": "int getWidth()", "required": true},
+      {"name": "Pixmap.getHeight", "signature": "int getHeight()", "required": true},
+      {"name": "Pixmap.destroy", "signature": "void destroy()", "required": true},
+      {"name": "DrawDevice.constructor", "signature": "DrawDevice(Matrix transform, Pixmap pixmap)", "required": true},
+      {"name": "DrawDevice.close", "signature": "void close()", "required": true},
+      {"name": "DrawDevice.destroy", "signature": "void destroy()", "required": true},
+      {"name": "Matrix.identity", "signature": "Matrix identity", "required": true},
+      {"name": "Matrix.scale", "signature": "Matrix scale(float sx, float sy)", "required": true},
+      {"name": "Matrix.translate", "signature": "Matrix translate(float tx, float ty)", "required": true},
+      {"name": "Matrix.concat", "signature": "Matrix concat(Matrix a, Matrix b)", "required": true},
+      {"name": "ColorSpace.DeviceRGB", "signature": "ColorSpace DeviceRGB", "required": true},
+      {"name": "StructuredText.walk", "signature": "void walk(WalkerCallbacks callbacks)", "required": true},
+      {"name": "PDFObject.get", "signature": "PDFObject get(string key)", "required": true},
+      {"name": "PDFObject.readRawStream", "signature": "Buffer readRawStream()", "required": true}
+    ]
+  },
+
+  "dependencies": {
+    "required": [
+      {
+        "name": "Emscripten SDK",
+        "version": ">=3.1.25",
+        "install": "git clone https://github.com/emscripten-core/emsdk.git && cd emsdk && ./emsdk install 3.1.50 && ./emsdk activate 3.1.50"
+      },
+      {
+        "name": "MuPDF Source",
+        "version": "1.26.x",
+        "install": "git clone --recursive https://git.ghostscript.com/mupdf.git"
+      },
+      {
+        "name": "GNU Make",
+        "version": ">=3.81"
+      },
+      {
+        "name": "Python",
+        "version": ">=3.8"
+      }
+    ]
+  },
+
+  "success_metrics": {
+    "bundle_size": [
+      {"metric": "WASM file size (uncompressed)", "target": "<1.5MB", "current": "~2.3MB"},
+      {"metric": "WASM file size (gzipped)", "target": "<500KB", "current": "~700KB"}
+    ],
+    "performance": [
+      {"metric": "MuPDF rasterization time (256x256 tile, 2x scale)", "target": "<50ms", "baseline": "~68ms"},
+      {"metric": "Worker initialization", "target": "<200ms", "baseline": "400-800ms"},
+      {"metric": "60fps sustained scroll", "target": "10 seconds continuous", "baseline": "achieved"}
+    ],
+    "memory": [
+      {"metric": "Worker memory at 16x zoom", "target": "<100MB per worker"},
+      {"metric": "Total memory (4 workers + main)", "target": "<500MB"}
+    ]
+  },
+
+  "sharedArrayBuffer": {
+    "status": "NOT_AVAILABLE_IN_OBSIDIAN",
+    "reason": "Obsidian does not enable cross-origin isolation (COOP/COEP headers)",
+    "evidence": "SharedArrayBuffer violations logged in Obsidian console",
+    "fallbackStrategy": {
+      "primary": "Transferable ArrayBuffer (current RGBA path)",
+      "performance": "26-40% improvement over PNG baseline",
+      "future": "SAB zero-copy if Obsidian enables cross-origin isolation"
+    }
+  },
+
+  "risk_assessment": {
+    "high": [
+      {"risk": "Larger memory footprint (raw RGBA)", "mitigation": "Adjust cache entry counts"}
+    ],
+    "medium": [
+      {"risk": "Emscripten API changes", "mitigation": "Pin to version 3.1.50"},
+      {"risk": "SharedArrayBuffer unavailable", "mitigation": "Graceful degradation to Transferable"}
+    ],
+    "low": [
+      {"risk": "MuPDF API surface changes", "mitigation": "Pin to 1.26.x"},
+      {"risk": "SIMD incompatibility", "mitigation": "Dual builds with feature detection"}
+    ]
+  },
+
+  "implementation_phases": [
+    {"phase": 1, "name": "Build System Setup", "status": "pending"},
+    {"phase": 2, "name": "Source Acquisition", "status": "pending"},
+    {"phase": 3, "name": "Feature Flag Configuration", "status": "pending"},
+    {"phase": 4, "name": "WASM Compilation", "status": "pending"},
+    {"phase": 5, "name": "API Verification", "status": "pending"},
+    {"phase": 6, "name": "Transfer Optimization (Transferable ArrayBuffer)", "status": "pending", "note": "SAB unavailable in Obsidian"},
+    {"phase": 7, "name": "Integration Testing", "status": "pending"},
+    {"phase": 8, "name": "Visual Regression Testing", "status": "pending"},
+    {"phase": 9, "name": "Stress Testing", "status": "pending"},
+    {"phase": 10, "name": "Fallback Strategy", "status": "pending"},
+    {"phase": 11, "name": "Documentation", "status": "pending"},
+    {"phase": 12, "name": "CI/CD Integration", "status": "pending"},
+    {"phase": 13, "name": "Production Deployment", "status": "pending"}
+  ]
+}

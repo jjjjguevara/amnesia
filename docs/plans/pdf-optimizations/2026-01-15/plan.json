@@ -1,0 +1,345 @@
+{
+  "meta": {
+    "plan_id": "trackpad-zoom-rebound-remediation",
+    "plan_type": "remediation",
+    "name": "Trackpad Zoom Rebound Remediation",
+    "description": "Fix trackpad pinch-to-zoom rebound causing drift from max zoom (16x) by implementing layered rebound suppression",
+    "created": "2026-01-15T00:00:00Z",
+    "status": "draft",
+    "mode": "correctness_first",
+    "tags": ["pdf", "zoom", "trackpad", "ux", "rebound", "inertia"]
+  },
+  "dependencies": {
+    "requires": [],
+    "enables": ["pdf-unified-coordinate-space"]
+  },
+  "phases": [
+    {
+      "phase_id": "phase-1-immediate-limit-protection",
+      "name": "Immediate Limit Protection",
+      "description": "Close the 0-150ms vulnerability window at zoom limits with timestamp-based blocking",
+      "status": "pending",
+      "definition_of_ready": [
+        "Root cause analysis completed",
+        "Research document reviewed",
+        "Code architecture understood"
+      ],
+      "definition_of_done": [
+        "Zoom stays at 16x (±0.1) after fast pinch-release",
+        "Console shows rebound blocked messages",
+        "No visual drift at max zoom",
+        "Manual testing completed on macOS trackpad"
+      ],
+      "tasks": [
+        {
+          "task_id": "add-limit-timestamp-properties",
+          "name": "Add limit timestamp tracking properties",
+          "description": "Add lastMaxZoomReachedAt, lastMinZoomReachedAt, LIMIT_PROTECTION_DURATION_MS to PdfInfiniteCanvas",
+          "status": "pending",
+          "success_criteria": [
+            "Properties declared near line 271",
+            "TypeScript compiles without errors"
+          ]
+        },
+        {
+          "task_id": "add-limit-protection-guard",
+          "name": "Add limit protection guard in zoomAtPoint()",
+          "description": "Block zoom-out for 600ms after reaching max zoom, block zoom-in for 600ms after reaching min zoom",
+          "status": "pending",
+          "success_criteria": [
+            "Guard placed BEFORE zoom calculation in zoomAtPoint()",
+            "Returns early if within cooldown window",
+            "Logs blocked events for debugging"
+          ]
+        },
+        {
+          "task_id": "add-limit-tracking",
+          "name": "Add limit tracking after zoom calculation",
+          "description": "Record timestamp when zoom transitions to/from limit threshold (99% of max, 101% of min)",
+          "status": "pending",
+          "success_criteria": [
+            "Timestamps updated after zoomCameraToPoint() call",
+            "Only records on actual threshold crossing"
+          ]
+        },
+        {
+          "task_id": "add-telemetry-logging",
+          "name": "Add telemetry logging for blocked rebounds",
+          "description": "Log all blocked rebound events with timing information for analysis",
+          "status": "pending",
+          "success_criteria": [
+            "Logs include time since limit reached",
+            "Logs include delta magnitude",
+            "Logs distinguishable from other zoom logs"
+          ]
+        }
+      ]
+    },
+    {
+      "phase_id": "phase-2-extended-direction-memory",
+      "name": "Extended Direction Memory",
+      "description": "Protect 80-99% zoom range by preserving direction memory across TIME_GAP resets when near limits",
+      "status": "pending",
+      "definition_of_ready": [
+        "Phase 1 completed and verified",
+        "InertiaClassifier architecture understood"
+      ],
+      "definition_of_done": [
+        "Direction memory persists for 800ms at 85-99% zoom",
+        "Rebounds at 14x-15.9x are blocked",
+        "Legitimate zoom-out works after cooldown",
+        "No regression in smooth zoom feel"
+      ],
+      "tasks": [
+        {
+          "task_id": "add-extended-memory-properties",
+          "name": "Add extended memory properties to InertiaClassifier",
+          "description": "Add directionMemoryExtendedUntil and EXTENDED_MEMORY_MS constants",
+          "status": "pending",
+          "success_criteria": [
+            "Properties declared near line 65",
+            "EXTENDED_MEMORY_MS = 800"
+          ]
+        },
+        {
+          "task_id": "modify-time-gap-handling",
+          "name": "Modify TIME_GAP handling for near-limit zones",
+          "description": "When near zoom limits, preserve direction memory instead of resetting on TIME_GAP",
+          "status": "pending",
+          "success_criteria": [
+            "TIME_GAP block (L172-230) modified",
+            "Near-limit check added before direction reset",
+            "Direction reversal still detected with preserved memory"
+          ]
+        },
+        {
+          "task_id": "add-near-limit-helper",
+          "name": "Add isNearZoomLimit() helper method",
+          "description": "Helper to determine if current zoom is within 15% of min or max",
+          "status": "pending",
+          "success_criteria": [
+            "Method returns true when within 15% of limits",
+            "Uses zoomContext for min/max values",
+            "Pure function with no side effects"
+          ]
+        },
+        {
+          "task_id": "ensure-zoom-context-passed",
+          "name": "Ensure zoomContext passed to classify()",
+          "description": "Verify handleWheel passes complete zoomContext to InertiaClassifier.classify()",
+          "status": "pending",
+          "success_criteria": [
+            "zoomContext includes currentZoom, minZoom, maxZoom",
+            "Passed in handleWheel around line 3985"
+          ]
+        }
+      ]
+    },
+    {
+      "phase_id": "phase-3-velocity-detection",
+      "name": "Velocity Reversal Detection (Optional)",
+      "description": "Catch rebounds based on physics signature - sudden velocity reversals",
+      "status": "pending",
+      "definition_of_ready": [
+        "Phase 2 completed and verified",
+        "Need for additional coverage confirmed"
+      ],
+      "definition_of_done": [
+        "Catches rebounds at any zoom level",
+        "No false positives on intentional fast zoom changes",
+        "Velocity threshold tuned through testing"
+      ],
+      "tasks": [
+        {
+          "task_id": "add-velocity-tracking",
+          "name": "Add velocity tracking to InertiaClassifier",
+          "description": "Track zoom velocity (delta/time) over 300ms window",
+          "status": "pending",
+          "success_criteria": [
+            "velocityHistory array maintained",
+            "Window limited to 300ms",
+            "Velocity calculated per event"
+          ]
+        },
+        {
+          "task_id": "implement-velocity-reversal-detection",
+          "name": "Implement velocity reversal detection",
+          "description": "Detect sudden direction reversals with high velocity change",
+          "status": "pending",
+          "success_criteria": [
+            "Direction change detected",
+            "Velocity change > 0.5 threshold",
+            "Returns velocity_reversal reason"
+          ]
+        },
+        {
+          "task_id": "tune-velocity-threshold",
+          "name": "Tune velocity threshold through testing",
+          "description": "Adjust REBOUND_VELOCITY_THRESHOLD based on real-world testing",
+          "status": "pending",
+          "success_criteria": [
+            "Threshold minimizes false positives",
+            "Threshold catches actual rebounds",
+            "Documented testing methodology"
+          ]
+        }
+      ]
+    }
+  ],
+  "axiological": {
+    "dx_metrics": {
+      "build_time_target_seconds": 30,
+      "feedback_loop_target_seconds": 5,
+      "cognitive_load_assessment": "Low - focused changes to 2 files with clear purpose",
+      "automation_candidates": [
+        {
+          "task": "Rebound detection testing",
+          "current_state": "manual",
+          "automation_plan": "Add MCP-based automated zoom tests"
+        }
+      ]
+    },
+    "quality_floors": {
+      "defined": true,
+      "artifact_path": "docs/plans/pdf-optimizations/2026-01-15/quality-floors.json",
+      "enforced_in_ci": false
+    },
+    "bounded_context": {
+      "name": "PDF Zoom Pipeline",
+      "boundary_description": "Trackpad event handling, zoom state management, and rebound filtering",
+      "connected_to": [
+        {
+          "context": "Tile Rendering",
+          "interface": "ZoomStateMachine.getZoomSnapshot()",
+          "rationale": "Tiles render at snapshot zoom, not live camera zoom"
+        }
+      ],
+      "disconnected_from": [
+        {
+          "context": "EPUB Rendering",
+          "rationale": "EPUB uses Shadow DOM, not canvas zoom"
+        },
+        {
+          "context": "Unified Coordinate Space",
+          "rationale": "Bug occurs in legacy mode; unified mode disabled"
+        }
+      ]
+    },
+    "lifecycle": {
+      "stages_addressed": ["implementation", "validation"],
+      "maintenance_burden": "Low - self-contained with clear logging",
+      "support_owner": "PDF rendering team",
+      "deprecation_strategy": "Remove when unified coordinate space is enabled"
+    },
+    "trade_offs": [
+      {
+        "decision": "600ms cooldown duration",
+        "traded": "Immediate zoom-out responsiveness at limits",
+        "gained": "98% rebound protection coverage",
+        "rationale": "600ms is imperceptible for most users; protects against most rebounds"
+      },
+      {
+        "decision": "15% near-limit threshold for extended memory",
+        "traded": "Memory extension at 80-84% zoom",
+        "gained": "Focused protection where rebounds matter most",
+        "rationale": "Most rebound issues occur near max zoom"
+      }
+    ],
+    "legators_test": {
+      "why_documented": true,
+      "how_documented": true,
+      "when_documented": true,
+      "passed": true
+    }
+  },
+  "testing": {
+    "strategy": "Manual testing with MCP verification, automated regression tests pending",
+    "pyramid": {
+      "unit": 20,
+      "integration": 30,
+      "e2e": 50
+    },
+    "coverage_target": 80,
+    "tools": ["MCP DevTools", "Manual trackpad testing", "Console log analysis"]
+  },
+  "attempt_tracking": {
+    "issues": [
+      {
+        "issue_id": "BUG-001",
+        "description": "Trackpad pinch-to-zoom rebound causes drift from max zoom (16x)",
+        "first_seen": "2026-01-14T00:00:00Z",
+        "complexity_rating": "high",
+        "threshold": 5,
+        "status": "escalated",
+        "attempts": [
+          {
+            "attempt_number": 1,
+            "hypothesis": "Direction reversal blocking in handleWheel would catch rebounds",
+            "action_taken": "Block events where InertiaClassifier detects reason === 'direction_reversal'",
+            "outcome": "failed",
+            "side_effects": [],
+            "evidence": "TIME_GAP (300ms) resets classifier, treating rebounds as new gestures",
+            "learning": "TIME_GAP prevents direction reversal detection for 80-200ms rebounds"
+          },
+          {
+            "attempt_number": 2,
+            "hypothesis": "Magnitude anomaly check would filter large rebound deltas",
+            "action_taken": "Block events where |delta| > threshold (tried 0.15, 0.3, 0.5)",
+            "outcome": "failed",
+            "side_effects": ["Low thresholds blocked legitimate fast pinches"],
+            "evidence": "Normal pinch deltas 1.0-2.0 overlap with rebound magnitudes",
+            "learning": "Magnitude alone cannot distinguish intent from rebound"
+          },
+          {
+            "attempt_number": 3,
+            "hypothesis": "Temporal protection at max zoom would block post-release events",
+            "action_taken": "Block zoom-out for 500ms when at >=98% of max zoom",
+            "outcome": "failed",
+            "side_effects": ["Sluggish zoom feel during active zooming"],
+            "evidence": "Protection triggered during active gesture, not just after release",
+            "learning": "Need to detect gesture end, not just proximity to limit"
+          },
+          {
+            "attempt_number": 4,
+            "hypothesis": "Lower MIN_DIRECTION_SUM would establish direction faster",
+            "action_taken": "Lowered MIN_DIRECTION_SUM from 0.1 to 0.02",
+            "outcome": "partial",
+            "side_effects": [],
+            "evidence": "Direction tracking improved but 0-150ms window still vulnerable",
+            "learning": "Direction tracking alone insufficient; need multi-layer approach"
+          }
+        ],
+        "escalation": {
+          "triggered_at": "2026-01-15T00:00:00Z",
+          "trigger_reason": "threshold_exceeded",
+          "pattern_detected": "stagnation",
+          "resolution_strategy": "Layered defense: immediate limit protection + extended direction memory + velocity detection",
+          "research_conducted": {
+            "claude_research": [
+              "wheel-gestures library analysis",
+              "lethargy.js pattern study",
+              "pdf.js zoom implementation review"
+            ],
+            "user_research": [
+              "Existing research document compilation"
+            ],
+            "agent_analysis": [
+              "code-explorer: zoom handling files",
+              "code-explorer: zoom state machine",
+              "code-architect: solution proposals"
+            ]
+          }
+        }
+      }
+    ],
+    "session_health": {
+      "total_attempts": 4,
+      "successful_attempts": 0,
+      "failed_attempts": 3,
+      "regressions": 0,
+      "circular_patterns_detected": 0,
+      "escalations": 1,
+      "pivots_executed": 0
+    }
+  }
+}
