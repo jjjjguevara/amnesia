@@ -5613,6 +5613,165 @@ export class PdfInfiniteCanvas {
   }
 
   /**
+   * Get current camera state (for stress testing)
+   */
+  getCamera(): Camera {
+    return { ...this.camera };
+  }
+
+  /**
+   * Set camera position and zoom (for stress testing)
+   */
+  setCamera(x: number, y: number, zoom: number): void {
+    this.camera = { x, y, z: zoom };
+    this.applyTransform();
+    this.updateVisiblePages();
+  }
+
+  /**
+   * Get container element (for stress testing - synthetic events)
+   */
+  getContainer(): HTMLElement {
+    return this.container;
+  }
+
+  /**
+   * Get diagnostic state for stress testing
+   * Returns coverage percentage and CSS stretch factor
+   */
+  getDiagnosticState(): { coverage: number; cssStretch: number } | null {
+    // Coverage: ratio of rendered visible pages to expected visible pages
+    // Use a simpler calculation that avoids over/underestimation
+    const visibleCount = this.visiblePages.size;
+    
+    // For stress testing, we care about "are visible pages rendered?"
+    // If at least 1 page is expected visible and we have pages rendered, that's good
+    // Coverage = 100% means all expected pages are rendered
+    const expectedVisible = this.calculateExpectedVisiblePages();
+    
+    // Cap coverage at 100% - having more visible than expected is fine
+    const coverage = expectedVisible > 0 
+      ? Math.min(100, (visibleCount / expectedVisible) * 100) 
+      : (visibleCount > 0 ? 100 : 0);
+
+    // Calculate CSS stretch from getTargetScaleTier result
+    // A value > 1 means tiles are being stretched (blurry)
+    const tierResult = getTargetScaleTier(this.camera.z, this.config.pixelRatio);
+    const cssStretch = tierResult.cssStretch;
+
+    return { coverage, cssStretch };
+  }
+
+  /**
+   * Get comprehensive diagnostic state for live testing
+   * Captures all relevant state for debugging zoom-out blank issues
+   */
+  getFullDiagnosticState(): {
+    timestamp: number;
+    zoom: number;
+    camera: { x: number; y: number; z: number };
+    phase: string;
+    canRender: boolean;
+    visiblePages: number[];
+    visibleCount: number;
+    expectedVisible: number;
+    coverage: number;
+    cssStretch: number;
+    targetScaleTier: number;
+    renderMode: string;
+    epoch: number;
+    renderQueueSize: number;
+    priorityQueueSize: number;
+    isRendering: boolean;
+    l1CacheSize: number;
+    l2CacheSize: number;
+    pageElements: number;
+  } {
+    const zss = this.zoomScaleService;
+    const phase = zss?.getGesturePhase() ?? 'unknown';
+    const canRender = zss?.canRender() ?? false;
+    const epoch = zss?.getEpoch() ?? 0;
+    const renderMode = zss?.getRenderMode() ?? 'unknown';
+    
+    const tierResult = getTargetScaleTier(this.camera.z, this.config.pixelRatio);
+    const visibleCount = this.visiblePages.size;
+    const expectedVisible = this.calculateExpectedVisiblePages();
+    const coverage = expectedVisible > 0 
+      ? Math.min(100, (visibleCount / expectedVisible) * 100) 
+      : (visibleCount > 0 ? 100 : 0);
+
+    // Get cache sizes from local state
+    const l1Size = this.pageImageCache.size;
+    const l2Size = 0; // Tile cache size not easily accessible
+
+    return {
+      timestamp: performance.now(),
+      zoom: this.camera.z,
+      camera: { ...this.camera },
+      phase,
+      canRender,
+      visiblePages: Array.from(this.visiblePages),
+      visibleCount,
+      expectedVisible,
+      coverage,
+      cssStretch: tierResult.cssStretch,
+      targetScaleTier: tierResult.tier,
+      renderMode,
+      epoch,
+      renderQueueSize: this.renderQueue.length,
+      priorityQueueSize: this.priorityRenderQueue.length,
+      isRendering: this.isRendering,
+      l1CacheSize: l1Size,
+      l2CacheSize: l2Size,
+      pageElements: this.pageElements.size,
+    };
+  }
+
+  /**
+   * Get zoom scale service (for stress testing - gesture phase detection)
+   */
+  getZoomScaleService(): ZoomScaleService | null {
+    return this.zoomScaleService ?? null;
+  }
+
+  /**
+   * Calculate expected number of visible pages (for coverage calculation)
+   * Uses the actual visible bounds to determine how many pages should fit.
+   */
+  private calculateExpectedVisiblePages(): number {
+    const viewportRect = this.getViewportRect();
+    if (!viewportRect || viewportRect.width === 0 || viewportRect.height === 0) return 0;
+
+    const zoom = this.camera.z;
+    const visibleWidth = viewportRect.width / zoom;
+    const visibleHeight = viewportRect.height / zoom;
+
+    const { layoutMode, pagesPerRow } = this.config;
+    const cellWidth = this.layoutBaseWidth + this.layoutGap;
+    const cellHeight = this.layoutBaseHeight + this.layoutGap;
+
+    // Use floor instead of ceil to avoid overestimating
+    // A partially visible page at the edge counts as visible
+    if (layoutMode === 'vertical') {
+      // In vertical mode, count how many pages fit vertically
+      const count = Math.floor(visibleHeight / cellHeight) + 1;
+      return Math.min(count, this.pageCount);
+    } else if (layoutMode === 'horizontal') {
+      // In horizontal mode, count how many pages fit horizontally
+      const count = Math.floor(visibleWidth / cellWidth) + 1;
+      return Math.min(count, this.pageCount);
+    } else {
+      // Grid layout - count rows and columns that fit
+      // Use more conservative estimates to avoid overestimation
+      const visibleCols = Math.max(1, Math.floor(visibleWidth / cellWidth) + 1);
+      const visibleRows = Math.max(1, Math.floor(visibleHeight / cellHeight) + 1);
+      // Cap by actual pages per row and total page count
+      const cols = Math.min(visibleCols, pagesPerRow);
+      return Math.min(cols * visibleRows, this.pageCount);
+    }
+  }
+
+  /**
    * Zoom in
    */
   zoomIn(): void {

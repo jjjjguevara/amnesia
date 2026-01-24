@@ -1191,6 +1191,71 @@ export class PdfRenderer implements DocumentRenderer {
   }
 
   /**
+   * Set zoom level (for stress testing)
+   */
+  setZoom(zoom: number): void {
+    if (this.infiniteCanvas) {
+      this.infiniteCanvas.setZoom(zoom);
+    }
+  }
+
+  /**
+   * Get camera state (for stress testing)
+   */
+  getCamera(): { x: number; y: number; z: number } {
+    if (this.infiniteCanvas) {
+      return this.infiniteCanvas.getCamera();
+    }
+    return { x: 0, y: 0, z: this.config.scale ?? 1 };
+  }
+
+  /**
+   * Set camera position and zoom (for stress testing)
+   */
+  setCamera(x: number, y: number, zoom: number): void {
+    if (this.infiniteCanvas) {
+      this.infiniteCanvas.setCamera(x, y, zoom);
+    }
+  }
+
+  /**
+   * Get container element (for stress testing - synthetic events)
+   */
+  getContainer(): HTMLElement {
+    return this.container;
+  }
+
+  /**
+   * Get diagnostic state for stress testing
+   */
+  getDiagnosticState(): { coverage: number; cssStretch: number } | null {
+    if (this.infiniteCanvas) {
+      return this.infiniteCanvas.getDiagnosticState();
+    }
+    return null;
+  }
+
+  /**
+   * Get zoom scale service (for stress testing)
+   */
+  getZoomScaleService(): any {
+    if (this.infiniteCanvas) {
+      return this.infiniteCanvas.getZoomScaleService();
+    }
+    return null;
+  }
+
+  /**
+   * Get comprehensive diagnostic state for live testing
+   */
+  getFullDiagnosticState(): any {
+    if (this.infiniteCanvas) {
+      return this.infiniteCanvas.getFullDiagnosticState();
+    }
+    return null;
+  }
+
+  /**
    * Reset to auto-fit scale (clears user zoom)
    */
   resetScale(): void {

@@ -1769,7 +1769,15 @@ export class RenderCoordinator {
             getTelemetry().trackCustomMetric(`render_contentType_${classification.type}`, 1);
 
             // SCANNED_JPEG fast path: Direct JPEG extraction
+            // 2026-01-24 FIX: DISABLED for tile rendering!
+            // JPEG extraction returns the ENTIRE page JPEG, which is incorrect for tiles.
+            // When this was stored under tile keys, it caused the "checkerboard" visual bug
+            // where full-page bitmaps were drawn at each tile position.
+            // JPEG extraction should ONLY be used for full-page renders (request.type !== 'tile').
+            // For now, disable entirely in tile path until proper tile slicing is implemented.
+            const JPEG_EXTRACTION_ENABLED_FOR_TILES = false; // Set to true when tile slicing is added
             if (
+              JPEG_EXTRACTION_ENABLED_FOR_TILES &&
               strategy.useDirectExtraction &&
               classification.type === PDFContentType.SCANNED_JPEG &&
               this.extractJpegCallback

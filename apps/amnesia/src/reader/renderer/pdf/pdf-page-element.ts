@@ -453,6 +453,16 @@ export class PdfPageElement {
     // If mismatch > 5%, clear the buffer to prevent stretch corruption.
     // The page will briefly show blank, but new tiles will render quickly.
 
+    // 2026-01-24 FIX: Skip unrendered pages entirely.
+    // Pages that have never been rendered have default 300x150 canvas dimensions.
+    // Resetting CSS for these causes visible blank flash during zoom-out.
+    // Instead, leave them untouched - they'll get proper CSS when first rendered.
+    const isUnrenderedCanvas = this.canvas.width === 300 && this.canvas.height === 150;
+    if (isUnrenderedCanvas) {
+      // Don't log spam - just skip silently
+      return;
+    }
+
     const prevCss = {
       width: this.canvas.style.width,
       height: this.canvas.style.height,
@@ -1562,6 +1572,17 @@ export class PdfPageElement {
     let fallbacksSkipped = 0;
     
     for (const { tile, bitmap, cssStretch } of tiles) {
+      // 2026-01-24 FIX: Skip oversized bitmaps (likely corrupted full-page data stored as tiles)
+      // A tile bitmap should be at most (tileSize * 4 * 2) per dimension to account for high-DPI
+      const tileSizeForValidation = tile.tileSize ?? actualTileSize;
+      const MAX_TILE_DIM = tileSizeForValidation * 4 * 2; // e.g., 256 * 4 * 2 = 2048
+      if (bitmap.width > MAX_TILE_DIM || bitmap.height > MAX_TILE_DIM) {
+        console.error(`[TILE-SKIP-OVERSIZED] page=${this.config.pageNumber} tile(${tile.tileX},${tile.tileY}): ` +
+          `bitmap ${bitmap.width}x${bitmap.height} exceeds max ${MAX_TILE_DIM}. Skipping corrupted tile.`);
+        bitmap.close();
+        continue;
+      }
+      
       // amnesia-e4i: Skip fallback tiles if target-scale tile exists for this position
       const tilePositionKey = `${tile.tileX},${tile.tileY}`;
       const effectiveStretch = cssStretch ?? (tileScale / tile.scale);
@@ -1888,8 +1909,14 @@ export class PdfPageElement {
 
       // Use current dimensions when snapshot is stale to prevent buffer/CSS aspect mismatch
       const pdfToElementScale = isSnapshotStale ? currentPdfToElementScale : (snapshotPdfToElementScale ?? currentPdfToElementScale);
-      let layoutBoundsWidth = adjustedTileBoundsWidth * pdfToElementScale;
-      let layoutBoundsHeight = adjustedTileBoundsHeight * pdfToElementScale;
+      
+      // 2026-01-24 FIX: Use effectiveBounds for CSS sizing to match canvas sizing.
+      // PROBLEM: Canvas is sized from effectiveBounds (snapshot when available), but CSS was
+      // sized from adjustedTileBounds (derived from tiles). When these differ (pan during render),
+      // we get aspect ratio mismatch → visual corruption.
+      // FIX: Use effectiveBounds for BOTH canvas AND CSS sizing for consistency.
+      let layoutBoundsWidth = effectiveBoundsWidth * pdfToElementScale;
+      let layoutBoundsHeight = effectiveBoundsHeight * pdfToElementScale;
 
       // DIMENSION MATCH FIX: When bounds were invalid (useContainerDimensionsDirectly=true),
       // use container dimensions directly to avoid 1px mismatch from PDF aspect ratio calculation.
@@ -2901,6 +2928,18 @@ export class PdfPageElement {
    * we ensure the canvas displays at correct proportions while waiting for the new render.
    */
   prepareForFullPageRender(): void {
+    // EARLY EXIT FOR UNRENDERED PAGES (2026-01-24):
+    // If the canvas has never been rendered (default 300x150), skip all transition logic.
+    // These pages just need a fresh render, not a mode transition.
+    // This prevents the "blink" effect where we hide a never-rendered canvas.
+    const isUnrenderedCanvas = this.canvas.width === 300 && this.canvas.height === 150;
+    if (isUnrenderedCanvas) {
+      console.log(`[SKIP-TRANSITION] page=${this.config.pageNumber}: Canvas never rendered (300x150), skipping mode transition`);
+      // Just ensure loading state is shown - the render will happen naturally
+      this.showLoading();
+      return;
+    }
+
     // GOLDEN FRAME LOG (Protocol C): Capture all dimension-related values for hypothesis debugging
     // This log is critical for diagnosing dimension mismatches during mode transitions
     const containerRect = this.container.getBoundingClientRect();
@@ -3022,15 +3061,7 @@ export class PdfPageElement {
         const cssAspect = tiledWidth / tiledHeight;
         console.log(`[H3-DIAG] Mode transition: srcBuf=${this.canvas.width}x${this.canvas.height} (aspect=${sourceAspect.toFixed(4)}), dest=${drawWidth.toFixed(0)}x${drawHeight.toFixed(0)} (aspect=${destAspect.toFixed(4)}), css=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} (aspect=${cssAspect.toFixed(4)})`);
 
-        // UNINITIALIZED CANVAS CHECK (2026-01-22): The default HTML canvas size is 300x150.
-        // If we see these dimensions, it means the canvas hasn't been rendered yet.
-        // Using an uninitialized canvas produces 202% aspect ratio mismatch and corrupted snapshots.
-        const isDefaultCanvasSize = this.canvas.width === 300 && this.canvas.height === 150;
-        if (isDefaultCanvasSize) {
-          console.warn(`[SNAPSHOT-SKIP] page=${this.config.pageNumber}: Canvas has default 300x150 dimensions (not rendered yet). Skipping snapshot.`);
-          snapshotCtx.clearRect(0, 0, this.transitionSnapshot.width, this.transitionSnapshot.height);
-          return;
-        }
+        // NOTE: Uninitialized canvas check (300x150) is now handled at function entry with early return.
 
         // COVERAGE CHECK (2026-01-21): Skip snapshot if tiled content doesn't cover most of the page.
         // During tiled→full-page transition, the tiled canvas may cover only a small viewport region
@@ -3059,20 +3090,23 @@ export class PdfPageElement {
             `coverage=${(minCoverage * 100).toFixed(1)}% (threshold=${coverageThreshold * 100}%), ` +
             `tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)}, fullPage=${this.currentWidth}x${this.currentHeight}, ` +
             `aspectDiff=${(aspectRatioDiff * 100).toFixed(1)}%`);
-          // Clear the snapshot to show a clean transition instead of partial/stretched content
-          snapshotCtx.clearRect(0, 0, this.transitionSnapshot.width, this.transitionSnapshot.height);
+          // FIX (2026-01-24): Don't append blank snapshot - remove any existing one and let loading show
+          if (this.transitionSnapshot?.parentElement) {
+            this.transitionSnapshot.remove();
+          }
+          // Don't add the snapshot to container - fall through to hide canvas and show loading
         } else {
           // Draw the tiled content at its original position within the full-page snapshot
           snapshotCtx.drawImage(this.canvas, drawX, drawY, drawWidth, drawHeight);
           console.log(`[SNAPSHOT-USED] page=${this.config.pageNumber}: coverage=${(minCoverage * 100).toFixed(1)}%, ` +
             `tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)}, fullPage=${this.currentWidth}x${this.currentHeight}`);
-        }
 
-        // Insert snapshot into container
-        if (!this.transitionSnapshot.parentElement) {
-          this.container.appendChild(this.transitionSnapshot);
+          // Insert snapshot into container ONLY if snapshot is usable
+          if (!this.transitionSnapshot.parentElement) {
+            this.container.appendChild(this.transitionSnapshot);
+          }
+          console.log(`[MODE-TRANSITION] Captured snapshot for tiled→full-page transition, page=${this.config.pageNumber}, tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} at (${offsetX},${offsetY}), fullPage=${this.currentWidth}x${this.currentHeight.toFixed(0)}`);
         }
-        console.log(`[MODE-TRANSITION] Captured snapshot for tiled→full-page transition, page=${this.config.pageNumber}, tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} at (${offsetX},${offsetY}), fullPage=${this.currentWidth}x${this.currentHeight.toFixed(0)}`);
       }
     }
 

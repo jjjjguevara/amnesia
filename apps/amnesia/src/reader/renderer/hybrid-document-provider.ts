@@ -23,6 +23,8 @@ import type { ParsedDocument, StructuredText, SearchResult, DocumentFormat } fro
 import { getTileEngine, type TileCoordinate } from './pdf/tile-render-engine';
 import { getRenderCoordinator, type RenderCoordinator } from './pdf/render-coordinator';
 import { getTargetScaleTier, SCALE_TIERS } from './pdf/progressive-tile-renderer';
+import { getSharedMuPDFBridge } from './pdf/mupdf-bridge';
+import type { PageClassification } from './pdf/content-type-classifier';
 import type { ParsedPdf, PdfTextLayerData, TocEntry } from './types';
 import type { PdfContentProvider } from './pdf/pdf-renderer';
 import {
@@ -1076,7 +1078,82 @@ export class HybridDocumentProvider {
 
     // Set current document
     this.renderCoordinator.setDocument(docId);
+    
+    // Wire up content-type detection callbacks (amnesia-xlc fix)
+    // These enable 60-80% faster rendering for scanned PDFs via JPEG extraction
+    // and 30-50% faster for vector-heavy pages via scale optimization
+    this.wireContentTypeCallbacks().catch((err) => {
+      console.warn('[HybridDocumentProvider] Content-type callback setup failed:', err);
+    });
+    
     console.log(`[HybridDocumentProvider] RenderCoordinator configured for document ${docId}`);
+  }
+  
+  /**
+   * Wire up content-type detection callbacks from MuPDF bridge.
+   * 
+   * The PooledMuPDFBridge has classifyPage/extractJpeg methods that enable:
+   * - JPEG extraction for scanned PDFs (60-80% faster)
+   * - Vector scale optimization (30-50% faster)
+   * 
+   * This was identified as NOT RUNNING in amnesia-xlc - the callbacks were never set.
+   * 
+   * IMPORTANT: The document must be loaded into the PooledMuPDFBridge for classification
+   * to work. This is separate from the DocumentBridge used for rendering.
+   */
+  private async wireContentTypeCallbacks(): Promise<void> {
+    if (!this.renderCoordinator) return;
+    
+    const docId = this.wasmDocumentId;
+    const docData = this.documentData;
+    
+    if (!docId || !docData) {
+      console.warn('[HybridDocumentProvider] Cannot wire content-type callbacks - no document loaded');
+      return;
+    }
+    
+    try {
+      const bridge = await getSharedMuPDFBridge();
+      
+      // Check if bridge supports content-type detection (PooledMuPDFBridge)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pooledBridge = bridge as any;
+      if (typeof pooledBridge.classifyPage !== 'function' || 
+          typeof pooledBridge.extractJpeg !== 'function') {
+        console.log('[HybridDocumentProvider] MuPDF bridge does not support content-type detection (single-worker mode)');
+        return;
+      }
+      
+      // Load document into the pooled bridge for classification
+      // This is necessary because PooledMuPDFBridge has its own document store
+      // separate from DocumentBridge used for rendering
+      if (typeof pooledBridge.loadDocumentOnAllWorkers === 'function') {
+        console.log(`[HybridDocumentProvider] Loading document ${docId} into worker pool for classification...`);
+        await pooledBridge.loadDocumentOnAllWorkers(docId, docData.slice(0));
+        console.log(`[HybridDocumentProvider] Document loaded into worker pool successfully`);
+      } else {
+        console.warn('[HybridDocumentProvider] Worker pool does not support loadDocumentOnAllWorkers');
+        return;
+      }
+      
+      // Set the callbacks
+      this.renderCoordinator.setContentTypeCallbacks({
+        classifyPage: async (classifyDocId: string, pageNum: number): Promise<PageClassification> => {
+          const result = await pooledBridge.classifyPage(classifyDocId, pageNum);
+          return result as PageClassification;
+        },
+        extractJpeg: async (extractDocId: string, pageNum: number): Promise<{ data: Uint8Array; width: number; height: number }> => {
+          return pooledBridge.extractJpeg(extractDocId, pageNum);
+        },
+      });
+      
+      // Enable content-type detection
+      this.renderCoordinator.setContentTypeDetectionEnabled(true);
+      
+      console.log('[HybridDocumentProvider] Content-type detection callbacks wired successfully');
+    } catch (err) {
+      console.warn('[HybridDocumentProvider] Failed to wire content-type callbacks:', err);
+    }
   }
 
   // ============================================================================

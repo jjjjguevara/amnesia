@@ -797,6 +797,11 @@ export class TileCacheManager {
   async get(tile: TileCoordinate): Promise<ImageBitmap | null> {
     const key = this.getTileKey(tile);
     const telemetry = getTelemetry();
+    
+    // 2026-01-24 FIX: Max tile dimension for validation
+    // A tile bitmap should be at most (tileSize * 4 * 2) per dimension to account for high-DPI
+    const effectiveTileSize = tile.tileSize ?? 256;
+    const MAX_TILE_DIMENSION = effectiveTileSize * 4 * 2; // e.g., 256 * 4 * 2 = 2048
 
     // L1 check (hot tiles)
     const l1Result = this.l1Cache.get(key);
@@ -805,7 +810,19 @@ export class TileCacheManager {
       this.consecutiveMisses = 0; // Reset on hit
       try {
         // Create fresh ImageBitmap - caller owns it
-        return await this.createBitmapFromCachedData(l1Result);
+        const bitmap = await this.createBitmapFromCachedData(l1Result);
+        
+        // 2026-01-24 FIX: Validate bitmap dimensions
+        const isBitmapOversized = bitmap.width > MAX_TILE_DIMENSION || bitmap.height > MAX_TILE_DIMENSION;
+        if (isBitmapOversized) {
+          console.warn(`[TileCacheManager] PURGING corrupted L1 cache entry: ` +
+            `key=${key}, bitmap=${bitmap.width}x${bitmap.height} exceeds max ${MAX_TILE_DIMENSION}`);
+          bitmap.close();
+          this.l1Cache.delete(key);
+          // Fall through to L2/null
+        } else {
+          return bitmap;
+        }
       } catch (error) {
         console.warn('[TileCacheManager] Failed to decode L1 tile:', error);
         this.l1Cache.delete(key);
@@ -821,10 +838,21 @@ export class TileCacheManager {
       try {
         // Create fresh ImageBitmap - caller owns it
         const bitmap = await this.createBitmapFromCachedData(l2Result);
-        // Promote to L1
-        const size = this.getCachedDataSize(l2Result);
-        this.l1Cache.set(key, l2Result, size);
-        return bitmap;
+        
+        // 2026-01-24 FIX: Validate bitmap dimensions
+        const isBitmapOversized = bitmap.width > MAX_TILE_DIMENSION || bitmap.height > MAX_TILE_DIMENSION;
+        if (isBitmapOversized) {
+          console.warn(`[TileCacheManager] PURGING corrupted L2 cache entry: ` +
+            `key=${key}, bitmap=${bitmap.width}x${bitmap.height} exceeds max ${MAX_TILE_DIMENSION}`);
+          bitmap.close();
+          this.l2Cache.delete(key);
+          // Fall through to null
+        } else {
+          // Promote to L1
+          const size = this.getCachedDataSize(l2Result);
+          this.l1Cache.set(key, l2Result, size);
+          return bitmap;
+        }
       } catch (error) {
         console.warn('[TileCacheManager] Failed to decode L2 tile:', error);
         this.l2Cache.delete(key);
@@ -1518,9 +1546,26 @@ export class TileCacheManager {
     if (result) {
       try {
         const bitmap = await this.createBitmapFromCachedData(result.data);
-        // amnesia-e4i FIX: Include fallbackTile when tile coordinates differ
-        const fallbackTile = result.fallbackTile;
-        return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch, fallbackTile };
+        
+        // 2026-01-24 FIX: Validate bitmap dimensions are reasonable for a tile.
+        // A tile bitmap should be at most (tileSize * devicePixelRatio * 2) per dimension.
+        // If larger, it's likely a corrupted cache entry (full-page stored under tile key).
+        // The 2× factor allows for high-DPI tiles + some margin.
+        const MAX_TILE_DIMENSION = effectiveTileSize * 4 * 2; // e.g., 256 * 4 * 2 = 2048
+        const isBitmapOversized = bitmap.width > MAX_TILE_DIMENSION || bitmap.height > MAX_TILE_DIMENSION;
+        
+        if (isBitmapOversized) {
+          console.warn(`[TileCacheManager] REJECTING oversized fallback bitmap: ` +
+            `page=${tile.page} tile=(${tile.tileX},${tile.tileY}) scale=${tile.scale}, ` +
+            `bitmap=${bitmap.width}x${bitmap.height} exceeds max ${MAX_TILE_DIMENSION}. ` +
+            `Likely corrupted cache entry (full-page stored as tile).`);
+          bitmap.close();
+          // Fall through to full-page extraction which will properly slice the region
+        } else {
+          // amnesia-e4i FIX: Include fallbackTile when tile coordinates differ
+          const fallbackTile = result.fallbackTile;
+          return { bitmap, actualScale: result.actualScale, cssStretch: result.cssStretch, fallbackTile };
+        }
       } catch (error) {
         console.warn('[TileCacheManager] Failed to create bitmap from best available:', error);
         // Fall through to full-page fallback

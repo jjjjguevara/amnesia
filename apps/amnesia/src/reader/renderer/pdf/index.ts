@@ -364,3 +364,38 @@ export type {
   TileRenderInfo,
   CameraTransform,
 } from './webgl-compositor';
+
+// Device Profiler (Performance optimization)
+export {
+  getDeviceProfile,
+  getDeviceProfileSync,
+  type DeviceProfile,
+  type DeviceTier,
+} from './device-profiler';
+
+// Performance Config (Tier-based settings)
+export {
+  getPerformanceConfig,
+  getCurrentTier,
+  getAllTierConfigs,
+  getConfigForTier,
+  type PerformanceConfig,
+} from './performance-config';
+
+// Lifecycle Telemetry (Unified telemetry service)
+export {
+  getLifecycleTelemetry,
+  resetLifecycleTelemetry,
+  type LifecycleTelemetryService,
+  type TelemetryStats as LifecycleTelemetryStats,
+} from './lifecycle-telemetry';
+
+// Stress Test Harness (Automated testing)
+export {
+  StressTestHarness,
+  getStressTestHarness,
+  DEFAULT_QUALITY_FLOORS,
+  type QualityFloor,
+  type StressTestResult,
+  type StressTestReport,
+} from './stress-test-harness';
