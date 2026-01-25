@@ -25,7 +25,8 @@ import type { TileCoordinate, TileScale, Rect, PageLayout } from './tile-render-
 import { getTileSize } from './tile-render-engine';
 import { MAX_SCALE_TIER, getTargetScaleTier, getExactTargetScale } from './progressive-tile-renderer';
 import { isFeatureEnabled } from './feature-flags';
-import { getScaleStateManager } from './scale-state-manager';
+// amnesia-aqv: Use unified ZoomScaleService instead of deprecated ScaleStateManager
+import { getZoomScaleService } from './zoom-scale-service';
 import type { RenderPriority } from './render-coordinator';
 
 /** Scroll velocity vector */
@@ -202,8 +203,9 @@ export class ScrollStrategy {
     }
 
     // Check for focal point (amnesia-8bd)
-    const scaleManager = getScaleStateManager(documentId);
-    const focalPoint = scaleManager?.getFocalPoint();
+    // amnesia-aqv: Use ZoomScaleService instead of deprecated ScaleStateManager
+    const zoomService = getZoomScaleService();
+    const focalPoint = zoomService?.getFocalPoint();
 
     // Sort by distance from focal point (during zoom) or viewport center (normal)
     let sortX: number;
@@ -412,9 +414,10 @@ export class ScrollStrategy {
     documentId: string = 'default'
   ): PrioritizedTile[] {
     // Check for focal point priority (amnesia-8bd)
-    const scaleManager = getScaleStateManager(documentId);
-    const focalPoint = scaleManager?.getFocalPoint();
-    const useFocalPointPriority = focalPoint !== null && scaleManager !== null;
+    // amnesia-aqv: Use ZoomScaleService instead of deprecated ScaleStateManager
+    const zoomService = getZoomScaleService();
+    const focalPoint = zoomService?.getFocalPoint();
+    const useFocalPointPriority = focalPoint !== null && zoomService !== null;
     const lookahead = this.getAdaptiveLookahead(velocity);
     const quality = this.getQualityFactorForVelocity(velocity);
     const scale = this.getScaleForZoom(zoom, pixelRatio * quality);
@@ -467,9 +470,10 @@ export class ScrollStrategy {
 
         // Assign priority based on distance or focal point (amnesia-8bd)
         let priority: PrefetchPriority;
-        if (useFocalPointPriority && scaleManager) {
+        // amnesia-aqv: Use ZoomScaleService instead of deprecated ScaleStateManager
+        if (useFocalPointPriority && zoomService) {
           // During zoom gestures: prioritize by radial distance from focal point
-          const focalPriority = scaleManager.getTilePriority(tile, this.config.tileSize, {
+          const focalPriority = zoomService.getTilePriority(tile, this.config.tileSize, {
             x: layout.x,
             y: layout.y,
           });

@@ -40,12 +40,7 @@ export function getTileSize(zoom?: number): number {
 
   // Use adaptive tile sizing for crisp high-zoom rendering
   if (isFeatureEnabled('useAdaptiveTileSize')) {
-    const adaptiveSize = getAdaptiveTileSize(zoom);
-    // Log at high zoom to debug scale capping issue
-    if (zoom >= 16) {
-      console.log(`[getTileSize] zoom=${zoom.toFixed(2)}, adaptive=${adaptiveSize}, flag=${isFeatureEnabled('useAdaptiveTileSize')}`);
-    }
-    return adaptiveSize;
+    return getAdaptiveTileSize(zoom);
   }
 
   return TILE_SIZE;
@@ -268,9 +263,6 @@ export class TileRenderEngine {
     zoom: number,
     scale?: TileScale
   ): TileCoordinate[] {
-    // ELUSIVE BUG DEBUG: Log every call to track tile generation
-    console.error(`[getVisibleTiles] ENTRY: zoom=${zoom.toFixed(2)}, scale=${scale}, pages=${pageLayouts.map(l => l.page).join(',')}, viewport=(${viewport.x.toFixed(0)},${viewport.y.toFixed(0)}) ${viewport.width.toFixed(0)}x${viewport.height.toFixed(0)}`);
-
     const tiles: TileCoordinate[] = [];
     // Use provided scale, or default to zoom for basic HiDPI support
     // DYNAMIC MAX SCALE FIX: Use getDynamicMaxScaleTier() instead of hardcoded MAX_SCALE_TIER.
@@ -386,28 +378,6 @@ export class TileRenderEngine {
       // Pass zoom for adaptive tile sizing
       const pageTiles = this.getTilesInRect(pdfRect, layout.page, effectiveScale, zoom);
 
-      // DIAGNOSTIC: Log tile calculation at mid-zoom (4-8x) to debug blank area bug
-      if (zoom >= 4 && zoom <= 10) {
-        let tileRangeStr = '(none)';
-        if (pageTiles.length > 0) {
-          const tileXs = pageTiles.map(t => t.tileX);
-          const tileYs = pageTiles.map(t => t.tileY);
-          const minTileX = Math.min(...tileXs);
-          const maxTileX = Math.max(...tileXs);
-          const minTileY = Math.min(...tileYs);
-          const maxTileY = Math.max(...tileYs);
-          tileRangeStr = `X=[${minTileX}-${maxTileX}], Y=[${minTileY}-${maxTileY}]`;
-        }
-        console.log(`[TileCalc] page=${layout.page} zoom=${zoom.toFixed(2)} scale=${effectiveScale}`, {
-          viewport: `(${viewport.x.toFixed(0)},${viewport.y.toFixed(0)}) ${viewport.width.toFixed(0)}x${viewport.height.toFixed(0)}`,
-          layout: `(${layout.x.toFixed(0)},${layout.y.toFixed(0)}) ${layout.width.toFixed(0)}x${layout.height.toFixed(0)}`,
-          intersection: `(${intersection.x.toFixed(0)},${intersection.y.toFixed(0)}) ${intersection.width.toFixed(0)}x${intersection.height.toFixed(0)}`,
-          pdfRect: `(${pdfRect.x.toFixed(0)},${pdfRect.y.toFixed(0)}) ${pdfRect.width.toFixed(0)}x${pdfRect.height.toFixed(0)}`,
-          pdfScale: pdfScale.toFixed(3),
-          tiles: `${pageTiles.length} tiles: ${tileRangeStr}`,
-        });
-      }
-
       tiles.push(...pageTiles);
     }
 
@@ -436,18 +406,6 @@ export class TileRenderEngine {
     // 1. Semaphore limiting concurrent WASM allocations to 4
     // 2. Progressive rendering via priority queue (critical first)
     // 3. Session-based abort clearing stale requests on scroll
-    if (tiles.length > 64) {
-      console.log(`[TileRenderEngine] ${tiles.length} visible tiles (sorted by distance from center)`);
-    }
-
-    // ELUSIVE BUG DEBUG: Log tile count and range
-    if (tiles.length > 0) {
-      const tileXs = tiles.map(t => t.tileX);
-      const tileYs = tiles.map(t => t.tileY);
-      console.error(`[getVisibleTiles] EXIT: ${tiles.length} tiles, X=[${Math.min(...tileXs)}-${Math.max(...tileXs)}], Y=[${Math.min(...tileYs)}-${Math.max(...tileYs)}], pages=${[...new Set(tiles.map(t => t.page))].join(',')}`);
-    } else {
-      console.error(`[getVisibleTiles] EXIT: 0 tiles generated!`);
-    }
 
     return tiles;
   }

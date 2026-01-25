@@ -17,8 +17,13 @@
 import { getTileCacheManager } from './tile-cache-manager';
 import { getRenderCoordinator } from './render-coordinator';
 import { getFeatureFlags } from './feature-flags';
-import { getScaleStateManager } from './scale-state-manager';
+// amnesia-aqv: Use unified ZoomScaleService instead of deprecated ScaleStateManager
+import { getZoomScaleService } from './zoom-scale-service';
 import type { GesturePhase } from './zoom-scale-service';
+// amnesia-aqv Phase 0: Device profile and content-type for diagnostics
+import { getDeviceProfileSync, type DeviceTier, type DeviceProfile } from './device-profiler';
+import { PDFContentType } from './content-type-classifier';
+import { getLifecycleTelemetry } from './lifecycle-telemetry';
 
 /**
  * Phase transition record for timing analysis (amnesia-e4i)
@@ -28,6 +33,23 @@ export interface PhaseTransition {
   to: GesturePhase;
   timestamp: number;
   duration: number;  // How long we were in 'from' phase (ms)
+}
+
+/**
+ * Mode transition event for tracking visual continuity (amnesia-aqv Phase 0)
+ */
+export interface ModeTransitionEvent {
+  timestamp: number;
+  fromMode: 'full-page' | 'tiled';
+  toMode: 'full-page' | 'tiled';
+  trigger: string;
+  snapshotCreated: boolean;
+  snapshotCoverage: number;
+  snapshotRejectionReason: string | null;
+  blankDurationMs: number;
+  pagesAffected: number[];
+  zoom: number;
+  epoch: number;
 }
 
 export interface DiagnosticState {
@@ -81,6 +103,54 @@ export interface DiagnosticState {
   lastPhaseChangeTime: number;
   /** How long we've been in current phase (ms) */
   currentPhaseDuration: number;
+  
+  // ═══════════════════════════════════════════════════════════════════════════
+  // amnesia-aqv Phase 0: Device Profile, Content-Type, Memory, Mode Transitions
+  // ═══════════════════════════════════════════════════════════════════════════
+  
+  // Device profile (Phase 0.1)
+  /** Device performance tier */
+  deviceTier: DeviceTier;
+  /** Total system memory in GB */
+  deviceMemoryGB: number;
+  /** Number of CPU cores */
+  deviceCores: number;
+  /** GPU renderer name */
+  gpuRenderer: string;
+  /** Maximum canvas dimension supported */
+  maxCanvasDimension: number;
+  /** Whether device is Apple Silicon */
+  isAppleSilicon: boolean;
+  
+  // Content-type (Phase 0.2)
+  /** Content types of visible pages */
+  visiblePageTypes: Map<number, PDFContentType>;
+  /** Count of JPEG extraction optimizations used */
+  jpegExtractionCount: number;
+  /** Count of vector optimizations used */
+  vectorOptimizationCount: number;
+  /** Classification time stats */
+  avgClassificationTimeMs: number;
+  
+  // Memory tracking (Phase 0.5)
+  /** V8 heap used in MB */
+  heapUsedMB: number;
+  /** V8 heap limit in MB */
+  heapLimitMB: number;
+  /** Estimated canvas memory in MB */
+  canvasMemoryMB: number;
+  /** Count of overlay canvases (Phase 1 tracking) */
+  overlayCanvasCount: number;
+  /** L2 cache memory in MB */
+  l2CacheMemoryMB: number;
+  
+  // Mode transition tracking (Phase 0.3)
+  /** Recent mode transitions */
+  modeTransitions: ModeTransitionEvent[];
+  /** Count of blank pages detected during transitions */
+  blankTransitionCount: number;
+  /** Last mode transition info */
+  lastModeTransition: ModeTransitionEvent | null;
 }
 
 let overlayInstance: TileDiagnosticOverlay | null = null;
@@ -118,6 +188,28 @@ export class TileDiagnosticOverlay {
     avgPhaseDurations: { idle: 0, active: 0, settling: 0, rendering: 0 },
     lastPhaseChangeTime: performance.now(),
     currentPhaseDuration: 0,
+    // amnesia-aqv Phase 0: Device profile defaults (populated in constructor)
+    deviceTier: 'medium',
+    deviceMemoryGB: 8,
+    deviceCores: 4,
+    gpuRenderer: 'Unknown',
+    maxCanvasDimension: 16384,
+    isAppleSilicon: false,
+    // Content-type defaults
+    visiblePageTypes: new Map(),
+    jpegExtractionCount: 0,
+    vectorOptimizationCount: 0,
+    avgClassificationTimeMs: 0,
+    // Memory tracking defaults
+    heapUsedMB: 0,
+    heapLimitMB: 0,
+    canvasMemoryMB: 0,
+    overlayCanvasCount: 0,
+    l2CacheMemoryMB: 0,
+    // Mode transition defaults
+    modeTransitions: [],
+    blankTransitionCount: 0,
+    lastModeTransition: null,
   };
   
   // Tracking for rate-limited counters
@@ -129,6 +221,41 @@ export class TileDiagnosticOverlay {
   // Phase transition tracking (amnesia-e4i)
   private phaseTransitionHistory: PhaseTransition[] = [];
   private static readonly MAX_PHASE_TRANSITIONS = 50; // Limit to prevent memory leaks
+  
+  // Mode transition tracking (amnesia-aqv Phase 0.3)
+  private modeTransitionHistory: ModeTransitionEvent[] = [];
+  private static readonly MAX_MODE_TRANSITIONS = 20;
+
+  constructor() {
+    // Initialize device profile (amnesia-aqv Phase 0.1)
+    this.initializeDeviceProfile();
+  }
+
+  /**
+   * Initialize device profile data (amnesia-aqv Phase 0.1)
+   * Called once in constructor, provides static device info.
+   */
+  private initializeDeviceProfile(): void {
+    try {
+      const profile = getDeviceProfileSync();
+      this.state.deviceTier = profile.tier;
+      this.state.deviceMemoryGB = profile.memory.totalGB;
+      this.state.deviceCores = profile.cpu.cores;
+      this.state.gpuRenderer = profile.gpu.renderer;
+      this.state.maxCanvasDimension = profile.canvas.maxDimension;
+      this.state.isAppleSilicon = profile.cpu.isAppleSilicon;
+      
+      console.log('[DIAG] Device profile initialized:', {
+        tier: profile.tier,
+        memory: `${profile.memory.totalGB.toFixed(1)}GB`,
+        cores: profile.cpu.cores,
+        gpu: profile.gpu.renderer,
+        appleSilicon: profile.cpu.isAppleSilicon,
+      });
+    } catch (e) {
+      console.warn('[DIAG] Failed to get device profile:', e);
+    }
+  }
 
   show(): void {
     if (this.container) return;
@@ -204,12 +331,12 @@ export class TileDiagnosticOverlay {
       // Check for scale mismatch
       this.state.scaleMismatch = Math.abs(this.state.tileScale - this.state.requestedScale) > 0.5;
 
-      // Pull from ScaleStateManager if available
-      const scaleManager = getScaleStateManager('default');
-      if (scaleManager) {
-        this.state.currentEpoch = scaleManager.getEpoch();
-        this.state.gesturePhase = scaleManager.getState().gesturePhase;
-        const focalPoint = scaleManager.getFocalPoint();
+      // amnesia-aqv: Pull from ZoomScaleService instead of deprecated ScaleStateManager
+      const zoomService = getZoomScaleService();
+      if (zoomService) {
+        this.state.currentEpoch = zoomService.getEpoch();
+        this.state.gesturePhase = zoomService.getGesturePhase();
+        const focalPoint = zoomService.getFocalPoint();
         this.state.focalPoint = focalPoint;
       }
       
@@ -231,11 +358,80 @@ export class TileDiagnosticOverlay {
       
       // Update current phase duration (amnesia-e4i)
       this.state.currentPhaseDuration = now - this.state.lastPhaseChangeTime;
+      
+      // ═══════════════════════════════════════════════════════════════════════════
+      // amnesia-aqv Phase 0: Memory tracking and content-type stats
+      // ═══════════════════════════════════════════════════════════════════════════
+      
+      // Memory tracking (Phase 0.5)
+      this.updateMemoryStats();
+      
+      // Content-type stats from telemetry (Phase 0.2)
+      this.updateContentTypeStats();
+      
+      // L2 cache memory estimate
+      if (cacheStats.l2Bytes !== undefined) {
+        this.state.l2CacheMemoryMB = cacheStats.l2Bytes / (1024 * 1024);
+      }
 
       // Only update data elements, not the whole DOM (preserves event listeners)
       this.updateDataElements();
     } catch {
       // Ignore errors during auto-update
+    }
+  }
+  
+  /**
+   * Update memory statistics (amnesia-aqv Phase 0.5)
+   */
+  private updateMemoryStats(): void {
+    // V8 heap stats (Chrome/Electron specific)
+    if (typeof performance !== 'undefined' && (performance as any).memory) {
+      const mem = (performance as any).memory;
+      this.state.heapUsedMB = mem.usedJSHeapSize / (1024 * 1024);
+      this.state.heapLimitMB = mem.jsHeapSizeLimit / (1024 * 1024);
+    }
+    
+    // Estimate canvas memory usage
+    this.state.canvasMemoryMB = this.estimateCanvasMemory();
+    
+    // Count overlay canvases (for Phase 1 validation)
+    this.state.overlayCanvasCount = document.querySelectorAll('.pdf-page-overlay').length;
+  }
+  
+  /**
+   * Estimate total canvas memory usage (amnesia-aqv Phase 0.5)
+   * Each pixel = 4 bytes (RGBA)
+   */
+  private estimateCanvasMemory(): number {
+    let totalBytes = 0;
+    try {
+      const canvases = document.querySelectorAll('canvas');
+      canvases.forEach(c => {
+        totalBytes += c.width * c.height * 4;
+      });
+    } catch {
+      // Ignore errors
+    }
+    return totalBytes / (1024 * 1024);
+  }
+  
+  /**
+   * Update content-type statistics from telemetry (amnesia-aqv Phase 0.2)
+   */
+  private updateContentTypeStats(): void {
+    try {
+      const telemetry = getLifecycleTelemetry();
+      const stats = telemetry.getStats();
+      
+      // Get classification metrics if available
+      // The telemetry tracks these but we need to expose them
+      // For now, use what we have access to
+      
+      // Note: Full content-type tracking will be added when we wire up
+      // the content-type classifier to the render pipeline (Phase 0.4)
+    } catch {
+      // Ignore errors
     }
   }
   
@@ -290,6 +486,66 @@ export class TileDiagnosticOverlay {
     // Log for debugging
     const durationStr = duration < 1000 ? `${duration.toFixed(0)}ms` : `${(duration / 1000).toFixed(1)}s`;
     console.log(`[PhaseTransition] ${from} → ${to} (was in ${from} for ${durationStr})`);
+  }
+  
+  /**
+   * Record a mode transition event (amnesia-aqv Phase 0.3)
+   * Called during tiled↔full-page transitions to track visual continuity.
+   */
+  recordModeTransition(event: ModeTransitionEvent): void {
+    this.modeTransitionHistory.push(event);
+    
+    // Limit history
+    while (this.modeTransitionHistory.length > TileDiagnosticOverlay.MAX_MODE_TRANSITIONS) {
+      this.modeTransitionHistory.shift();
+    }
+    
+    // Update state
+    this.state.modeTransitions = [...this.modeTransitionHistory];
+    this.state.lastModeTransition = event;
+    
+    // Track blank transitions
+    if (event.blankDurationMs > 16) {  // More than 1 frame
+      this.state.blankTransitionCount++;
+      console.warn(`[MODE-TRANSITION] Blank detected: ${event.blankDurationMs.toFixed(0)}ms`, event);
+    }
+    
+    console.log(`[MODE-TRANSITION] ${event.fromMode} → ${event.toMode}`, {
+      trigger: event.trigger,
+      snapshotCreated: event.snapshotCreated,
+      coverage: `${event.snapshotCoverage.toFixed(1)}%`,
+      blankMs: event.blankDurationMs,
+      pages: event.pagesAffected,
+    });
+  }
+  
+  /**
+   * Update content type for a visible page (amnesia-aqv Phase 0.2)
+   * Called when page classification is determined.
+   */
+  updatePageContentType(pageNum: number, contentType: PDFContentType): void {
+    this.state.visiblePageTypes.set(pageNum, contentType);
+  }
+  
+  /**
+   * Clear content types for pages no longer visible
+   */
+  clearPageContentType(pageNum: number): void {
+    this.state.visiblePageTypes.delete(pageNum);
+  }
+  
+  /**
+   * Record JPEG extraction optimization usage (amnesia-aqv Phase 0.2)
+   */
+  recordJpegExtraction(): void {
+    this.state.jpegExtractionCount++;
+  }
+  
+  /**
+   * Record vector optimization usage (amnesia-aqv Phase 0.2)
+   */
+  recordVectorOptimization(): void {
+    this.state.vectorOptimizationCount++;
   }
   
   /**
@@ -400,6 +656,47 @@ export class TileDiagnosticOverlay {
     update('diag-inv2', inv2Status, s.epochMismatchCount === 0 ? '#00ff00' : '#ff4444');
     update('diag-inv6', inv6Status, s.uniqueScalesInBatch.length <= 1 ? '#00ff00' : '#ffaa00');
     update('diag-inv6a', inv6aStatus, Math.abs(s.avgCssStretch - 1) < 0.5 ? '#00ff00' : '#ffaa00');
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // amnesia-aqv Phase 0: Device, Content-Type, Memory, Mode Transitions
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Device section (static, but refresh tier color)
+    const tierColor = s.deviceTier === 'extreme' ? '#00ff00' : 
+                      s.deviceTier === 'high' ? '#00ffff' : 
+                      s.deviceTier === 'medium' ? '#ffff00' : '#ff4444';
+    update('diag-tier', s.deviceTier.toUpperCase(), tierColor);
+    update('diag-ram', `${s.deviceMemoryGB.toFixed(0)}GB`);
+    update('diag-cores', String(s.deviceCores));
+    update('diag-canvas-max', String(s.maxCanvasDimension));
+    
+    // Memory section
+    const heapUsagePercent = s.heapLimitMB > 0 ? (s.heapUsedMB / s.heapLimitMB) * 100 : 0;
+    const heapColor = heapUsagePercent > 80 ? '#ff4444' : heapUsagePercent > 60 ? '#ffaa00' : '#00ff00';
+    update('diag-heap', `${s.heapUsedMB.toFixed(0)}MB`, heapColor);
+    update('diag-heap-limit', `${s.heapLimitMB.toFixed(0)}MB`);
+    update('diag-canvas-mem', `${s.canvasMemoryMB.toFixed(1)}MB`, s.canvasMemoryMB > 200 ? '#ffaa00' : '#fff');
+    update('diag-overlay-count', String(s.overlayCanvasCount), s.overlayCanvasCount > 0 ? '#00ffff' : '#888');
+    update('diag-l2-mem', `${s.l2CacheMemoryMB.toFixed(1)}MB`);
+    
+    // Content-type section
+    const visibleTypesStr = Array.from(s.visiblePageTypes.entries())
+      .slice(0, 5)  // Limit to 5 for display
+      .map(([page, type]) => `p${page}:${type.replace('scanned-', 'S-').replace('-heavy', '')}`)
+      .join(' ');
+    update('diag-content-types', visibleTypesStr || 'none');
+    update('diag-jpeg-skip', String(s.jpegExtractionCount), s.jpegExtractionCount > 0 ? '#00ff00' : '#888');
+    update('diag-vector-opt', String(s.vectorOptimizationCount), s.vectorOptimizationCount > 0 ? '#00ff00' : '#888');
+    
+    // Mode transition section
+    const blankColor = s.blankTransitionCount > 0 ? '#ff4444' : '#00ff00';
+    update('diag-blank-count', String(s.blankTransitionCount), blankColor);
+    update('diag-mode-transitions', String(s.modeTransitions.length));
+    if (s.lastModeTransition) {
+      const mt = s.lastModeTransition;
+      update('diag-last-transition', `${mt.fromMode}→${mt.toMode}`, mt.blankDurationMs > 16 ? '#ff4444' : '#00ff00');
+      update('diag-last-blank-ms', `${mt.blankDurationMs.toFixed(0)}ms`, mt.blankDurationMs > 16 ? '#ff4444' : '#00ff00');
+    }
   }
 
   private render(): void {
@@ -546,6 +843,81 @@ export class TileDiagnosticOverlay {
         </tr>
       </table>
 
+      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+      <!-- amnesia-aqv Phase 0: Device, Memory, Content-Type, Mode Transitions         -->
+      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+
+      <!-- DEVICE SECTION (Phase 0.1) -->
+      <div style="color: #666; font-size: 10px; margin-bottom: 4px; border-top: 1px solid #333; padding-top: 8px;">DEVICE</div>
+      <table style="width: 100%; border-collapse: collapse; margin-bottom: 8px;">
+        <tr>
+          <td style="color: #888;">Tier:</td>
+          <td id="diag-tier" style="color: ${s.deviceTier === 'extreme' ? '#00ff00' : s.deviceTier === 'high' ? '#00ffff' : s.deviceTier === 'medium' ? '#ffff00' : '#ff4444'}; text-align: right;">${s.deviceTier.toUpperCase()}</td>
+          <td style="color: #888; padding-left: 12px;">RAM:</td>
+          <td id="diag-ram" style="color: #fff; text-align: right;">${s.deviceMemoryGB.toFixed(0)}GB</td>
+        </tr>
+        <tr>
+          <td style="color: #888;">Cores:</td>
+          <td id="diag-cores" style="color: #fff; text-align: right;">${s.deviceCores}</td>
+          <td style="color: #888; padding-left: 12px;">Max Canvas:</td>
+          <td id="diag-canvas-max" style="color: #fff; text-align: right;">${s.maxCanvasDimension}</td>
+        </tr>
+      </table>
+
+      <!-- MEMORY SECTION (Phase 0.5) -->
+      <div style="color: #666; font-size: 10px; margin-bottom: 4px; border-top: 1px solid #333; padding-top: 8px;">MEMORY</div>
+      <table style="width: 100%; border-collapse: collapse; margin-bottom: 8px;">
+        <tr>
+          <td style="color: #888;">Heap:</td>
+          <td id="diag-heap" style="color: #fff; text-align: right;">${s.heapUsedMB.toFixed(0)}MB</td>
+          <td style="color: #888; padding-left: 12px;">Limit:</td>
+          <td id="diag-heap-limit" style="color: #888; text-align: right;">${s.heapLimitMB.toFixed(0)}MB</td>
+        </tr>
+        <tr>
+          <td style="color: #888;">Canvas:</td>
+          <td id="diag-canvas-mem" style="color: #fff; text-align: right;">${s.canvasMemoryMB.toFixed(1)}MB</td>
+          <td style="color: #888; padding-left: 12px;">Overlays:</td>
+          <td id="diag-overlay-count" style="color: ${s.overlayCanvasCount > 0 ? '#00ffff' : '#888'}; text-align: right;">${s.overlayCanvasCount}</td>
+        </tr>
+        <tr>
+          <td style="color: #888;">L2 Cache:</td>
+          <td id="diag-l2-mem" style="color: #fff; text-align: right;" colspan="3">${s.l2CacheMemoryMB.toFixed(1)}MB</td>
+        </tr>
+      </table>
+
+      <!-- CONTENT TYPE SECTION (Phase 0.2) -->
+      <div style="color: #666; font-size: 10px; margin-bottom: 4px; border-top: 1px solid #333; padding-top: 8px;">CONTENT TYPES</div>
+      <div id="diag-content-types" style="font-size: 10px; color: #aaa; margin-bottom: 4px;">
+        ${Array.from(s.visiblePageTypes.entries()).slice(0, 5).map(([page, type]) => 
+          `p${page}:${type.replace('scanned-', 'S-').replace('-heavy', '')}`
+        ).join(' ') || 'none'}
+      </div>
+      <table style="width: 100%; border-collapse: collapse; margin-bottom: 8px;">
+        <tr>
+          <td style="color: #888;">JPEG Skip:</td>
+          <td id="diag-jpeg-skip" style="color: ${s.jpegExtractionCount > 0 ? '#00ff00' : '#888'}; text-align: right;">${s.jpegExtractionCount}</td>
+          <td style="color: #888; padding-left: 12px;">Vector Opt:</td>
+          <td id="diag-vector-opt" style="color: ${s.vectorOptimizationCount > 0 ? '#00ff00' : '#888'}; text-align: right;">${s.vectorOptimizationCount}</td>
+        </tr>
+      </table>
+
+      <!-- MODE TRANSITIONS SECTION (Phase 0.3) -->
+      <div style="color: #666; font-size: 10px; margin-bottom: 4px; border-top: 1px solid #333; padding-top: 8px;">MODE TRANSITIONS</div>
+      <table style="width: 100%; border-collapse: collapse; margin-bottom: 8px;">
+        <tr>
+          <td style="color: #888;">Blanks:</td>
+          <td id="diag-blank-count" style="color: ${s.blankTransitionCount > 0 ? '#ff4444' : '#00ff00'}; text-align: right;">${s.blankTransitionCount}</td>
+          <td style="color: #888; padding-left: 12px;">Total:</td>
+          <td id="diag-mode-transitions" style="color: #fff; text-align: right;">${s.modeTransitions.length}</td>
+        </tr>
+        <tr>
+          <td style="color: #888;">Last:</td>
+          <td id="diag-last-transition" style="color: #fff; text-align: right;">${s.lastModeTransition ? `${s.lastModeTransition.fromMode}→${s.lastModeTransition.toMode}` : 'none'}</td>
+          <td style="color: #888; padding-left: 12px;">Blank ms:</td>
+          <td id="diag-last-blank-ms" style="color: ${s.lastModeTransition && s.lastModeTransition.blankDurationMs > 16 ? '#ff4444' : '#00ff00'}; text-align: right;">${s.lastModeTransition ? `${s.lastModeTransition.blankDurationMs.toFixed(0)}ms` : '0ms'}</td>
+        </tr>
+      </table>
+
       <!-- RECENT TILES -->
       <div id="diag-tiles-section" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px; display: ${s.lastTileCoords && s.lastTileCoords.length > 0 ? 'block' : 'none'};">
         <div style="color: #888; margin-bottom: 4px;">Recent Tiles:</div>
@@ -684,5 +1056,10 @@ if (typeof window !== 'undefined') {
     recordDrop: (reason: string) => getTileDiagnosticOverlay().recordDrop(reason),
     recordAbort: (reason: string) => getTileDiagnosticOverlay().recordAbort(reason),
     recordEpochMismatch: (epoch: number) => getTileDiagnosticOverlay().recordEpochMismatch(epoch),
+    // amnesia-aqv Phase 0: New diagnostic methods
+    recordModeTransition: (event: ModeTransitionEvent) => getTileDiagnosticOverlay().recordModeTransition(event),
+    updatePageContentType: (page: number, type: PDFContentType) => getTileDiagnosticOverlay().updatePageContentType(page, type),
+    recordJpegExtraction: () => getTileDiagnosticOverlay().recordJpegExtraction(),
+    recordVectorOptimization: () => getTileDiagnosticOverlay().recordVectorOptimization(),
   };
 }

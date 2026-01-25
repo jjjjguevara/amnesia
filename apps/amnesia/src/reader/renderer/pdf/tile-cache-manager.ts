@@ -300,7 +300,7 @@ export function quantizeScale(scale: number): number {
   }
 
   // For scales >= 1, find the nearest scale tier
-  // SCALE_TIERS = [2, 3, 4, 6, 8, 12, 16, 24, 32]
+  // SCALE_TIERS = [2, 3, 4, 6, 8, 12, 16, 24, 32, 64]
   // Scale 1-1.5 maps to 1, 1.5-2.5 maps to 2, etc.
   if (scale < 1.5) return 1;
 
@@ -1473,15 +1473,6 @@ export class TileCacheManager {
       if (found) {
         // cssStretch < 1 means downscale (e.g., have scale 16, need 8 → stretch 0.5)
         const cssStretch = tile.scale / scaleTier;
-        
-        // Log when fallback tile indices differ from requested (indicates the fix is working)
-        if (found.tile.tileX !== tile.tileX || found.tile.tileY !== tile.tileY ||
-            found.tile.tileSize !== effectiveTileSize) {
-          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale}/ts${effectiveTileSize} ` +
-            `→ using (${found.tile.tileX},${found.tile.tileY})@s${scaleTier}/ts${found.tile.tileSize} ` +
-            `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
-        }
-        
         // amnesia-e4i: Include fallbackTile so compositing can position correctly
         return { data: found.data, actualScale: scaleTier, cssStretch, fallbackTile: found.tile };
       }
@@ -1497,15 +1488,6 @@ export class TileCacheManager {
       if (found) {
         // cssStretch > 1 means upscale (e.g., have scale 4, need 8 → stretch 2)
         const cssStretch = tile.scale / scaleTier;
-        
-        // Log when fallback tile indices differ from requested (indicates the fix is working)
-        if (found.tile.tileX !== tile.tileX || found.tile.tileY !== tile.tileY ||
-            found.tile.tileSize !== effectiveTileSize) {
-          console.log(`[FALLBACK-COORD-FIX] Requested (${tile.tileX},${tile.tileY})@s${tile.scale}/ts${effectiveTileSize} ` +
-            `→ using (${found.tile.tileX},${found.tile.tileY})@s${scaleTier}/ts${found.tile.tileSize} ` +
-            `(PDF pos: ${pdfX.toFixed(1)},${pdfY.toFixed(1)})`);
-        }
-        
         // amnesia-e4i: Include fallbackTile so compositing can position correctly
         return { data: found.data, actualScale: scaleTier, cssStretch, fallbackTile: found.tile };
       }

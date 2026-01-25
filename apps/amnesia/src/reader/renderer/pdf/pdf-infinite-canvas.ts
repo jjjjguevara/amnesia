@@ -46,15 +46,8 @@ import {
   type ScaleTier,
 } from './progressive-tile-renderer';
 import { ZoomTransformLayer, type ZoomPhase } from './zoom-transform-layer';
-import { ZoomStateMachine } from './zoom-state-machine';
-import { ZoomStateManager } from './zoom-state-manager';
-import {
-  ScaleStateManager,
-  createScaleStateManager,
-  clearScaleStateManager,
-  getScaleStateManager,
-  type ScaleState,
-} from './scale-state-manager';
+// NOTE: ZoomStateMachine, ZoomStateManager, ScaleStateManager removed (amnesia-aqv refactor)
+// All state now managed by ZoomScaleService
 import {
   ZoomScaleService,
   createZoomScaleService,
@@ -64,6 +57,11 @@ import {
 } from './zoom-scale-service';
 import { getRenderSessionManager } from './render-session';
 import { getTileIntegrityChecker, type TileRequest } from './tile-integrity-checker';
+// amnesia-aqv Phase 0: Diagnostic overlay for mode transition tracking
+import { getTileDiagnosticOverlay, type ModeTransitionEvent } from './tile-diagnostic-overlay';
+// Diagnostic trackers for T2HR and focal-point analysis
+import { getT2HRTracker, type TileRequestSource } from './t2hr-tracker';
+import { getFocalPointTracker } from './focal-point-tracker';
 
 export interface PageLayout {
   /** Page number (1-indexed) */
@@ -265,6 +263,8 @@ export class PdfInfiniteCanvas {
     padding: number;
   } | null = null;
 
+
+
   // Snapshot for zoom re-rendering - captures camera AND layout params at schedule time
   // CRITICAL: Same pattern as scroll - during rapid zoom gestures, the camera moves
   // significantly between schedule and render (100ms+ debounce in ZoomTransformLayer).
@@ -291,26 +291,14 @@ export class PdfInfiniteCanvas {
   private lastPointerPosition: Point | null = null;
   private panStartCamera: Camera | null = null;
 
-  // ZOOM STATE MACHINE: Centralized zoom state management to prevent bypass paths.
-  // Replaces distributed flags (isZoomGestureActive, cooldowns, etc.) with a
-  // single source of truth. All render paths check zoomStateMachine.canRender().
-  private zoomStateMachine!: ZoomStateMachine;
-
-  // ZOOM STATE MANAGER (amnesia-5so): New unified zoom state with rebound detection.
-  // Provides epoch-based tile validation and rebound filtering to prevent drift.
-  // This works alongside zoomStateMachine until full migration is complete.
-  private zoomStateManager!: ZoomStateManager;
-
-  // SCALE STATE MANAGER (amnesia-ewt): Central source of truth for all scale decisions.
-  // Subscribes to ZoomStateManager internally. Eliminates 7+ distributed scale calculation
-  // sites that caused temporal race conditions with tiles arriving at different scales.
-  // Provides: epoch-based validation, gesture-phase awareness, cssStretch consolidation.
-  private scaleStateManager!: ScaleStateManager;
-
-  // ZOOM SCALE SERVICE (amnesia-d9f): Unified service replacing ZoomOrchestrator +
-  // ZoomStateManager + ScaleStateManager. Single source of truth for zoom, scale,
-  // epoch, and gesture phase. All derived values (scale, cssStretch, renderMode)
-  // are computed on-demand from the canonical zoom value.
+  // ZOOM SCALE SERVICE (amnesia-aqv): Unified service - single source of truth for:
+  // - Zoom state and gesture phase (idle, active, settling, rendering)
+  // - Epoch counter (incremented on zoom change, mode change, invalidation)
+  // - Scale and cssStretch (derived from zoom, never stored)
+  // - Render mode (full-page, adaptive, tiled) with hysteresis
+  // - Rebound detection for trackpad gesture artifacts
+  // - Focal point for tile priority ordering
+  // Replaces: ZoomOrchestrator, ZoomStateMachine, ZoomStateManager, ScaleStateManager
   private zoomScaleService!: ZoomScaleService;
 
   // UNIFIED COORDINATE SPACE (Phase 2): Controls whether we use the new coordinate system.
@@ -352,6 +340,8 @@ export class PdfInfiniteCanvas {
   private cachedViewportRect: DOMRect | null = null;
   private pendingVisiblePagesUpdate = false;
 
+
+
   // Deferred initial view setup - waits for viewport to have valid dimensions
   private initialViewSetupPending = false;
   private resizeObserver: ResizeObserver | null = null;
@@ -377,6 +367,10 @@ export class PdfInfiniteCanvas {
   private renderCoordinator: RenderCoordinator | null = null;
   private useTiledRendering = false;
   private tileZoomThreshold = 2.0; // Use tiles when zoom > 2x
+  
+  // amnesia-xc0: Page refresh debouncing for onTileReady callback
+  // Prevents excessive re-composites when many tiles finish in quick succession
+  private pendingPageRefresh: Map<number, ReturnType<typeof setTimeout>> = new Map();
 
   // Progressive zoom state (Phase 2: Multi-Resolution Zoom)
   private zoomFinalRenderTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -468,6 +462,18 @@ export class PdfInfiniteCanvas {
       // Cache documentId for cross-document isolation in render requests
       this.documentId = this.provider.getDocumentId?.() ?? null;
       console.log(`[PdfInfiniteCanvas] Tile rendering enabled, documentId=${this.documentId}`);
+      
+      // amnesia-xc0: Register onTileReady callback to trigger epoch-gated re-composite
+      // when tiles finish rendering in the background.
+      // 
+      // This fixes the "nudge bug" where tiles render but don't display until user pans.
+      // The epoch parameter enables validation that tiles are compatible with the
+      // current canvas render state before drawing them.
+      if (this.renderCoordinator) {
+        this.renderCoordinator.onTileReady = (page: number, priority: import('./render-coordinator').RenderPriority, scaleEpoch: number) => {
+          this.schedulePageRefresh(page, priority, scaleEpoch);
+        };
+      }
     }
 
     // Initialize ZoomTransformLayer for progressive zoom rendering.
@@ -499,57 +505,28 @@ export class PdfInfiniteCanvas {
       console.log('[PdfInfiniteCanvas] ZoomTransformLayer initialized');
     }
 
-    // Initialize ZoomStateMachine for centralized zoom state management.
-    // This replaces distributed flags with a single source of truth.
-    // All render paths check zoomStateMachine.canRender() before executing.
-    this.zoomStateMachine = new ZoomStateMachine(
-      this.renderCoordinator,
-      { pixelRatio: this.config.pixelRatio }
-    );
+    // Initialize ZoomScaleService (amnesia-aqv): Single source of truth for all zoom/scale state.
+    // Replaces: ZoomOrchestrator, ZoomStateMachine, ZoomStateManager, ScaleStateManager
+    const docId = this.provider.getDocumentId?.() ?? 'default';
+    this.documentId = docId;
+    
+    this.zoomScaleService = createZoomScaleService({
+      pixelRatio: this.config.pixelRatio,
+      minZoom: this.config.minZoom,
+      maxZoom: this.config.maxZoom,
+      initialZoom: this.camera.z,
+      initialPosition: { x: this.camera.x, y: this.camera.y },
+      gestureEndDelay: 300,
+      settlingDelay: 200,
+    });
 
-    // Wire render callback - state machine triggers render when settling completes
-    // CRITICAL: Callback signature is (phase, scale, zoom) - NOT (phase, zoom)!
-    // The orchestrator passes (phase, scale, zoom) where scale is already calculated.
-    //
-    // SCALE MISMATCH FIX (amnesia-d9f):
-    // When useExactScaleRendering is enabled, the orchestrator calculates exact scale
-    // (e.g., zoom * pixelRatio = 5.14). Previously, we ignored this and recalculated
-    // using getTargetScaleTier() which quantizes to the next tier (6), causing:
-    // - Canvas renders at scale 6 but orchestrator thinks scale is 5.14
-    // - cssStretch calculations become inconsistent across the pipeline
-    // - Tiles appear stretched/warped at mid-zoom levels
-    //
-    // Fix: Respect the feature flag and use orchestrator's scale when exact mode is on.
-    this.zoomStateMachine.onRenderPhase = (phase, orchestratorScale, zoom) => {
-      let scale: number;
-      if (isFeatureEnabled('useExactScaleRendering')) {
-        // Exact scale mode: use orchestrator's calculated scale directly
-        // This ensures cssStretch=1 throughout the pipeline
-        scale = orchestratorScale;
-      } else {
-        // Tier mode: quantize to valid ScaleTier for consistent cache hits
-        // FIX (2026-01-23): Pass maxZoom to prevent scale jumps at zoom boundaries
-        const { tier } = getTargetScaleTier(zoom, this.config.pixelRatio, this.config.maxZoom);
-        scale = tier;
-      }
-      console.log(`[PdfInfiniteCanvas] ZoomStateMachine triggered ${phase} render at scale=${scale}, zoom=${zoom.toFixed(2)}, orchestratorScale=${orchestratorScale}, exactMode=${isFeatureEnabled('useExactScaleRendering')}`);
-      this.handleZoomRenderPhase(scale as ScaleTier, phase);
-    };
-
-    // Wire zoom start callback - unified coordinate space handles zoom without cssStretch
-    this.zoomStateMachine.onZoomStart = () => {
-      // UNIFIED COORDINATE SPACE: No freeze needed
-      // Page elements are sized to final dimensions via handleZoomChange()
-      console.log('[PdfInfiniteCanvas] Zoom gesture started');
-      // Sync with ZoomStateManager
-      this.zoomStateManager.startGesture();
-      // Telemetry: Track gesture start (amnesia-hem investigation)
+    // Wire ZoomScaleService callbacks - this is now the ONLY state machine
+    this.zoomScaleService.onGestureStart = () => {
+      console.log('[PdfInfiniteCanvas] ZoomScaleService: gesture started');
       getTelemetry().trackGestureStart(this.camera);
     };
 
-    // Wire gesture end callback for rebound detection (amnesia-5so) + hard constraints (amnesia-u9l)
-    // + deferred mode transitions (amnesia-z8v)
-    this.zoomStateMachine.onGestureEnd = () => {
+    this.zoomScaleService.onGestureEnd = () => {
       // ═══════════════════════════════════════════════════════════════════════════
       // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
       // Captures complete state at gesture end to identify broken/stretched content bug
@@ -563,31 +540,26 @@ export class PdfInfiniteCanvas {
         viewport: `${viewportRect.width}x${viewportRect.height}`,
         visibleBounds: `x=${visibleBoundsBefore.x.toFixed(1)}, y=${visibleBoundsBefore.y.toFixed(1)}, ` +
                        `w=${visibleBoundsBefore.width.toFixed(1)}, h=${visibleBoundsBefore.height.toFixed(1)}`,
-        isAtMaxZoom: this.zoomStateManager.isAtMaxZoom(),
-        isAtMinZoom: this.zoomStateManager.isAtMinZoom(),
+        isAtMaxZoom: this.zoomScaleService.isAtMaxZoom(),
+        isAtMinZoom: this.zoomScaleService.isAtMinZoom(),
         maxZoom: this.config.maxZoom,
-        scaleState: this.scaleStateManager.getState(),
+        renderMode: this.zoomScaleService.getRenderMode(),
         lastExecutedRenderMode: this.lastExecutedRenderMode,
         visiblePages: Array.from(this.visiblePages),
         epoch: this.zoomScaleService.getEpoch(),
       });
 
-      this.zoomStateManager.endGesture();
+      // Clear focal point after gesture ends
+      this.zoomScaleService.setFocalPoint(null, 'idle');
 
-      // SCALE STATE MANAGER: Clear focal point after gesture ends
-      // This transitions priority back to viewport-center ordering
-      this.scaleStateManager.setFocalPoint(null, 'idle');
-
-      // Telemetry: Track gesture end (amnesia-hem investigation)
+      // Telemetry: Track gesture end
       getTelemetry().trackGestureEnd(
         this.camera,
-        this.zoomStateManager.isAtMaxZoom(),
-        this.zoomStateManager.isAtMinZoom()
+        this.zoomScaleService.isAtMaxZoom(),
+        this.zoomScaleService.isAtMinZoom()
       );
 
-      // MODE TRANSITION (amnesia-wbp): Use ScaleStateManager's gesture-aware mode.
-      // After endGesture(), ScaleStateManager updates committedRenderMode to the
-      // correct mode for final zoom level (with hysteresis already applied).
+      // MODE TRANSITION: Check and execute mode transition based on current zoom
       this.checkAndExecuteModeTransition();
 
       // Apply HARD constraints now that gesture has ended (amnesia-u9l)
@@ -610,11 +582,10 @@ export class PdfInfiniteCanvas {
         });
       }
 
-      // FIX (amnesia-hem): Sync position change with ZoomStateManager
-      this.zoomStateManager.syncFromCamera(this.camera);
+      // Sync position change with ZoomScaleService
+      this.zoomScaleService.syncFromCamera(this.camera);
 
-      // FIX (amnesia-hem): Propagate constrained position to CSS transform
-      // This was MISSING - the primary cause of focal point drift at gesture end
+      // Propagate constrained position to CSS transform
       this.applyTransform();
 
       // Log final state
@@ -629,68 +600,30 @@ export class PdfInfiniteCanvas {
 
       // Telemetry: Track the transform event
       getTelemetry().trackTransformEvent('gesture-end', cameraBefore, this.camera, true);
-    };
-
-    console.log('[PdfInfiniteCanvas] ZoomStateMachine initialized');
-
-    // Initialize ZoomStateManager for rebound detection and epoch-based validation (amnesia-5so)
-    // This provides additional protection against focal point drift from trackpad rebound events.
-    this.zoomStateManager = new ZoomStateManager({
-      pixelRatio: this.config.pixelRatio,
-      minZoom: this.config.minZoom,
-      maxZoom: this.config.maxZoom,
-      initialZoom: this.camera.z,
-      initialPosition: { x: this.camera.x, y: this.camera.y },
-    });
-
-    console.log('[PdfInfiniteCanvas] ZoomStateManager initialized for rebound detection');
-
-    // Initialize ScaleStateManager (amnesia-ewt): Subscribes to ZoomStateManager internally.
-    // Provides single source of truth for scale, cssStretch, renderMode, and epoch validation.
-    const docId = this.provider.getDocumentId?.() ?? 'default';
-    this.documentId = docId;
-    this.scaleStateManager = createScaleStateManager(docId, this.zoomStateManager, {
-      pixelRatio: this.config.pixelRatio,
-      maxZoom: this.config.maxZoom,
-      scaleMode: 'tier', // Use tiered scaling for cache efficiency
-    });
-    console.log('[PdfInfiniteCanvas] ScaleStateManager initialized for scale orchestration');
-
-    // Initialize ZoomScaleService (amnesia-d9f): Unified service replacing fragmented state.
-    // This is the new single source of truth for zoom, scale, epoch, and gesture phase.
-    this.zoomScaleService = createZoomScaleService({
-      pixelRatio: this.config.pixelRatio,
-      minZoom: this.config.minZoom,
-      maxZoom: this.config.maxZoom,
-      initialZoom: this.camera.z,
-      initialPosition: { x: this.camera.x, y: this.camera.y },
-      gestureEndDelay: 300,
-      settlingDelay: 200,
-    });
-
-    // Wire ZoomScaleService callbacks
-    this.zoomScaleService.onGestureStart = () => {
-      console.log('[PdfInfiniteCanvas] ZoomScaleService: gesture started');
-      getTelemetry().trackGestureStart(this.camera);
-    };
-
-    this.zoomScaleService.onGestureEnd = () => {
+      
       console.log('[PdfInfiniteCanvas] ZoomScaleService: gesture ended');
-      // Clear focal point after gesture ends
-      this.scaleStateManager.setFocalPoint(null, 'idle');
-      getTelemetry().trackGestureEnd(
-        this.camera,
-        this.zoomScaleService.isAtMaxZoom(),
-        this.zoomScaleService.isAtMinZoom()
-      );
-      // Apply hard constraints and check mode transitions
-      // Use non-soft constraint since gesture ended (want final position)
-      this.constrainCameraPositionPreservingFocalPoint(/* soft */ false);
-      this.checkAndExecuteModeTransition();
     };
 
     this.zoomScaleService.onSettlingComplete = (scale, zoom) => {
       console.log(`[PdfInfiniteCanvas] ZoomScaleService: settling complete, scale=${scale}, zoom=${zoom.toFixed(2)}`);
+      
+      // Calculate the ACTUAL max achievable scale (capped by tile pixel limits)
+      // This is the scale tiles will actually be rendered at, not the ideal scale
+      const MAX_TILE_PIXELS = 8192;
+      const tileSize = getTileSize(zoom); // 512, 256, or 128 based on zoom
+      const maxAchievableScale = Math.min(scale, Math.floor(MAX_TILE_PIXELS / tileSize));
+      
+      // Start T2HR measurement for diagnostics
+      // targetScale = max achievable, NOT the ideal scale from ZoomScaleService
+      const t2hrTracker = getT2HRTracker();
+      t2hrTracker.startMeasurement({
+        targetZoom: zoom,
+        targetScale: maxAchievableScale, // Use capped scale, not ideal
+        focalPoint: this.zoomScaleService.getFocalPoint(),
+      });
+      
+      console.log(`[T2HR] Starting measurement: zoom=${zoom.toFixed(2)}, idealScale=${scale}, maxAchievableScale=${maxAchievableScale}, tileSize=${tileSize}`);
+      
       this.handleZoomRenderPhase(scale as ScaleTier, 'final');
     };
 
@@ -701,10 +634,10 @@ export class PdfInfiniteCanvas {
     console.log('[PdfInfiniteCanvas] ZoomScaleService initialized');
 
     // amnesia-x6q: Set up focal-point-aware cache eviction
-    // The priority function converts ScaleStateManager's radial priority to numeric values
+    // amnesia-aqv: Updated to use ZoomScaleService
     const cacheManager = getTileCacheManager();
     cacheManager.setPriorityFunction((page, tileX, tileY) => {
-      const focalPoint = this.scaleStateManager.getFocalPoint();
+      const focalPoint = this.zoomScaleService.getFocalPoint();
       if (!focalPoint) {
         // No focal point - use page distance as priority (fallback)
         const currentPage = Math.min(...this.visiblePages) || 1;
@@ -717,21 +650,19 @@ export class PdfInfiniteCanvas {
         const currentPage = Math.min(...this.visiblePages) || 1;
         return Math.abs(page - currentPage);
       }
-      // Use ScaleStateManager's radial priority with actual page position
-      const currentScale = this.scaleStateManager.getScale();
-      const priority = this.scaleStateManager.getTilePriority(
-        { page, tileX, tileY, scale: currentScale },
-        256, // Default tile size
-        { x: layout.x, y: layout.y } // Actual page position on canvas
+      // Calculate distance from focal point to tile center
+      const { scale } = this.zoomScaleService.getScale();
+      const tileSize = 256; // CSS pixels
+      const tileX_canvas = layout.x + (tileX + 0.5) * (tileSize / scale);
+      const tileY_canvas = layout.y + (tileY + 0.5) * (tileSize / scale);
+      const distance = Math.sqrt(
+        (tileX_canvas - focalPoint.x) ** 2 + (tileY_canvas - focalPoint.y) ** 2
       );
-      // Convert RenderPriority to numeric (critical=0, high=1, medium=2, low=3)
-      const priorityMap: Record<string, number> = {
-        critical: 0,
-        high: 1,
-        medium: 2,
-        low: 3,
-      };
-      return priorityMap[priority] ?? 2;
+      // Radial priority zones (in CSS pixels)
+      if (distance < tileSize) return 0;      // critical: 1 tile radius
+      if (distance < tileSize * 2) return 1;  // high: 2 tile radius
+      if (distance < tileSize * 4) return 2;  // medium: 4 tile radius
+      return 3;                               // low: beyond 4 tiles
     });
 
     // Setup ResizeObserver to handle deferred initial view setup
@@ -1825,13 +1756,35 @@ export class PdfInfiniteCanvas {
       pageLayouts: Array.from(this.pageLayouts.entries()).map(([page, layout]) =>
         `p${page}: ${layout.width.toFixed(0)}x${layout.height.toFixed(0)} @ (${layout.x.toFixed(0)},${layout.y.toFixed(0)})`
       ),
-      scaleState: this.scaleStateManager.getState(),
+      scaleState: { scale: this.zoomScaleService.getScale(), epoch: this.zoomScaleService.getEpoch(), renderMode: this.zoomScaleService.getRenderMode() },
     });
 
     this.lastExecutedRenderMode = targetMode;
     // MIGRATION (amnesia-d9f): Use ZoomScaleService for epoch
     const newEpoch = this.zoomScaleService.incrementEpoch();
     console.log(`[MODE-TRANSITION-DEBUG] Epoch incremented: ${newEpoch}`);
+
+    // amnesia-aqv Phase 0: Record mode transition event for diagnostic tracking
+    const transitionStartTime = performance.now();
+    const modeTransitionEvent: ModeTransitionEvent = {
+      timestamp: transitionStartTime,
+      fromMode: oldMode,
+      toMode: targetMode,
+      trigger: oldMode === 'tiled' ? 'zoom-out' : 'zoom-in',
+      snapshotCreated: false, // Updated below if using snapshot approach
+      snapshotCoverage: 0,
+      snapshotRejectionReason: null,
+      blankDurationMs: 0, // Will be measured when render completes
+      pagesAffected: Array.from(this.visiblePages),
+      zoom: this.camera.z,
+      epoch: newEpoch,
+    };
+    
+    try {
+      getTileDiagnosticOverlay().recordModeTransition(modeTransitionEvent);
+    } catch {
+      // Overlay may not be initialized
+    }
 
     // IMMEDIATE CSS RESET: When transitioning tiled→full-page, immediately reset
     // canvas CSS for visible pages. This prevents the old viewport-only content
@@ -1842,15 +1795,22 @@ export class PdfInfiniteCanvas {
       for (const pageNum of this.visiblePages) {
         const element = this.pageElements.get(pageNum);
         if (element) {
-          // TWO-TRACK PIPELINE FIX (2026-01-21): DO NOT call resetCanvas() here!
-          // prepareForFullPageRender() captures a snapshot from the EXISTING canvas
-          // content (even if stretched/low-res) to maintain "progressive quality"
-          // per balancing-forces.md Section 7.2: "No blank space during zoom"
+          // ═══════════════════════════════════════════════════════════════════════════
+          // OVERLAY CANVAS ATOMIC SWAP (amnesia-aqv Phase 1)
+          // ═══════════════════════════════════════════════════════════════════════════
+          // Use overlay canvas pattern instead of snapshot pattern.
+          // This keeps the main canvas visible (with current content) while
+          // rendering new full-page content to an overlay canvas. When the overlay
+          // render completes, we do an atomic swap - no blank flash.
           //
-          // The snapshot shows existing tiled content until full-page render completes.
-          // Clearing canvas before snapshot would result in blank pages - violation of
-          // INV-5 (Mode Transition Continuity).
-          element.prepareForFullPageRender();
+          // The old prepareForFullPageRender() approach failed because:
+          // 1. Snapshot coverage check fails (<95% for viewport-only canvas)
+          // 2. Buffer clearing happens due to aspect mismatch (>5%)
+          // 3. Result: blank page for 50-200ms
+          //
+          // The overlay pattern eliminates this by never hiding/clearing the main canvas.
+          element.prepareForFullPageRenderWithOverlay(newEpoch);
+          
           // Clear the pageWasTiled flag for proper subsequent render flow
           this.pageWasTiled.set(pageNum, false);
         }
@@ -2251,13 +2211,23 @@ export class PdfInfiniteCanvas {
   private triggerTilePrefetch(): void {
     if (!this.renderCoordinator || !this.tileEngine) return;
 
-    // ZOOM STATE GUARD: Skip tile prefetch during active zoom gestures.
-    // ZoomScaleService provides centralized state - canRender() returns false
-    // during 'active' and 'settling' phases. This prevents queue saturation
-    // from scale changes on every frame (s8→s12→s16).
-    if (!this.zoomScaleService.canRender()) {
-      return;
-    }
+    // amnesia-rwe: REVISED ZOOM STATE GUARD
+    // Per requirements: "Maximum high res tiles should be prefetched when the gesture starts"
+    // 
+    // Previous behavior: Block ALL prefetch during 'active' and 'settling'
+    // Problem: Tiles only requested ~500ms AFTER gesture ends
+    // 
+    // New behavior:
+    // - 'settling': Allow full prefetch (zoom is stable, user stopped)
+    // - 'active': Allow limited prefetch (focal-priority tiles only)
+    // - 'idle'/'rendering': Allow full prefetch (unchanged)
+    //
+    // The semaphore policy already has safeguards for 'active' phase:
+    // - maxQueueSize: 50, maxTilesPerPage: 30, dropBehavior: 'aggressive'
+    const currentGesturePhase = this.zoomScaleService.getGesturePhase();
+    const isActiveZoom = currentGesturePhase === 'active';
+    
+    // Note: 'settling' now allows prefetch (zoom stable, just waiting for timer)
 
     // Use canvas coordinates for prefetch calculation
     const screenRect = this.getViewportRect();
@@ -2295,7 +2265,6 @@ export class PdfInfiniteCanvas {
     const MAX_TILE_PIXELS = 8192;
     const tileSize = getTileSize(zoom); // Returns 512, 256, or 128 based on zoom
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
-    console.log(`[TILE-SCALE-DEBUG] zoom=${zoom.toFixed(2)}, tileSize=${tileSize}, maxScaleForTileSize=${maxScaleForTileSize}`);
     const rawScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
     const tileScale = Math.min(MAX_TILE_SCALE, maxScaleForTileSize, rawScale);
 
@@ -2304,52 +2273,98 @@ export class PdfInfiniteCanvas {
     }
 
     // Get visible tiles for current viewport with proper scale
-    // PREFETCH PATH LOG: Track which pages enter tile engine from triggerTilePrefetch
-    if (layouts.length > 0) {
-      console.warn(`[PREFETCH-TILE-ENGINE] pages=[${layouts.map(l => l.page).join(',')}], viewport.y=${canvasViewport.y.toFixed(1)}, expandedViewport.y=${expandedViewport.y.toFixed(1)}-${(expandedViewport.y + expandedViewport.height).toFixed(1)}, camera.y=${this.camera.y.toFixed(1)}`);
-    }
+    // NOTE: Bleed buffer removed (amnesia-aqv) - it was causing excessive tile requests
+    // that overwhelmed the render queue. The fallback tile system provides adequate
+    // coverage during pan by showing lower-resolution cached tiles.
     const visibleTiles = this.tileEngine.getVisibleTiles(canvasViewport, layouts, zoom, tileScale);
 
     // INV-6 FIX (2026-01-23): Capture scale snapshot BEFORE tile batch.
     // All tiles in this batch MUST use the same epoch to prevent mixed-scale corruption.
-    // The snapshot freezes scale/epoch at request time; display time validates it.
-    const scaleSnapshot = this.scaleStateManager.captureSnapshot();
+    // amnesia-aqv: Use ZoomScaleService snapshot
+    const scaleSnapshot = this.zoomScaleService.captureSnapshot();
 
-    // Queue critical tile requests (visible tiles)
-    // PHASE 7 (amnesia-zdu): Per-tile quality variation based on focal point distance
-    const focalPoint = this.scaleStateManager.getFocalPoint();
-    const useFocalPointQuality = focalPoint !== null && this.scaleStateManager.getQualityFalloff() !== 'none';
-
+    // Queue tile requests with FOCAL-POINT PRIORITY (amnesia-aqv fix)
+    // Previously all tiles were hardcoded to 'critical', bypassing the focal center
+    // prioritization. Now tiles near the focal point (during zoom) or viewport center
+    // (during scroll) get higher priority, ensuring users see sharp content where
+    // they're looking first.
+    
+    // Calculate priority distribution for focal-point tracking
+    const priorityDistribution = { critical: 0, high: 0, medium: 0, low: 0 };
+    const tilePriorities: Map<string, RenderPriority> = new Map();
+    
     for (const tile of visibleTiles) {
-      // Determine tile scale: per-tile when focal point active, global otherwise
-      let actualScale = tileScale;
-      let tileCssStretch = 1.0;
+      const layout = this.pageLayouts.get(tile.page);
+      const priority = layout ? this.getTilePriority(tile, layout) : 'critical';
+      priorityDistribution[priority]++;
+      tilePriorities.set(`${tile.page}-${tile.tileX}-${tile.tileY}`, priority);
+    }
+    
+    // Record priority distribution for focal-point analysis
+    const focalTracker = getFocalPointTracker();
+    focalTracker.startGesture(priorityDistribution);
+    
+    // amnesia-rwe: During active zoom, only queue focal-priority tiles (critical/high)
+    // This fulfills the requirement: "Maximum high res tiles should be prefetched when gesture starts"
+    // without overwhelming the queue. The semaphore policy limits active-phase queue to 50.
+    let tilesToQueue = visibleTiles;
+    if (isActiveZoom) {
+      tilesToQueue = visibleTiles.filter(tile => {
+        const key = `${tile.page}-${tile.tileX}-${tile.tileY}`;
+        const priority = tilePriorities.get(key);
+        return priority === 'critical' || priority === 'high';
+      });
+      console.log(`[amnesia-rwe] Active zoom: queuing ${tilesToQueue.length}/${visibleTiles.length} focal-priority tiles`);
+    }
+    
+    // T2HR v2: Track tile requests by source
+    // Determine source based on gesture phase:
+    // - 'active' or 'settling' → zoom-initiated (tiles should be ready by zoom end)
+    // - 'idle' or 'rendering' → pan/scroll-initiated
+    const t2hrTracker = getT2HRTracker();
+    const gesturePhase = this.zoomScaleService.getGesturePhase();
+    const t2hrSource: TileRequestSource = (gesturePhase === 'active' || gesturePhase === 'settling')
+      ? 'zoom'
+      : (Math.abs(this.velocity.y) > 0.1 ? 'scroll' : 'pan');
+    
+    for (const tile of tilesToQueue) {
+      // Use consistent scale for all tiles in this batch
+      const actualScale = tileScale;
+      
+      // Calculate actual cssStretch: how much tile will be stretched on screen
+      // For crisp display at zoom Z with DPR D, we need scale Z*D
+      // If we render at tileScale S, cssStretch = (Z*D) / S
+      // cssStretch=1.0 means perfectly sharp, >1 means blurry (stretched)
+      const neededScaleForCrispness = zoom * this.config.pixelRatio;
+      const tileCssStretch = neededScaleForCrispness / actualScale;
 
-      if (useFocalPointQuality) {
-        // Per-tile quality: tiles near focal point get higher scale
-        const layout = layouts.find(l => l.page === tile.page);
-        if (layout) {
-          const perTileQuality = this.scaleStateManager.getTileScale(tile, tileSize, {
-            x: layout.x,
-            y: layout.y,
-          });
-          actualScale = Math.min(tileScale, perTileQuality.scale);
-          tileCssStretch = perTileQuality.cssStretch;
-        }
-      }
+      // Get pre-calculated priority
+      const priority = tilePriorities.get(`${tile.page}-${tile.tileX}-${tile.tileY}`) ?? 'critical';
+      
+      // T2HR v2: Track tile request at REQUEST time (before render)
+      const tileKey = `${tile.page}-${tile.tileX}-${tile.tileY}-s${actualScale}`;
+      t2hrTracker.onTileRequested({
+        tileKey,
+        page: tile.page,
+        tileX: tile.tileX,
+        tileY: tile.tileY,
+        source: t2hrSource,
+        targetScale: actualScale,
+        priority,
+      });
 
       const adjustedTile = { ...tile, scale: actualScale };
       this.renderCoordinator.requestRender({
         type: 'tile' as const,
         tile: adjustedTile,
-        priority: 'critical',
+        priority,
         documentId: this.documentId ?? undefined,
         sessionId: this.pendingSessionId,
         // Pass cssStretch for display compensation
         cssStretch: tileCssStretch,
         // INV-6: Attach epoch for display-time validation
         scaleEpoch: scaleSnapshot.epoch,
-        renderParamsId: scaleSnapshot.renderParamsId,
+        renderParamsId: scaleSnapshot.snapshotId,
         // Debug info
         zoom: zoom,
         requestedScale: tileScale,
@@ -2358,31 +2373,35 @@ export class PdfInfiniteCanvas {
       });
     }
 
-    // Get prefetch tiles from strategy (velocity-based prediction)
-    const prefetchTiles = this.renderCoordinator.getPrefetchTiles(
-      canvasViewport,
-      layouts,
-      this.velocity,
-      zoom
-    );
+    // amnesia-rwe: Skip prefetch during active zoom (low priority tiles compete with critical)
+    // Prefetch is velocity-based prediction which doesn't apply during zoom gestures
+    if (!isActiveZoom) {
+      // Get prefetch tiles from strategy (velocity-based prediction)
+      const prefetchTiles = this.renderCoordinator.getPrefetchTiles(
+        canvasViewport,
+        layouts,
+        this.velocity,
+        zoom
+      );
 
-    // Queue prefetch requests at lower priority
-    for (const tile of prefetchTiles) {
-      this.renderCoordinator.requestRender({
-        type: 'tile' as const,
-        tile,
-        priority: 'low',
-        documentId: this.documentId ?? undefined,
-        sessionId: this.pendingSessionId,
-        // INV-6: Attach epoch for display-time validation (same batch)
-        scaleEpoch: scaleSnapshot.epoch,
-        renderParamsId: scaleSnapshot.renderParamsId,
-        // Debug info
-        zoom: zoom,
-        requestedScale: tileScale,
-      }).catch(() => {
-        // Ignore prefetch failures
-      });
+      // Queue prefetch requests at lower priority
+      for (const tile of prefetchTiles) {
+        this.renderCoordinator.requestRender({
+          type: 'tile' as const,
+          tile,
+          priority: 'low',
+          documentId: this.documentId ?? undefined,
+          sessionId: this.pendingSessionId,
+          // INV-6: Attach epoch for display-time validation (same batch)
+          scaleEpoch: scaleSnapshot.epoch,
+          renderParamsId: scaleSnapshot.snapshotId,
+          // Debug info
+          zoom: zoom,
+          requestedScale: tileScale,
+        }).catch(() => {
+          // Ignore prefetch failures
+        });
+      }
     }
   }
 
@@ -2646,6 +2665,139 @@ export class PdfInfiniteCanvas {
   }
 
   /**
+   * amnesia-xc0: Schedule a debounced page refresh when tiles finish rendering.
+   * 
+   * This is called by the onTileReady callback when tiles complete in the background.
+   * It debounces multiple tile completions within 50ms to avoid excessive re-composites.
+   * 
+   * IMPORTANT: This does NOT call triggerTilePrefetch() because that would add more
+   * tiles to the already-saturated queue. Instead, it calls compositeCachedTilesForPage()
+   * which ONLY composites tiles that are already in cache - no new render requests.
+   * 
+   * @param page - Page number to refresh
+   * @param priority - Priority of the completed tile (for logging)
+   */
+  private schedulePageRefresh(page: number, priority: import('./render-coordinator').RenderPriority, tileEpoch: number): void {
+    // Cancel any existing scheduled refresh for this page
+    const existingTimeout = this.pendingPageRefresh.get(page);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+    
+    // Schedule a new refresh with 50ms debounce
+    // Capture tileEpoch at schedule time (not execution time) to maintain epoch consistency
+    const timeout = setTimeout(() => {
+      this.pendingPageRefresh.delete(page);
+      
+      // Only refresh if the page is still visible
+      if (!this.visiblePages.has(page)) {
+        return;
+      }
+      
+      console.log(`[PAGE-REFRESH] page=${page}: Refreshing after ${priority} tile completed (epoch=${tileEpoch})`);
+      
+      // Composite ONLY cached tiles - do NOT add new render requests to the queue!
+      // triggerTilePrefetch would add all visible tiles (cached AND non-cached) to the queue,
+      // making the saturated queue problem worse. compositeCachedTilesForPage only reads
+      // from cache and composites what's already rendered.
+      if (this.useTiledRendering && this.renderCoordinator?.shouldUseTiling(this.camera.z)) {
+        this.compositeCachedTilesForPage(page, tileEpoch).catch(err => {
+          console.warn(`[PAGE-REFRESH] page=${page}: Failed to composite cached tiles:`, err);
+        });
+      }
+    }, 50);
+    
+    this.pendingPageRefresh.set(page, timeout);
+  }
+  
+  /**
+   * amnesia-xc0: Composite ONLY cached tiles for a page without requesting new renders.
+   * 
+   * This is the key to fixing the nudge bug without making the queue saturation worse.
+   * It reads tiles directly from cache and composites them to the canvas, without
+   * going through the render queue (semaphore).
+   * 
+   * EPOCH VALIDATION: The tileEpoch parameter gates compositing. If the tile epoch
+   * doesn't match the canvas render state epoch, tiles are skipped (zoom changed).
+   * 
+   * COVERAGE THRESHOLD: Only composite if we have at least 25% of viewport tiles.
+   * This avoids visual artifacts from very sparse partial updates.
+   * 
+   * @param page - Page number to composite
+   * @param tileEpoch - The epoch when the completed tile was requested
+   */
+  private async compositeCachedTilesForPage(page: number, tileEpoch: number): Promise<void> {
+    if (!this.tileEngine || !this.renderCoordinator) return;
+    
+    const element = this.pageElements.get(page);
+    const layout = this.pageLayouts.get(page);
+    if (!element || !layout) return;
+    
+    const zoom = this.camera.z;
+    const screenRect = this.getViewportRect();
+    if (!screenRect || screenRect.width <= 0 || screenRect.height <= 0) return;
+    
+    // Calculate visible tiles for this page
+    const canvasViewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
+    const tileScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
+    const tiles = this.tileEngine.getVisibleTiles(canvasViewport, [layout], zoom, tileScale);
+    
+    if (tiles.length === 0) return;
+    
+    // Get cached tiles ONLY - do not request new renders
+    const cacheManager = getTileCacheManager();
+    const cachedTileImages: Array<{
+      tile: typeof tiles[0];
+      bitmap: ImageBitmap;
+    }> = [];
+    
+    for (const tile of tiles) {
+      // Try exact scale match first
+      const cached = await cacheManager.get(tile);
+      if (cached) {
+        cachedTileImages.push({ tile, bitmap: cached });
+        continue;
+      }
+      
+      // Try fallback at different scale (only for additive composite)
+      const fallback = await cacheManager.getBestAvailableBitmap(tile);
+      if (fallback && fallback.cssStretch <= 2.0) {
+        // Accept only good fallbacks (up to 2x stretch) for additive composite
+        cachedTileImages.push({ 
+          tile: fallback.fallbackTile ?? tile, 
+          bitmap: fallback.bitmap,
+        });
+      }
+      // If no cache hit, skip this tile - don't request a new render!
+    }
+    
+    // COVERAGE THRESHOLD: Only composite if we have at least 25% of viewport tiles.
+    // Very sparse updates look bad and waste CPU cycles.
+    const COVERAGE_THRESHOLD = 0.25;
+    const cachedRatio = cachedTileImages.length / tiles.length;
+    
+    if (cachedRatio < COVERAGE_THRESHOLD) {
+      // Close bitmaps to avoid memory leak
+      cachedTileImages.forEach(({ bitmap }) => bitmap.close());
+      console.log(`[CACHE-COMPOSITE] page=${page}: Skipping - only ${(cachedRatio * 100).toFixed(0)}% coverage (threshold ${COVERAGE_THRESHOLD * 100}%)`);
+      return;
+    }
+    
+    console.log(`[CACHE-COMPOSITE] page=${page}: Compositing ${cachedTileImages.length}/${tiles.length} cached tiles (${(cachedRatio * 100).toFixed(0)}%), epoch=${tileEpoch}`);
+    
+    // Use epoch-validated ADDITIVE composite
+    // This validates that the tile epoch matches the canvas render state
+    const success = element.addTilesToExistingCanvas(cachedTileImages, tileEpoch);
+    
+    if (!success) {
+      // Epoch mismatch - tiles are stale, already closed in addTilesToExistingCanvas
+      console.log(`[CACHE-COMPOSITE] page=${page}: Skipped due to epoch mismatch`);
+    } else {
+      console.log(`[CACHE-COMPOSITE] page=${page}: Additive composite complete`);
+    }
+  }
+
+  /**
    * Queue pages for rendering (legacy method, uses priority queue internally)
    * @param force - If true, bypass the canRender() guard (for mode transitions)
    */
@@ -2664,8 +2816,6 @@ export class PdfInfiniteCanvas {
    */
   private async processRenderQueue(): Promise<void> {
     const hasWork = this.priorityRenderQueue.length > 0 || this.renderQueue.length > 0;
-    // DEBUG: Log render queue processing
-    console.log(`[PdfInfiniteCanvas] processRenderQueue: hasWork=${hasWork}, isRendering=${this.isRendering}, priorityQueue=${this.priorityRenderQueue.length}, regularQueue=${this.renderQueue.length}`);
     if (this.isRendering || !hasWork) return;
 
     this.isRendering = true;
@@ -2681,6 +2831,11 @@ export class PdfInfiniteCanvas {
       // Helper to check if page needs rendering (not rendered OR needs zoom rerender)
       const needsRender = (page: number, element: PdfPageElement): boolean => {
         if (!element.getIsRendered()) return true;
+        // OVERLAY FIX (amnesia-aqv): Always render if overlay mode is active.
+        // The overlay pattern prepares a canvas for atomic swap during mode transitions.
+        // Even if the page is "rendered", we need to render fresh content to the overlay
+        // and then commit the swap.
+        if (element.isRenderingToOverlay()) return true;
         // Also render if zoom changed and cached scale is insufficient
         return this.needsZoomRerender(page);
       };
@@ -2989,6 +3144,18 @@ export class PdfInfiniteCanvas {
       const { tier: gridScale } = getTargetScaleTier(zoom, this.config.pixelRatio, this.config.maxZoom);
       const gridTileScale = Math.min(gridScale, maxScaleForTileSize);
       
+      // amnesia-rwe: Clear stale-scale tiles when scale changes significantly.
+      // This prevents queue buildup when zooming rapidly (1x → 32x), where tiles
+      // from intermediate scales (4, 8, 16, 24) would fill the queue and prevent
+      // high-res tiles from rendering quickly.
+      const lastRenderScale = this.pageCacheScales.get(page);
+      if (lastRenderScale !== undefined && this.renderCoordinator) {
+        const scaleRatio = Math.max(gridTileScale / lastRenderScale, lastRenderScale / gridTileScale);
+        if (scaleRatio > 2) {
+          this.renderCoordinator.abortStaleScaleTiles(gridTileScale, lastRenderScale);
+        }
+      }
+      
       // MID-ZOOM DIAGNOSTIC: Log all scale calculations at mid-zoom levels (4-32x)
       // This captures the amnesia-d9f mid-zoom blank tile bug
       if (zoom >= 4) {
@@ -3176,7 +3343,7 @@ export class PdfInfiniteCanvas {
             tileCoords: tiles.length > 0
               ? tiles.slice(0, 5).map(t => `(${t.tileX},${t.tileY})`).join(', ') + (tiles.length > 5 ? `... (${tiles.length} total)` : '')
               : '(NONE - BUG!)',
-            cameraSource: this.zoomStateMachine.getZoomSnapshot() ? 'zoomSnapshot' : (this.scrollRenderSnapshot ? 'scrollSnapshot' : 'current'),
+            cameraSource: this.zoomScaleService.getZoomSnapshot() ? 'zoomSnapshot' : (this.scrollRenderSnapshot ? 'scrollSnapshot' : 'current'),
             camera: `x=${effectiveCamera.x.toFixed(1)}, y=${effectiveCamera.y.toFixed(1)}, z=${effectiveCamera.z.toFixed(2)}`,
           });
         }
@@ -3293,7 +3460,8 @@ export class PdfInfiniteCanvas {
 
       // INV-6 FIX (2026-01-23): Capture scale snapshot BEFORE tile batch.
       // All tiles in this batch MUST use the same epoch to prevent mixed-scale corruption.
-      const scaleSnapshot = this.scaleStateManager.captureSnapshot();
+      // amnesia-aqv: Use ZoomScaleService snapshot
+      const scaleSnapshot = this.zoomScaleService.captureSnapshot();
 
       // Request tiles through coordinator (handles caching, deduplication)
       const tilePromises = tiles.map(tile =>
@@ -3305,7 +3473,7 @@ export class PdfInfiniteCanvas {
           sessionId: this.pendingSessionId,
           // INV-6: Attach epoch for display-time validation
           scaleEpoch: scaleSnapshot.epoch,
-          renderParamsId: scaleSnapshot.renderParamsId,
+          renderParamsId: scaleSnapshot.snapshotId,
         })
       );
 
@@ -3632,11 +3800,12 @@ export class PdfInfiniteCanvas {
     // FOCAL-POINT-RADIAL PRIORITY: Use zoom focal point if available, else viewport center.
     // During zoom gestures, the focal point is where the user is zooming (cursor/pinch center).
     // Prioritizing tiles near the focal point means users see sharpness at their zoom target first.
-    const zoomSnapshot = this.zoomStateMachine.getZoomSnapshot();
+    // amnesia-aqv: Use ZoomScaleService instead of deprecated ZoomStateMachine
+    const zoomSnapshot = this.zoomScaleService.getZoomSnapshot();
     let priorityCenterX: number;
     let priorityCenterY: number;
 
-    if (zoomSnapshot && this.zoomStateMachine.isZoomActive()) {
+    if (zoomSnapshot && this.zoomScaleService.isZoomActive()) {
       // ZOOM GESTURE ACTIVE: Use focal point in canvas coordinates
       // Convert screen focal point to canvas coordinates
       const focalCanvas = screenToCanvas(zoomSnapshot.focalPoint, zoomSnapshot.camera);
@@ -3650,10 +3819,45 @@ export class PdfInfiniteCanvas {
     }
 
     // Calculate tile center in canvas coordinates
-    const tileX = layout.x + tile.tileX * TILE_SIZE;
-    const tileY = layout.y + tile.tileY * TILE_SIZE;
-    const tileCenterX = tileX + TILE_SIZE / 2;
-    const tileCenterY = tileY + TILE_SIZE / 2;
+    // amnesia-rwe FIX: Convert tile indices to canvas coordinates correctly.
+    //
+    // Tile coordinate system:
+    // - tile.tileX, tile.tileY: Grid indices
+    // - tile.tileSize: CSS tile size (e.g., 128px at high zoom)
+    // - tile.scale: Render scale (e.g., 64)
+    // - PDF tile size = tileSize / scale (e.g., 128/64 = 2 PDF units)
+    //
+    // To convert tile index to canvas position:
+    // 1. Get PDF position: tileX * pdfTileSize
+    // 2. Convert to canvas: pdfPos * (layout.width / pdfWidth)
+    //
+    // SIMPLIFICATION: At zoom Z, canvas coords scale with zoom.
+    // A tile covers (tileSize/scale) PDF units, which is (tileSize/scale * zoom) canvas units.
+    // Since scale ≈ zoom * DPR for crisp rendering, canvas tile size ≈ tileSize / DPR.
+    // But for focal priority, we just need relative distances, so we can use a simpler approach:
+    // 
+    // The tile grid covers the entire page. Tile (0,0) is at layout origin.
+    // Tile (tileX, tileY) is at (tileX/totalTilesX, tileY/totalTilesY) fraction of the page.
+    const actualTileSize = tile.tileSize ?? TILE_SIZE;
+    const pdfTileSize = actualTileSize / tile.scale;
+    
+    // Get page dimensions to calculate total tiles
+    const pdfDims = this.tileEngine?.pageDimensions.get(tile.page);
+    const pdfWidth = pdfDims?.width ?? layout.width;
+    const pdfHeight = pdfDims?.height ?? layout.height;
+    
+    // Convert PDF tile position to canvas position
+    // pdfPos = tileIndex * pdfTileSize
+    // canvasPos = layout.origin + pdfPos * (layout.size / pdfSize)
+    const pdfX = tile.tileX * pdfTileSize;
+    const pdfY = tile.tileY * pdfTileSize;
+    const canvasScaleX = layout.width / pdfWidth;
+    const canvasScaleY = layout.height / pdfHeight;
+    
+    const tileX = layout.x + pdfX * canvasScaleX;
+    const tileY = layout.y + pdfY * canvasScaleY;
+    const tileCenterX = tileX + (pdfTileSize * canvasScaleX) / 2;
+    const tileCenterY = tileY + (pdfTileSize * canvasScaleY) / 2;
 
     // Distance from priority center (focal point or viewport center)
     const distance = Math.sqrt(
@@ -3711,7 +3915,8 @@ export class PdfInfiniteCanvas {
       if (!layout) return;
 
       // INV-6 FIX (2026-01-23): Capture scale snapshot for retry batch.
-      const scaleSnapshot = this.scaleStateManager.captureSnapshot();
+      // amnesia-aqv: Use ZoomScaleService snapshot
+      const scaleSnapshot = this.zoomScaleService.captureSnapshot();
 
       const retryPromises = retryTiles.map(tile =>
         this.renderCoordinator!.requestRender({
@@ -3722,7 +3927,7 @@ export class PdfInfiniteCanvas {
           sessionId: this.pendingSessionId,
           // INV-6: Attach epoch for display-time validation
           scaleEpoch: scaleSnapshot.epoch,
-          renderParamsId: scaleSnapshot.renderParamsId,
+          renderParamsId: scaleSnapshot.snapshotId,
         })
       );
 
@@ -3784,7 +3989,14 @@ export class PdfInfiniteCanvas {
     // PAGE SCALE STABILITY FIX: Immediately reset canvas CSS to container size
     // before async operations start. This prevents the stretched/clipped appearance
     // that occurs when old viewport-only tile CSS settings interact with new camera zoom.
-    element.prepareForFullPageRender();
+    //
+    // OVERLAY FIX (amnesia-aqv): Skip if already in overlay mode. When executeModeTransition
+    // calls prepareForFullPageRenderWithOverlay(), it sets up the overlay canvas for atomic
+    // swap. Calling prepareForFullPageRender() here would reset that state and switch back
+    // to snapshot mode, defeating the purpose of the overlay pattern.
+    if (!element.isRenderingToOverlay()) {
+      element.prepareForFullPageRender();
+    }
 
     // Calculate zoom-aware render scale for sharp text at current zoom
     // Cap at max useful scale to avoid fetching unnecessarily large images
@@ -3981,8 +4193,24 @@ export class PdfInfiniteCanvas {
     elementBuffer: number;
     keepBuffer: number;
   } {
-    // Minimum floors ALIGNED TO TILE BOUNDARIES (256px tile size)
-    // This ensures buffers always cover at least N complete tiles at high zoom
+    // amnesia-rwe: At extreme zoom (>16x), minimize buffers to reduce tile count.
+    // At 32x zoom with 128px tiles, even a small buffer creates many tiles.
+    // The visible viewport at 32x is tiny in PDF space, so we don't need large buffers.
+    //
+    // Previous: MIN_RENDER_BUFFER=256 → 256/2=128 tiles for 256×256 screen area
+    // New: At high zoom, use much smaller buffers
+    
+    if (zoom > 16) {
+      // High zoom: minimize buffers
+      // At 32x zoom, 64px buffer = 2 PDF units = 1 tile at 128px/scale64
+      return {
+        renderBuffer: 64,    // ~1 tile worth of buffer
+        elementBuffer: 128,  // ~2 tiles
+        keepBuffer: 192,     // ~3 tiles
+      };
+    }
+    
+    // Normal zoom: use original buffer sizes
     const MIN_RENDER_BUFFER = 256;   // 1 complete tile
     const MIN_ELEMENT_BUFFER = 512;  // 2 complete tiles
     const MIN_KEEP_BUFFER = 768;     // 3 complete tiles
@@ -4367,6 +4595,15 @@ export class PdfInfiniteCanvas {
 
     console.log(`[PdfInfiniteCanvas] handleZoomChange: ${oldZoom.toFixed(2)} → ${newZoom.toFixed(2)}, focalPoint=(${focalPoint.x.toFixed(0)}, ${focalPoint.y.toFixed(0)})`);
 
+    // amnesia-rwe: Clear stale tile queue on major zoom changes (>2x ratio).
+    // Without this, zooming from 1x → 32x floods the queue with 300+ stale tiles
+    // from intermediate scales, causing critical high-res tiles to wait 100+ seconds.
+    const majorZoomRatio = Math.max(newZoom / oldZoom, oldZoom / newZoom);
+    if (majorZoomRatio > 2 && this.renderCoordinator) {
+      console.log(`[amnesia-rwe] Major zoom change: ${oldZoom.toFixed(2)} → ${newZoom.toFixed(2)} (${majorZoomRatio.toFixed(1)}x ratio), clearing tile queue`);
+      this.renderCoordinator.abortAllPending();
+    }
+
     // Step 1: Resize all page elements to their final zoomed dimensions
     for (const [page, element] of this.pageElements) {
       const layout = this.pageLayouts.get(page);
@@ -4506,20 +4743,16 @@ export class PdfInfiniteCanvas {
     // Notify ZoomTransformLayer that scale was rendered (for quality tracking)
     this.zoomTransformLayer?.onScaleRendered(scale);
 
-    // CRITICAL FIX: Also notify ZoomStateMachine so its renderState.renderScale stays in sync.
-    // Without this, the orchestrator's renderScale stays at initial value (2), causing
-    // cssStretch calculations to be wildly wrong (e.g., cssStretch=16 at zoom=16).
-    this.zoomStateMachine.onScaleRendered(scale);
+    // amnesia-aqv: Notify ZoomScaleService that scale was rendered.
+    // This keeps the unified state machine's renderScale in sync with actual rendered content.
+    this.zoomScaleService.onScaleRendered(scale);
 
     // Final phase completes the zoom gesture - reset animation state and state machine
     if (phase === 'final') {
       this.zoomTransformLayer?.onZoomGestureEnd();
 
-      // Notify state machine that render is complete
-      // This clears the snapshot and transitions back to 'idle'
-      this.zoomStateMachine.completeRenderPhase();
-      
-      // amnesia-e4i: Also notify ZoomScaleService to complete render phase
+      // amnesia-aqv: Notify ZoomScaleService that render is complete.
+      // This clears the snapshot and transitions back to 'idle'.
       this.zoomScaleService.completeRenderPhase();
       
       // amnesia-e4i: Process retry queue for any tiles that were dropped during gesture
@@ -5251,7 +5484,8 @@ export class PdfInfiniteCanvas {
       x: point.x + this.camera.x,
       y: point.y + this.camera.y,
     };
-    this.scaleStateManager.setFocalPoint(canvasFocalPoint, 'zoom');
+    // amnesia-aqv: Use ZoomScaleService for focal point tracking
+    this.zoomScaleService.setFocalPoint(canvasFocalPoint, 'zoom');
 
     // NOTE: Old flag-based zoom blocking has been replaced by ZoomStateMachine.
     // The state machine provides centralized blocking via canRender() and handles:
@@ -5283,15 +5517,20 @@ export class PdfInfiniteCanvas {
 
     this.camera = zoomCameraToPoint(this.camera, point, delta, constraints);
 
-      // ZOOM STATE MANAGER SYNC (amnesia-5so): Keep ZoomStateManager in sync with camera
-      // This enables epoch-based tile validation and rebound detection.
-      this.zoomStateManager.syncFromCamera(this.camera);
-
-      // ZOOM SCALE SERVICE SYNC (amnesia-d9f): Keep unified service in sync with camera.
-      // This replaces zoomStateManager + zoomStateMachine with a single source of truth.
+      // amnesia-aqv: ZoomScaleService is now the single source of truth for zoom state.
+      // This replaces both zoomStateManager and zoomStateMachine.
       this.zoomScaleService.onZoomGesture(this.camera.z, point, this.camera);
 
     if (this.camera.z !== oldZoom) {
+      // amnesia-rwe: Clear stale tile queue on major zoom changes (>2x ratio).
+      // Without this, zooming from 1x → 32x floods the queue with 300+ stale tiles
+      // from intermediate scales, causing critical high-res tiles to wait 100+ seconds.
+      const zoomChangeRatio = Math.max(this.camera.z / oldZoom, oldZoom / this.camera.z);
+      if (zoomChangeRatio > 2 && this.renderCoordinator) {
+        console.log(`[amnesia-rwe] Major zoom change in zoomAtPoint: ${oldZoom.toFixed(2)} → ${this.camera.z.toFixed(2)} (${zoomChangeRatio.toFixed(1)}x ratio), clearing tile queue`);
+        this.renderCoordinator.abortAllPending();
+      }
+
       // STALE SNAPSHOT FIX (2026-01-22): Clear scrollRenderSnapshot when zoom changes.
       // The scroll snapshot captures camera position at scroll time, but during zoom
       // the camera.y changes dramatically (focal point preservation). If we don't clear
@@ -5348,16 +5587,8 @@ export class PdfInfiniteCanvas {
         this.checkAndExecuteModeTransition();
       }
 
-      // MIGRATION (amnesia-d9f): ZoomScaleService.onZoomGesture() is already called above.
-      // Legacy ZoomStateMachine kept temporarily for comparison - will be removed.
-      this.zoomStateMachine.onZoomGesture(
-        this.camera.z,
-        point,
-        { ...this.camera }
-      );
-
-      // NOTE: Render abort is now handled by ZoomScaleService via canRender() guards.
-      // No explicit abort needed - pending renders are rejected via epoch validation.
+      // amnesia-aqv: ZoomScaleService.onZoomGesture() is already called above.
+      // Render abort is handled by ZoomScaleService via canRender() guards and epoch validation.
 
       // NOTE: Cache eviction moved to handleZoomRenderPhase() final phase.
       // Evicting during zoom gesture caused cache misses → fallback tiles → cssStretch drift.
@@ -6273,20 +6504,8 @@ export class PdfInfiniteCanvas {
     // Ensure thumbnails are resumed on destroy
     this.provider.resumeThumbnailGeneration?.();
 
-    // Destroy ZoomStateMachine
-    if (this.zoomStateMachine) {
-      this.zoomStateMachine.destroy();
-    }
-
-    // Destroy ZoomStateManager (amnesia-5so)
-    if (this.zoomStateManager) {
-      this.zoomStateManager.destroy();
-    }
-
-    // Destroy ScaleStateManager (amnesia-ewt)
-    if (this.scaleStateManager) {
-      clearScaleStateManager(this.documentId ?? 'default');
-    }
+    // amnesia-aqv: ZoomScaleService is destroyed via its own lifecycle management.
+    // The old ZoomStateMachine, ZoomStateManager, and ScaleStateManager have been removed.
 
     // amnesia-x6q: Clear priority function to prevent memory leak
     getTileCacheManager().setPriorityFunction(null);

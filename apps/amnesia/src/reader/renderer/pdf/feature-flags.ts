@@ -147,6 +147,34 @@ export interface FeatureFlagDefinitions {
    * Default: true (diagnostic mode for debugging tile corruption)
    */
   useTileComplianceValidation: boolean;
+
+  /**
+   * Enable the diagnostics tab in the HUD.
+   *
+   * When enabled:
+   * - Shows "DIAG" tab in Amnesia HUD
+   * - Displays T2HR metrics, device profile, content-type analysis
+   * - Allows running health checks
+   *
+   * Enable via devtools: getFeatureFlags().setOverride('enableDiagnosticsTab', true)
+   *
+   * Default: false (enable manually for debugging)
+   */
+  enableDiagnosticsTab: boolean;
+
+  /**
+   * Export diagnostics data to console as JSON.
+   *
+   * When enabled:
+   * - T2HR measurements are logged to console on completion
+   * - Health check results are logged
+   * - Focal-point tracking events are logged
+   *
+   * Useful for debugging and data collection.
+   *
+   * Default: false (enable manually for debugging)
+   */
+  exportDiagnosticsJson: boolean;
 }
 
 /** Runtime-resolved flag values (all booleans or numbers) */
@@ -167,6 +195,8 @@ export interface ResolvedFeatureFlags {
   useZoomStateManager: boolean;
   useDebugTiles: boolean;
   useTileComplianceValidation: boolean;
+  enableDiagnosticsTab: boolean;
+  exportDiagnosticsJson: boolean;
 }
 
 /** Capability detection results */
@@ -221,6 +251,8 @@ const DEFAULT_FLAGS: FeatureFlagDefinitions = {
   useZoomStateManager: true, // Centralized zoom: enabled to fix two-stage zoom bug
   useDebugTiles: false, // Debug: disabled by default, enable for tile composition debugging
   useTileComplianceValidation: true, // amnesia-e4i: enabled to diagnose tile corruption
+  enableDiagnosticsTab: false, // Diagnostics: disabled by default, enable via devtools
+  exportDiagnosticsJson: false, // Diagnostics: disabled by default, enable for data collection
 };
 
 /**
@@ -467,6 +499,8 @@ export class FeatureFlagsManager {
       useZoomStateManager: merged.useZoomStateManager,
       useDebugTiles: merged.useDebugTiles,
       useTileComplianceValidation: merged.useTileComplianceValidation,
+      enableDiagnosticsTab: merged.enableDiagnosticsTab,
+      exportDiagnosticsJson: merged.exportDiagnosticsJson,
     };
   }
 

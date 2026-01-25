@@ -10,7 +10,7 @@ import type { SvelteComponent } from 'svelte';
 // Tab Types
 // =============================================================================
 
-export type TabName = 'reading' | 'library' | 'stats' | 'server' | 'series';
+export type TabName = 'reading' | 'library' | 'stats' | 'server' | 'series' | 'diagnostics';
 
 export interface HUDTab {
   id: TabName;

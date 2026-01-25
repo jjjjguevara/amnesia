@@ -50,7 +50,8 @@ import type { Point, Camera, CameraConstraints } from './pdf-canvas-camera';
 import { screenToCanvas } from './pdf-canvas-camera';
 import { getTargetScaleTier, getExactTargetScale, type ScaleTier } from './progressive-tile-renderer';
 import { isFeatureEnabled } from './feature-flags';
-import { setGesturePhase } from './render-coordinator';
+import { setGesturePhase, type RenderPriority } from './render-coordinator';
+import type { TileCoordinate } from './tile-render-engine';
 
 // ─────────────────────────────────────────────────────────────────
 // Types
@@ -182,6 +183,18 @@ export class ZoomScaleService {
   private gestureEndTime: number = 0;
   private wasAtMaxZoom: boolean = false;
   private wasAtMinZoom: boolean = false;
+
+  // ─────────────────────────────────────────────────────────────────
+  // Focal Point (merged from ScaleStateManager)
+  // ─────────────────────────────────────────────────────────────────
+  private focalPoint: Point | null = null;
+  private focalPointGestureType: 'zoom' | 'pan' | 'idle' = 'idle';
+
+  // ─────────────────────────────────────────────────────────────────
+  // Zoom Snapshot (merged from ZoomOrchestrator)
+  // ─────────────────────────────────────────────────────────────────
+  private zoomSnapshot: { zoom: number; focalPoint: Point; camera: { x: number; y: number; z: number }; timestamp: number } | null = null;
+  private lastRenderedScale: number = 1;
 
   // ─────────────────────────────────────────────────────────────────
   // Callbacks (set by PdfInfiniteCanvas)
@@ -413,6 +426,116 @@ export class ZoomScaleService {
   }
 
   // ─────────────────────────────────────────────────────────────────
+  // Focal Point API (merged from ScaleStateManager)
+  // ─────────────────────────────────────────────────────────────────
+
+  /** Get the current focal point for tile priority ordering */
+  getFocalPoint(): Point | null {
+    return this.focalPoint;
+  }
+
+  /** Set the focal point for radial priority calculations */
+  setFocalPoint(point: Point | null, gestureType: 'zoom' | 'pan' | 'idle' = 'idle'): void {
+    this.focalPoint = point;
+    this.focalPointGestureType = gestureType;
+  }
+
+  /**
+   * Get tile priority based on radial distance from focal point.
+   * amnesia-aqv: Migrated from ScaleStateManager to consolidate zoom state.
+   *
+   * @param tile Tile coordinate
+   * @param tileSize Tile size in CSS pixels (default 256)
+   * @param pageLayout Layout info for converting tile coords to canvas coords
+   */
+  getTilePriority(
+    tile: TileCoordinate,
+    tileSize: number = 256,
+    pageLayout?: { x: number; y: number }
+  ): RenderPriority {
+    const focal = this.focalPoint;
+    if (!focal || this.focalPointGestureType === 'idle') {
+      return 'medium';
+    }
+
+    // Calculate tile center in canvas coordinates
+    const tileX = (pageLayout?.x ?? 0) + (tile.tileX + 0.5) * (tileSize / tile.scale);
+    const tileY = (pageLayout?.y ?? 0) + (tile.tileY + 0.5) * (tileSize / tile.scale);
+
+    const distance = Math.sqrt(
+      (tileX - focal.x) ** 2 + (tileY - focal.y) ** 2
+    );
+
+    // Radial priority zones (in CSS pixels)
+    if (distance < tileSize) return 'critical';      // 1 tile radius
+    if (distance < tileSize * 2) return 'high';      // 2 tile radius
+    if (distance < tileSize * 4) return 'medium';    // 4 tile radius
+    return 'low';
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Zoom Snapshot API (merged from ZoomOrchestrator)
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Get the zoom snapshot captured at gesture start.
+   * Used for camera restoration during gesture cancel.
+   * Returns null if not in an active gesture.
+   */
+  getZoomSnapshot(): { zoom: number; focalPoint: Point; camera: { x: number; y: number; z: number }; timestamp: number } | null {
+    if (this.state.gesturePhase === 'idle') {
+      return null;
+    }
+    return this.zoomSnapshot;
+  }
+
+  /**
+   * Check if a zoom gesture is currently active.
+   * Alias for isGestureActive() for ZoomOrchestrator compatibility.
+   */
+  isZoomActive(): boolean {
+    return this.isGestureActive();
+  }
+
+  /**
+   * Track that a specific scale was rendered.
+   * Used for quality progression decisions.
+   */
+  onScaleRendered(scale: number): void {
+    this.lastRenderedScale = scale;
+  }
+
+  /** Get the last rendered scale */
+  getLastRenderedScale(): number {
+    return this.lastRenderedScale;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Public Gesture Control (for external callers)
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Manually start a gesture (for programmatic zoom).
+   * Usually gestures start automatically via onZoomGesture().
+   */
+  startGestureManual(): void {
+    if (this.state.gesturePhase === 'idle') {
+      this.startGesture();
+    }
+  }
+
+  /**
+   * Manually end a gesture (for programmatic zoom).
+   * Usually gestures end automatically via timeout.
+   */
+  endGestureManual(): void {
+    if (this.state.gesturePhase === 'active') {
+      this.clearTimers();
+      this.endGesture();
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────
   // Zoom Constraints
   // ─────────────────────────────────────────────────────────────────
 
@@ -565,6 +688,9 @@ export class ZoomScaleService {
     // Clear watchdog - we're successfully transitioning to idle
     this.clearPhaseWatchdog();
     
+    // Clear zoom snapshot - gesture cycle is complete
+    this.zoomSnapshot = null;
+    
     this.state = {
       ...this.state,
       gesturePhase: 'idle',
@@ -625,6 +751,15 @@ export class ZoomScaleService {
   private startGesture(): void {
     console.log('[ZoomScaleService] Gesture started');
     this.clearTimers();
+    
+    // Capture zoom snapshot at gesture start (merged from ZoomOrchestrator)
+    this.zoomSnapshot = {
+      zoom: this.state.zoom,
+      focalPoint: this.focalPoint ?? { x: 0, y: 0 },
+      camera: { x: this.state.position.x, y: this.state.position.y, z: this.state.zoom },
+      timestamp: performance.now(),
+    };
+    
     this.state = { ...this.state, gesturePhase: 'active' };
     setGesturePhase('active'); // amnesia-e4i: Update semaphore policy
     this.onGestureStart?.();
@@ -804,6 +939,8 @@ export class ZoomScaleService {
     this.onGestureEnd = null;
     this.onSettlingComplete = null;
     this.onRenderModeChange = null;
+    this.focalPoint = null;
+    this.zoomSnapshot = null;
   }
 }
 

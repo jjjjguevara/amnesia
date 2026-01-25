@@ -5,6 +5,11 @@
       "type": "local",
       "command": ["node", "/Users/josueguevara/Documents/Builds/obsidian-devtools-mcp/dist/index.js"],
       "enabled": true
+    },
+    "llm-council": {
+      "type": "local",
+      "command": ["llm-council"],
+      "enabled": true
     }
   }
 }

@@ -205,40 +205,22 @@ export {
 } from './progressive-tile-renderer';
 export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig, ExactScaleResult } from './progressive-tile-renderer';
 
-// Zoom Orchestrator (@deprecated - use ZoomStateManager for new code)
+// Zoom Scale Service (unified source of truth - amnesia-aqv)
+// Replaces: ZoomOrchestrator, ZoomStateMachine, ZoomStateManager, ScaleStateManager
 export {
-  ZoomOrchestrator,
-  getQualityDegradation,
-  shouldUseProgressiveZoom,
-} from './zoom-orchestrator';
+  ZoomScaleService,
+  createZoomScaleService,
+  getZoomScaleService,
+  clearZoomScaleService,
+} from './zoom-scale-service';
 export type {
-  ZoomState,
-  RenderPhase,
-  ZoomSnapshot,
-  ZoomRenderState,
-  ZoomOrchestratorConfig,
-} from './zoom-orchestrator';
-
-// Scale State Manager (single source of truth for scale decisions)
-export {
-  ScaleStateManager,
-  createScaleStateManager,
-  getScaleStateManager,
-  clearScaleStateManager,
-  clearAllScaleStateManagers,
-} from './scale-state-manager';
-export type {
-  ScaleMode,
-  RenderMode as ScaleRenderMode,
   GesturePhase,
-  QualityFalloffMode,
-  RenderParamsId,
-  ScaleState,
-  ScaleSnapshot,
-  TileQualityParams,
-  FocalPointState,
-  ScaleStateManagerConfig,
-} from './scale-state-manager';
+  RenderMode as ZoomRenderMode,
+  ZoomScaleServiceConfig,
+  ZoomScaleSnapshot,
+  ScaleResult,
+  TileParams,
+} from './zoom-scale-service';
 
 export { RenderCoordinator, getRenderCoordinator, resetRenderCoordinator } from './render-coordinator';
 export type { RenderRequest, RenderResult, RenderMode, RenderPriority } from './render-coordinator';

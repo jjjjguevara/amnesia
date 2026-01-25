@@ -47,6 +47,10 @@ import LibraryTab from '../components/tabs/LibraryTab.svelte';
 import StatsTab from '../components/tabs/StatsTab.svelte';
 import ServerTab from '../components/tabs/ServerTab.svelte';
 import SeriesTab from '../components/tabs/SeriesTab.svelte';
+import DiagnosticsTab from '../components/tabs/DiagnosticsTab.svelte';
+
+// Feature flags for conditional tabs
+import { getFeatureFlags } from '../../reader/renderer/pdf/feature-flags';
 
 // Map of tab IDs to component classes
 const TAB_COMPONENTS: Record<string, typeof ReadingTab> = {
@@ -55,6 +59,7 @@ const TAB_COMPONENTS: Record<string, typeof ReadingTab> = {
   stats: StatsTab,
   server: ServerTab,
   series: SeriesTab,
+  diagnostics: DiagnosticsTab,
 };
 
 export class AmnesiaHUDProvider implements HUDContentProvider {
@@ -441,7 +446,7 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
     const seriesCount = this.getActiveSeries().length;
 
     // Return tab definitions (components will be set by the HUD)
-    return [
+    const tabs: HUDTab[] = [
       {
         id: 'reading',
         label: 'READING',
@@ -477,6 +482,19 @@ export class AmnesiaHUDProvider implements HUDContentProvider {
         component: null as any,
       },
     ];
+
+    // Add diagnostics tab when feature flag is enabled
+    // Enable via devtools: getFeatureFlags().setFlag('enableDiagnosticsTab', true)
+    if (getFeatureFlags().isEnabled('enableDiagnosticsTab')) {
+      tabs.push({
+        id: 'diagnostics',
+        label: 'DIAG',
+        icon: 'activity',
+        component: null as any,
+      });
+    }
+
+    return tabs;
   }
 
   /**

@@ -160,29 +160,33 @@ export function getDynamicMaxScaleTier(): ScaleTier {
     const memoryGB = profile.memory.deviceMemoryGB ?? 4; // Default 4GB if unknown
     const tier = profile.tier;
 
-    // ADAPTIVE TILE SCALE FIX (amnesia-d9f):
+    // ADAPTIVE TILE SCALE FIX (amnesia-d9f, amnesia-rwe):
     //
     // With adaptive tile sizing enabled (useAdaptiveTileSize=true):
-    // - zoom <= 16: 512px tiles → max scale 16 (8192/512)
-    // - zoom <= 32: 256px tiles → max scale 32 (8192/256)
-    // - zoom > 32:  128px tiles → max scale 64 (8192/128)
+    // - zoom <= 8:  512px tiles → max scale 16 (8192/512)
+    // - zoom <= 16: 256px tiles → max scale 32 (8192/256)
+    // - zoom <= 32: 128px tiles → max scale 64 (8192/128)
     //
     // The maxScaleForTileSize calculation in tile-render-engine.ts already
-    // accounts for this. But getDynamicMaxScaleTier() was capping at 16
-    // regardless, preventing scale 32 at high zoom.
+    // accounts for tile size. But getDynamicMaxScaleTier() was capping at 32,
+    // preventing scale 64 at max zoom (32x on Retina displays).
     //
-    // FIX: Return 32 as max for high-end devices (8GB+ RAM).
-    // This allows scale 32 with 256px tiles at zoom 16-32.
-    // Lower-end devices (< 8GB) stay at scale 16 for memory safety.
+    // FIX (amnesia-rwe): Return 64 as max for high-end devices (8GB+ RAM).
+    // This allows scale 64 with 128px tiles at zoom 32 on Retina (DPR 2).
+    // Memory per tile: 128×64 = 8192px, so 8192×8192×4 = 268MB per tile.
+    // With ~180 tiles visible at max zoom, L2 cache handles this fine.
     //
-    // Memory per tile at scale 32 with 256px tiles: 8192×8192×4 = 268MB
-    // (Same as scale 16 with 512px tiles - within safe limits)
+    // For lower-end devices (< 8GB), cap at 32 for memory safety.
+    // For very low-end (< 4GB), cap at 16.
     if (memoryGB >= 8) {
+      maxScale = GPU_SAFE_MAX_SCALE; // 64 - enables crisp rendering at zoom 32 + DPR 2
+      console.log(`[ProgressiveTileRenderer] High-end device (${memoryGB}GB RAM, ${tier}): max scale ${maxScale}`);
+    } else if (memoryGB >= 4) {
       maxScale = 32;
-      console.log(`[ProgressiveTileRenderer] High-end device (${memoryGB}GB RAM, ${tier}): max scale 32`);
+      console.log(`[ProgressiveTileRenderer] Mid-range device (${memoryGB}GB RAM, ${tier}): max scale 32`);
     } else {
       maxScale = DEFAULT_MAX_SCALE_TIER; // 16
-      console.log(`[ProgressiveTileRenderer] Device (${memoryGB}GB RAM, ${tier}): max scale 16`);
+      console.log(`[ProgressiveTileRenderer] Low-end device (${memoryGB}GB RAM, ${tier}): max scale 16`);
     }
     void tier; // Tier not used for memory-based decision
 
@@ -580,22 +584,34 @@ export function getCssScaleFactor(renderedScale: number, displayScale: number): 
  * @param zoom Current zoom level
  * @returns Tile size in CSS pixels (512, 256, or 128)
  */
-export function getAdaptiveTileSize(zoom: number): number {
-  // Zoom band thresholds chosen to maintain crisp rendering (DPR >= 1.0)
-  // at the top of each band.
+export function getAdaptiveTileSize(zoom: number, pixelRatio?: number): number {
+  // amnesia-rwe: CRITICAL FIX - account for devicePixelRatio
   //
-  // Band 1: zoom <= 16, 512px tiles, max scale 16
-  //   - At zoom 16: DPR = 16/16 = 1.0 (crisp)
+  // For crisp rendering: neededScale = zoom * pixelRatio
+  // Max achievable scale: MAX_TILE_PIXELS (8192) / tileSize
   //
-  // Band 2: 16 < zoom <= 32, 256px tiles, max scale 32
-  //   - At zoom 32: DPR = 32/32 = 1.0 (crisp)
+  // On Retina (pixelRatio=2):
+  //   - 512px tiles: max scale = 16 → max crisp zoom = 8
+  //   - 256px tiles: max scale = 32 → max crisp zoom = 16
+  //   - 128px tiles: max scale = 64 → max crisp zoom = 32
   //
-  // Band 3: zoom > 32, 128px tiles, max scale 64
-  //   - At zoom 64: DPR = 64/64 = 1.0 (crisp)
+  // On non-Retina (pixelRatio=1):
+  //   - 512px tiles: max scale = 16 → max crisp zoom = 16
+  //   - 256px tiles: max scale = 32 → max crisp zoom = 32
+  //   - 128px tiles: max scale = 64 → max crisp zoom = 64
   
-  if (zoom <= 16) {
+  const dpr = pixelRatio ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 2);
+  const neededScale = zoom * dpr;
+  
+  // Pick smallest tile size that can achieve needed scale
+  // MAX_TILE_PIXELS = 8192, so:
+  // 512px tiles: max scale = 16
+  // 256px tiles: max scale = 32
+  // 128px tiles: max scale = 64
+  
+  if (neededScale <= 16) {
     return 512;
-  } else if (zoom <= 32) {
+  } else if (neededScale <= 32) {
     return 256;
   } else {
     return 128;

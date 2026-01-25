@@ -50,6 +50,9 @@ import { getCanvasPool } from './pdf-canvas-pool';
 import { getRenderSessionManager } from './render-session';
 import { isFeatureEnabled } from './feature-flags';
 import type { GesturePhase } from './zoom-scale-service';
+// Diagnostic trackers for T2HR and focal-point analysis
+import { getT2HRTracker } from './t2hr-tracker';
+import { getFocalPointTracker } from './focal-point-tracker';
 
 // ─────────────────────────────────────────────────────────────────
 // Dynamic Semaphore Policy (amnesia-e4i)
@@ -511,6 +514,24 @@ export class RenderCoordinator {
   private currentPolicy: SemaphorePolicy = getSemaphorePolicy('idle', 1);
 
   // ============================================================
+  // Tile Ready Callback (amnesia-xc0: Nudge Bug Fix)
+  // ============================================================
+  
+  /**
+   * Callback triggered when a tile finishes rendering and is cached.
+   * Used to trigger re-composite for visible pages without requiring user interaction.
+   * 
+   * amnesia-xc0: Extended to include scaleEpoch for epoch-gated compositing.
+   * The epoch allows the canvas to validate that tiles are compatible with
+   * the current render state before drawing them.
+   * 
+   * @param page - Page number the tile belongs to
+   * @param priority - Priority level of the completed tile
+   * @param scaleEpoch - The epoch when this tile was requested (for validation)
+   */
+  public onTileReady: ((page: number, priority: RenderPriority, scaleEpoch: number) => void) | null = null;
+
+  // ============================================================
   // Smart Retry Queue (amnesia-e4i)
   // ============================================================
   
@@ -846,6 +867,57 @@ export class RenderCoordinator {
   }
 
   /**
+   * Abort all tiles when scale changes significantly (amnesia-rwe).
+   *
+   * When user zooms rapidly (e.g., 1x → 32x), tiles get requested at many
+   * intermediate scales (4, 8, 16, 24, etc.). These fill up the queue and
+   * prevent high-res tiles from rendering quickly.
+   *
+   * Call this when scale changes by > 2x to clear stale-scale tiles.
+   *
+   * @param newScale The new target scale
+   * @param oldScale The previous scale (optional)
+   * @returns Number of tiles aborted/cleared
+   */
+  abortStaleScaleTiles(newScale: number, oldScale?: number): number {
+    // Only clear if scale changed significantly (> 2x ratio)
+    if (oldScale !== undefined) {
+      const ratio = Math.max(newScale / oldScale, oldScale / newScale);
+      if (ratio < 2) {
+        return 0; // Scale didn't change enough to warrant clearing
+      }
+    }
+
+    let abortedCount = 0;
+
+    // 1. Abort in-flight requests at different scales
+    for (const [posKey, entry] of this.activeByPosition) {
+      // Allow 50% tolerance for scale match (e.g., 64 matches 48-96)
+      const scaleDiff = Math.abs(entry.scale - newScale) / newScale;
+      if (scaleDiff > 0.5) {
+        entry.controller.abort();
+        this.activeByPosition.delete(posKey);
+        this.abortControllers.delete(entry.controller);
+        abortedCount++;
+      }
+    }
+
+    // 2. Clear the entire semaphore queue if we aborted any in-flight
+    // This is aggressive but necessary - queued tiles are likely stale-scale too
+    if (abortedCount > 0) {
+      const queuedCount = this.semaphore.clearQueue();
+      console.log(`[amnesia-rwe] Scale change ${oldScale?.toFixed(0) ?? '?'} → ${newScale.toFixed(0)}: ` +
+        `aborted ${abortedCount} in-flight, cleared ${queuedCount} queued`);
+      abortedCount += queuedCount;
+    }
+
+    // 3. Clear retry queue too
+    this.clearRetryQueue();
+
+    return abortedCount;
+  }
+
+  /**
    * Get adaptive session keep count based on tile scale.
    *
    * At high scale, tile renders take longer due to higher resolution,
@@ -864,14 +936,28 @@ export class RenderCoordinator {
    * @param scale Tile scale (zoom × pixelRatio)
    */
   getAdaptiveKeepRecent(scale: number): number {
-    // PERF FIX: Reduced from (32/24/16/8) which caused queue saturation.
-    // With 32ms scroll debounce and 400ms avg render, keeping 32 sessions
-    // means 32×20=640 tiles potentially queued, causing 7+ second waits.
-    // Lower values = more aggressive abort = faster response to new tiles.
-    if (scale >= 16) return 8;   // Scale 16+: ~256ms tolerance (high zoom)
-    if (scale >= 8) return 6;    // Scale 8-15: ~192ms tolerance
-    if (scale >= 4) return 4;    // Scale 4-7: ~128ms tolerance
-    return 3;                     // Scale < 4: ~96ms tolerance
+    // amnesia-aqv FIX: Increased tolerance at high scale to let tiles complete.
+    // Previous values (8/6/4/3) were too aggressive - tiles at scale 16+ take
+    // 800-1200ms to render, but 8 sessions × 32ms = 256ms tolerance meant
+    // tiles were aborted before completion, causing permanent blurry fallbacks.
+    //
+    // With focal-point priority now active, critical tiles (center) get
+    // rendered first, so we can afford longer tolerance without queue saturation.
+    // The priority queue ensures important tiles complete even if edge tiles
+    // are eventually dropped.
+    //
+    // Tile render times (from profiling):
+    // - Scale 2-4: ~100-200ms per tile
+    // - Scale 4-8: ~300-500ms per tile  
+    // - Scale 8-16: ~500-800ms per tile
+    // - Scale 16+: ~800-1200ms per tile
+    //
+    // Sessions created every 32ms during scroll.
+    // keepRecent × 32ms = tolerance window.
+    if (scale >= 16) return 40;  // Scale 16+: ~1280ms tolerance (matches render time)
+    if (scale >= 8) return 20;   // Scale 8-15: ~640ms tolerance
+    if (scale >= 4) return 10;   // Scale 4-7: ~320ms tolerance
+    return 5;                     // Scale < 4: ~160ms tolerance
   }
 
   /**
@@ -1228,6 +1314,27 @@ export class RenderCoordinator {
       // First try exact scale match
       const cached = await getTileCacheManager().get(request.tile);
       if (cached) {
+        // Track cache hit for T2HR measurement
+        // Exact cache match means tile.scale === requested scale (highest-res)
+        const t2hrTracker = getT2HRTracker();
+        const focalTracker = getFocalPointTracker();
+        const isFocal = request.priority === 'critical' || request.priority === 'high';
+        
+        t2hrTracker.onTileComplete({
+          tile: request.tile,
+          actualScale: request.tile.scale, // Exact match = requested scale
+          priority: request.priority,
+          isFocalTile: isFocal,
+          isFallback: false, // Exact cache hit is NOT a fallback
+          pipelineTiming: { total: 0 }, // Instant from cache
+        });
+        
+        focalTracker.recordTileCompletion({
+          tileKey: `${request.tile.page}-${request.tile.tileX}-${request.tile.tileY}`,
+          priority: request.priority,
+          wasSharp: true, // Exact cache hit is always at requested scale
+        });
+        
         return { success: true, data: cached, fromCache: true };
       }
 
@@ -1264,6 +1371,26 @@ export class RenderCoordinator {
           // Queue background render at target scale (don't await - fire and forget)
           // Use low priority to avoid competing with visible tile requests
           this.queueBackgroundRender(request);
+
+          // Track fallback for T2HR - this is NOT highest-res
+          const t2hrTracker = getT2HRTracker();
+          const focalTracker = getFocalPointTracker();
+          const isFocal = request.priority === 'critical' || request.priority === 'high';
+          
+          t2hrTracker.onTileComplete({
+            tile: request.tile,
+            actualScale: fallback.actualScale, // Actual scale of fallback (lower than requested)
+            priority: request.priority,
+            isFocalTile: isFocal,
+            isFallback: true, // This IS a fallback
+            pipelineTiming: { total: 0 }, // Instant from cache
+          });
+          
+          focalTracker.recordTileCompletion({
+            tileKey: `${request.tile.page}-${request.tile.tileX}-${request.tile.tileY}`,
+            priority: request.priority,
+            wasSharp: false, // Fallback is NOT sharp
+          });
 
           // Return fallback immediately for display
           // amnesia-e4i: Include fallbackTile for correct compositing position
@@ -1383,6 +1510,14 @@ export class RenderCoordinator {
       waitingCount: this.semaphore.waiting,
       mode: this.currentMode,
     };
+  }
+
+  /**
+   * Get the current queue size (number of waiting render requests)
+   * Used by amnesia-xc0 to determine when to trigger page refresh
+   */
+  getQueueSize(): number {
+    return this.semaphore.waiting;
   }
 
   /**
@@ -1757,11 +1892,9 @@ export class RenderCoordinator {
         let usedFastPath = false;
 
         const contentTypeEnabled = this.isContentTypeDetectionEnabled();
-        console.log(`[RenderCoordinator] Tile render page ${pageNum}, contentTypeEnabled: ${contentTypeEnabled}`);
 
         if (contentTypeEnabled) {
           const classification = await this.getPageClassification(pageNum);
-          console.log(`[RenderCoordinator] Page ${pageNum} classification:`, classification?.type || 'null');
           if (classification) {
             const strategy = getRenderStrategy(classification);
 
@@ -1862,9 +1995,6 @@ export class RenderCoordinator {
           } else {
             const result = await this.renderTileCallback(tileToRender, this.documentId);
 
-            // DEBUG: Log what the render callback returned
-            console.log(`[RenderCoordinator] renderTileCallback returned: isBlob=${result instanceof Blob}, format=${(result as any)?.format}, hasRgba=${!!(result as any)?.rgba}, hasBlob=${!!(result as any)?.blob}`);
-
             // Handle TileRenderResult (new format-aware) or legacy Blob
             if (result instanceof Blob) {
               blob = result;
@@ -1908,8 +2038,6 @@ export class RenderCoordinator {
         // - 'high' priority (TEXT_HEAVY, SCANNED) → prefer L1 for faster retrieval
         // - 'low' priority (COMPLEX) → demote to L2/L3
         // - 'normal' → use request priority as before
-        // DEBUG: Log whether we're caching
-        console.log(`[RenderCoordinator] Tile render complete, cachedData=${cachedData ? 'yes' : 'NO'}, blob=${blob ? 'yes' : 'no'}, key=${key}`);
         if (cachedData) {
           let tier: 'L1' | 'L2' | 'L3' = request.priority === 'critical' ? 'L1' : 'L2';
 
@@ -1936,6 +2064,50 @@ export class RenderCoordinator {
           }
 
           await getTileCacheManager().set(request.tile, cachedData, tier);
+          
+          // Track tile completion for T2HR and focal-point analysis
+          const t2hrTracker = getT2HRTracker();
+          const focalTracker = getFocalPointTracker();
+          
+          // For fresh renders, actualScale = requested scale (we rendered at full quality)
+          // Vector optimization may use a lower internal scale with CSS upscaling
+          const actualScale = vectorOptimization?.wasOptimized 
+            ? vectorOptimization.actualScale 
+            : request.tile.scale;
+          
+          // Record for T2HR measurement
+          t2hrTracker.onTileComplete({
+            tile: request.tile,
+            actualScale, // Actual scale we rendered at
+            priority: request.priority,
+            isFocalTile: request.priority === 'critical' || request.priority === 'high',
+            isFallback: false, // Fresh render is NOT a fallback
+            pipelineTiming: {
+              total: performance.now() - startTime,
+              // Note: Individual stage timings would need to be passed from worker
+            },
+          });
+          
+          // Record for focal-point tracking
+          // Sharp = rendered at requested scale (not a downscaled fallback)
+          focalTracker.recordTileCompletion({
+            tileKey: key,
+            priority: request.priority,
+            wasSharp: actualScale >= request.tile.scale * 0.9,
+          });
+          
+          // amnesia-xc0: Trigger onTileReady callback with scaleEpoch for epoch-gated compositing.
+          // The epoch allows PdfInfiniteCanvas to validate that tiles are compatible
+          // with the current canvas render state before drawing them.
+          if (this.onTileReady && request.priority !== 'low') {
+            try {
+              const epoch = request.scaleEpoch ?? 0;
+              this.onTileReady(request.tile.page, request.priority, epoch);
+            } catch (err) {
+              console.warn('[RenderCoordinator] onTileReady callback error:', err);
+            }
+          }
+          
         }
       } else {
         // ========== Full-Page Render Path ==========
