@@ -125,12 +125,19 @@ export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): Se
       // amnesia-e4i FIX: Reduced threshold from 16 to 8 because at zoom 16 with
       // scale 32, a full-page render can require 4704 tiles (56×84 grid).
       // At zoom 8 with scale 16, it's ~1176 tiles (28×42) - still high but manageable.
-      // Also added maxTilesPerPage=300 limit as a safety valve.
+      // Also added maxTilesPerPage limit that scales inversely with zoom.
+      //
+      // At extreme zoom (32x), each tile can take 500ms+ to render.
+      // 300 tiles × 500ms = 150 seconds! Way too long.
+      // Scale the limit inversely: zoom 8 = 200, zoom 16 = 100, zoom 32 = 50
+      const maxTiles = zoom >= 32 ? 50 : 
+                       zoom >= 16 ? 100 : 
+                       zoom >= 8 ? 200 : 300;
       return {
         maxQueueSize: 400,
         viewportOnlyThreshold: 8,
         dropBehavior: 'conservative',
-        maxTilesPerPage: 300, // Safety limit - prevents 4704-tile floods
+        maxTilesPerPage: maxTiles,
       };
   }
 }
@@ -611,9 +618,22 @@ export class RenderCoordinator {
 
   /**
    * Update current zoom level (for policy calculations).
+   * Also updates the semaphore policy since maxTilesPerPage depends on zoom.
    */
   setCurrentZoom(zoom: number): void {
+    const oldZoom = this.currentZoom;
     this.currentZoom = zoom;
+    
+    // amnesia-e4i FIX: Update policy when zoom changes significantly.
+    // The maxTilesPerPage limit depends on zoom level (50 at 32x, 300 at 8x).
+    // Without this, policy only updates on gesture phase change, leaving
+    // stale limits that cause queue saturation at extreme zoom.
+    const zoomRatio = Math.max(zoom / oldZoom, oldZoom / zoom);
+    if (zoomRatio >= 1.5 || (zoom >= 16 && oldZoom < 16) || (zoom >= 32 && oldZoom < 32)) {
+      const policy = getSemaphorePolicy(currentGesturePhase, zoom);
+      this.updateSemaphorePolicy(policy);
+      console.log(`[RenderCoordinator] Zoom-triggered policy update: zoom ${oldZoom.toFixed(0)} → ${zoom.toFixed(0)}, maxTilesPerPage=${policy.maxTilesPerPage}`);
+    }
   }
 
   /**
@@ -704,6 +724,15 @@ export class RenderCoordinator {
    * @returns Number of tiles queued for retry
    */
   async processRetryQueue(viewportBounds?: { x: number; y: number; width: number; height: number }): Promise<number> {
+    // amnesia-e4i FIX: Don't process retry queue if semaphore is saturated.
+    // This prevents the infinite loop where retried tiles get immediately dropped
+    // and re-added to the retry queue.
+    const queueSaturation = this.semaphore.waiting / this.currentPolicy.maxQueueSize;
+    if (queueSaturation >= 0.5) {
+      console.log(`[RetryQueue] Skipping - queue ${(queueSaturation * 100).toFixed(0)}% saturated`);
+      return 0;
+    }
+    
     const now = performance.now();
     let retriedCount = 0;
     const toRetry: Array<{ key: string; tile: TileCoordinate; priority: RenderPriority }> = [];
@@ -1831,10 +1860,17 @@ export class RenderCoordinator {
       this.logAbortStats('dropped from queue');
       
       // amnesia-e4i: Add to retry queue for later processing
-      if (request.type === 'tile') {
+      // BUT NOT when queue is saturated - that creates an infinite loop!
+      // If the queue is nearly full, tiles will just get dropped again immediately.
+      const queueSaturation = this.semaphore.waiting / this.currentPolicy.maxQueueSize;
+      const shouldRetry = request.type === 'tile' && queueSaturation < 0.8; // Only retry if queue < 80% full
+      
+      if (shouldRetry) {
         this.addToRetryQueue(request.tile, request.priority);
-        
-        // FALLBACK FIX: Even when dropped from queue, try to return a cached fallback tile
+      }
+      
+      // FALLBACK FIX: Even when dropped from queue, try to return a cached fallback tile
+      if (request.type === 'tile') {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
         if (fallback) {
           // amnesia-e4i: Include fallbackTile for correct compositing position

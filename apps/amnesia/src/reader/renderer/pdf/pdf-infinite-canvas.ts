@@ -291,6 +291,12 @@ export class PdfInfiniteCanvas {
   private lastPointerPosition: Point | null = null;
   private panStartCamera: Camera | null = null;
 
+  // amnesia-e4i: Cumulative pan distance tracking for queue clearing
+  // Tracks how far the viewport has moved since last queue clear.
+  // When cumulative distance exceeds viewport size, clear stale tile queue.
+  private cumulativePanDistance = 0;
+  private lastQueueClearPosition: Point = { x: 0, y: 0 };
+
   // ZOOM SCALE SERVICE (amnesia-aqv): Unified service - single source of truth for:
   // - Zoom state and gesture phase (idle, active, settling, rendering)
   // - Epoch counter (incremented on zoom change, mode change, invalidation)
@@ -2043,6 +2049,34 @@ export class PdfInfiniteCanvas {
       { dx: effectiveDx, dy: effectiveDy, invertSign, unifiedMode: this.useUnifiedCoordinateSpace },
       { camera: { ...this.camera } }
     );
+
+    // amnesia-e4i: Track cumulative pan distance and clear queue when threshold exceeded.
+    // At high zoom, the tile queue fills with requests from previous pan positions.
+    // These stale tiles block critical tiles for the current viewport.
+    // Solution: Clear queue when viewport moves more than viewport-size distance.
+    if (this.camera.z > this.tileZoomThreshold && this.renderCoordinator) {
+      const panDistanceX = Math.abs(this.camera.x - this.lastQueueClearPosition.x);
+      const panDistanceY = Math.abs(this.camera.y - this.lastQueueClearPosition.y);
+      this.cumulativePanDistance = Math.sqrt(panDistanceX * panDistanceX + panDistanceY * panDistanceY);
+      
+      // Threshold: half viewport size (adjusted for zoom)
+      // At zoom Z, the viewport covers (screenSize/Z) content units
+      // We want to clear when user has panned half a viewport
+      const viewportRect = this.getViewportRect();
+      const contentViewportSize = Math.min(viewportRect.width, viewportRect.height) / this.camera.z;
+      const clearThreshold = contentViewportSize * 0.5;
+      
+      if (this.cumulativePanDistance > clearThreshold) {
+        const queueBefore = this.renderCoordinator.getQueueSize();
+        if (queueBefore > 50) { // Only clear if queue is actually backed up
+          console.log(`[amnesia-e4i] Pan distance ${this.cumulativePanDistance.toFixed(0)} > threshold ${clearThreshold.toFixed(0)}, clearing ${queueBefore} stale tiles`);
+          this.renderCoordinator.abortAllPending();
+        }
+        // Reset tracking position
+        this.lastQueueClearPosition = { x: this.camera.x, y: this.camera.y };
+        this.cumulativePanDistance = 0;
+      }
+    }
   }
 
   private updateVisiblePages(): void {
@@ -2283,7 +2317,51 @@ export class PdfInfiniteCanvas {
     // NOTE: Bleed buffer removed (amnesia-aqv) - it was causing excessive tile requests
     // that overwhelmed the render queue. The fallback tile system provides adequate
     // coverage during pan by showing lower-resolution cached tiles.
-    const visibleTiles = this.tileEngine.getVisibleTiles(canvasViewport, layouts, zoom, tileScale);
+    let visibleTiles = this.tileEngine.getVisibleTiles(canvasViewport, layouts, zoom, tileScale);
+
+    // amnesia-e4i FIX: Apply maxTilesPerPage limit to prevent queue saturation.
+    // This was MISSING - triggerTilePrefetch was bypassing the limit that renderPageTiled enforces.
+    // At 32x zoom, getVisibleTiles can return 400+ tiles per page, flooding the queue with 8000+ tiles.
+    // Group tiles by page and limit each page's contribution.
+    const maxTilesPerPage = this.renderCoordinator?.getMaxTilesPerPage() ?? 0;
+    if (maxTilesPerPage > 0 && visibleTiles.length > maxTilesPerPage) {
+      // Group tiles by page
+      const tilesByPage = new Map<number, typeof visibleTiles>();
+      for (const tile of visibleTiles) {
+        const pageTiles = tilesByPage.get(tile.page) || [];
+        pageTiles.push(tile);
+        tilesByPage.set(tile.page, pageTiles);
+      }
+      
+      // For each page, keep only the closest tiles to viewport center
+      const viewportCenterX = canvasViewport.x + canvasViewport.width / 2;
+      const viewportCenterY = canvasViewport.y + canvasViewport.height / 2;
+      const pdfTileSize = getTileSize(zoom) / tileScale;
+      
+      const limitedTiles: typeof visibleTiles = [];
+      for (const [page, pageTiles] of tilesByPage) {
+        if (pageTiles.length <= maxTilesPerPage) {
+          limitedTiles.push(...pageTiles);
+        } else {
+          // Sort by distance from viewport center, keep closest
+          const layout = this.pageLayouts.get(page);
+          if (layout) {
+            pageTiles.sort((a, b) => {
+              const aCenterX = layout.x + (a.tileX + 0.5) * pdfTileSize;
+              const aCenterY = layout.y + (a.tileY + 0.5) * pdfTileSize;
+              const bCenterX = layout.x + (b.tileX + 0.5) * pdfTileSize;
+              const bCenterY = layout.y + (b.tileY + 0.5) * pdfTileSize;
+              const aDist = Math.hypot(aCenterX - viewportCenterX, aCenterY - viewportCenterY);
+              const bDist = Math.hypot(bCenterX - viewportCenterX, bCenterY - viewportCenterY);
+              return aDist - bDist;
+            });
+          }
+          limitedTiles.push(...pageTiles.slice(0, maxTilesPerPage));
+          console.warn(`[PREFETCH-LIMIT] page=${page} zoom=${zoom.toFixed(2)}: Limiting from ${pageTiles.length} to ${maxTilesPerPage} tiles`);
+        }
+      }
+      visibleTiles = limitedTiles;
+    }
 
     // INV-6 FIX (2026-01-23): Capture scale snapshot BEFORE tile batch.
     // All tiles in this batch MUST use the same epoch to prevent mixed-scale corruption.
@@ -2384,12 +2462,20 @@ export class PdfInfiniteCanvas {
     // Prefetch is velocity-based prediction which doesn't apply during zoom gestures
     if (!isActiveZoom) {
       // Get prefetch tiles from strategy (velocity-based prediction)
-      const prefetchTiles = this.renderCoordinator.getPrefetchTiles(
+      let prefetchTiles = this.renderCoordinator.getPrefetchTiles(
         canvasViewport,
         layouts,
         this.velocity,
         zoom
       );
+
+      // amnesia-e4i FIX: Limit prefetch tiles to prevent queue saturation
+      // At high zoom, prefetch can request hundreds of tiles that overflow the queue
+      const maxPrefetchTiles = Math.max(50, maxTilesPerPage);
+      if (prefetchTiles.length > maxPrefetchTiles) {
+        console.warn(`[PREFETCH-LIMIT] Limiting prefetch from ${prefetchTiles.length} to ${maxPrefetchTiles} tiles`);
+        prefetchTiles = prefetchTiles.slice(0, maxPrefetchTiles);
+      }
 
       // Queue prefetch requests at lower priority
       for (const tile of prefetchTiles) {
@@ -4664,6 +4750,9 @@ export class PdfInfiniteCanvas {
     if (majorZoomRatio > 2 && this.renderCoordinator) {
       console.log(`[amnesia-rwe] Major zoom change: ${oldZoom.toFixed(2)} → ${newZoom.toFixed(2)} (${majorZoomRatio.toFixed(1)}x ratio), clearing tile queue`);
       this.renderCoordinator.abortAllPending();
+      // amnesia-e4i: Reset pan distance tracking after zoom-triggered queue clear
+      this.lastQueueClearPosition = { x: this.camera.x, y: this.camera.y };
+      this.cumulativePanDistance = 0;
     }
 
     // Step 1: Resize all page elements to their final zoomed dimensions
@@ -5609,6 +5698,10 @@ export class PdfInfiniteCanvas {
 
       // Track zoom change for telemetry
       getTelemetry().trackZoomChange(oldZoom, this.camera.z);
+
+      // amnesia-e4i FIX: Update render coordinator's zoom for policy decisions.
+      // Without this, maxTilesPerPage stays at 300 even at 32x zoom where it should be 50.
+      this.renderCoordinator?.setCurrentZoom(this.camera.z);
 
       // FOCAL POINT PRESERVATION + SOFT CONSTRAINTS (amnesia-u9l):
       // During gesture: apply SOFT constraints (rubber-band effect allows overscroll)
