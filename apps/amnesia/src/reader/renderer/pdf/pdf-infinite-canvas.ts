@@ -2252,6 +2252,19 @@ export class PdfInfiniteCanvas {
   private triggerTilePrefetch(): void {
     if (!this.renderCoordinator || !this.tileEngine) return;
 
+    // amnesia-e4i FIX: Skip prefetch when processRenderQueue is actively rendering pages.
+    // renderPageTiled already handles visible tiles for each page. If we also prefetch
+    // here, we queue the SAME tiles twice, causing 2x the queue usage.
+    // 
+    // With 2 pages × 50 tiles × 2 paths = 200 tiles → 400 with intermediate+final render.
+    // This overwhelms the 400-tile queue limit.
+    //
+    // Solution: Only prefetch when NOT actively rendering. The render cycle will handle
+    // visible tiles, and prefetch can add lookahead tiles AFTER the render settles.
+    if (this.isRendering) {
+      return;
+    }
+
     // amnesia-rwe: REVISED ZOOM STATE GUARD
     // Per requirements: "Maximum high res tiles should be prefetched when the gesture starts"
     // 
