@@ -371,6 +371,13 @@ export class PdfInfiniteCanvas {
   // amnesia-xc0: Page refresh debouncing for onTileReady callback
   // Prevents excessive re-composites when many tiles finish in quick succession
   private pendingPageRefresh: Map<number, ReturnType<typeof setTimeout>> = new Map();
+  
+  // amnesia-e4i.1: Global rate limiting for composite operations
+  // Prevents renderer overload from rapid tile completions across multiple pages
+  private lastGlobalCompositeTime = 0;
+  private globalCompositeCount = 0;
+  private readonly GLOBAL_COMPOSITE_INTERVAL_MS = 250; // Max 4 composites/second globally
+  private readonly MAX_COMPOSITES_PER_INTERVAL = 2; // Max 2 composites per interval
 
   // Progressive zoom state (Phase 2: Multi-Resolution Zoom)
   private zoomFinalRenderTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -2678,13 +2685,28 @@ export class PdfInfiniteCanvas {
    * @param priority - Priority of the completed tile (for logging)
    */
   private schedulePageRefresh(page: number, priority: import('./render-coordinator').RenderPriority, tileEpoch: number): void {
+    // amnesia-e4i.1: Global rate limiting - check if we're within the composite interval
+    const now = performance.now();
+    const timeSinceLastComposite = now - this.lastGlobalCompositeTime;
+    
+    if (timeSinceLastComposite < this.GLOBAL_COMPOSITE_INTERVAL_MS) {
+      // Within the rate limit interval - check composite count
+      if (this.globalCompositeCount >= this.MAX_COMPOSITES_PER_INTERVAL) {
+        // Already hit the limit for this interval, skip silently
+        return;
+      }
+    } else {
+      // New interval, reset counter
+      this.globalCompositeCount = 0;
+    }
+    
     // Cancel any existing scheduled refresh for this page
     const existingTimeout = this.pendingPageRefresh.get(page);
     if (existingTimeout) {
       clearTimeout(existingTimeout);
     }
     
-    // Schedule a new refresh with 50ms debounce
+    // Schedule a new refresh with 150ms debounce (increased from 50ms for amnesia-e4i.1)
     // Capture tileEpoch at schedule time (not execution time) to maintain epoch consistency
     const timeout = setTimeout(() => {
       this.pendingPageRefresh.delete(page);
@@ -2694,7 +2716,24 @@ export class PdfInfiniteCanvas {
         return;
       }
       
-      console.log(`[PAGE-REFRESH] page=${page}: Refreshing after ${priority} tile completed (epoch=${tileEpoch})`);
+      // amnesia-e4i.1: Re-check global rate limit at execution time
+      const execNow = performance.now();
+      const execTimeSince = execNow - this.lastGlobalCompositeTime;
+      if (execTimeSince < this.GLOBAL_COMPOSITE_INTERVAL_MS && 
+          this.globalCompositeCount >= this.MAX_COMPOSITES_PER_INTERVAL) {
+        // Rate limit exceeded at execution time, reschedule
+        this.schedulePageRefresh(page, priority, tileEpoch);
+        return;
+      }
+      
+      // Update global rate limit tracking
+      if (execTimeSince >= this.GLOBAL_COMPOSITE_INTERVAL_MS) {
+        this.globalCompositeCount = 0;
+      }
+      this.lastGlobalCompositeTime = execNow;
+      this.globalCompositeCount++;
+      
+      console.log(`[PAGE-REFRESH] page=${page}: Refreshing after ${priority} tile completed (epoch=${tileEpoch}, composites=${this.globalCompositeCount})`);
       
       // Composite ONLY cached tiles - do NOT add new render requests to the queue!
       // triggerTilePrefetch would add all visible tiles (cached AND non-cached) to the queue,
@@ -2705,7 +2744,7 @@ export class PdfInfiniteCanvas {
           console.warn(`[PAGE-REFRESH] page=${page}: Failed to composite cached tiles:`, err);
         });
       }
-    }, 50);
+    }, 150); // Increased from 50ms to 150ms for amnesia-e4i.1
     
     this.pendingPageRefresh.set(page, timeout);
   }
@@ -3316,6 +3355,29 @@ export class PdfInfiniteCanvas {
           // Full-page: get all tiles for the page
           // GRID SCALE FIX (amnesia-e4i): Use gridTileScale for tile GRID calculation
           tiles = this.tileEngine!.getPageTileGrid(page, gridTileScale, zoom);
+        }
+        
+        // amnesia-e4i FIX: Enforce maxTilesPerPage limit to prevent queue overflow.
+        // At high zoom (e.g., 16x with scale 32), a single page can require 4704 tiles.
+        // This floods the queue and causes most tiles to be dropped.
+        // Limit to the most important tiles (center of viewport first).
+        const maxTilesPerPage = this.renderCoordinator?.getMaxTilesPerPage() ?? 0;
+        if (maxTilesPerPage > 0 && tiles.length > maxTilesPerPage) {
+          console.warn(`[TILE-LIMIT] page=${page} zoom=${zoom.toFixed(2)}: Limiting from ${tiles.length} to ${maxTilesPerPage} tiles (policy limit)`);
+          // Sort tiles by distance from viewport center, keep closest
+          const viewportCenterX = viewport.x + viewport.width / 2;
+          const viewportCenterY = viewport.y + viewport.height / 2;
+          const pdfTileSize = getTileSize(zoom) / gridTileScale;
+          tiles.sort((a, b) => {
+            const aCenterX = layout.x + (a.tileX + 0.5) * pdfTileSize;
+            const aCenterY = layout.y + (a.tileY + 0.5) * pdfTileSize;
+            const bCenterX = layout.x + (b.tileX + 0.5) * pdfTileSize;
+            const bCenterY = layout.y + (b.tileY + 0.5) * pdfTileSize;
+            const aDist = Math.hypot(aCenterX - viewportCenterX, aCenterY - viewportCenterY);
+            const bDist = Math.hypot(bCenterX - viewportCenterX, bCenterY - viewportCenterY);
+            return aDist - bDist;
+          });
+          tiles = tiles.slice(0, maxTilesPerPage);
         }
 
         // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)

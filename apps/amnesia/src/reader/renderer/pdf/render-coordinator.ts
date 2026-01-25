@@ -122,11 +122,15 @@ export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): Se
     case 'idle':
     default:
       // Fully idle, can prefetch and build cache
+      // amnesia-e4i FIX: Reduced threshold from 16 to 8 because at zoom 16 with
+      // scale 32, a full-page render can require 4704 tiles (56×84 grid).
+      // At zoom 8 with scale 16, it's ~1176 tiles (28×42) - still high but manageable.
+      // Also added maxTilesPerPage=300 limit as a safety valve.
       return {
         maxQueueSize: 400,
-        viewportOnlyThreshold: 16,
+        viewportOnlyThreshold: 8,
         dropBehavior: 'conservative',
-        maxTilesPerPage: 0, // No limit
+        maxTilesPerPage: 300, // Safety limit - prevents 4704-tile floods
       };
   }
 }
@@ -622,9 +626,14 @@ export class RenderCoordinator {
   /**
    * Check if viewport-only tiles should be used at the given zoom level.
    * Based on current policy which is determined by gesture state.
+   * 
+   * amnesia-e4i FIX: Use >= instead of > to avoid requesting 4704+ tiles
+   * at exactly the threshold zoom level. At zoom 16 with threshold 16,
+   * the old logic (16 > 16 = false) would request full-page tiles, but
+   * a 441×666 PDF at scale 32 needs 56×84 = 4704 tiles - way too many!
    */
   shouldUseViewportOnlyTiles(zoom: number): boolean {
-    return zoom > this.currentPolicy.viewportOnlyThreshold;
+    return zoom >= this.currentPolicy.viewportOnlyThreshold;
   }
 
   /**
@@ -2099,7 +2108,18 @@ export class RenderCoordinator {
           // amnesia-xc0: Trigger onTileReady callback with scaleEpoch for epoch-gated compositing.
           // The epoch allows PdfInfiniteCanvas to validate that tiles are compatible
           // with the current canvas render state before drawing them.
-          if (this.onTileReady && request.priority !== 'low') {
+          //
+          // amnesia-e4i.1 FIX: Skip callback during active/settling gestures to prevent
+          // callback storm that overwhelms the renderer. Tiles rendered during gestures
+          // are likely stale anyway (viewport is constantly changing).
+          // Only trigger callbacks during 'rendering' and 'idle' phases.
+          const gesturePhase = getGesturePhase();
+          const shouldTriggerCallback = 
+            this.onTileReady && 
+            request.priority !== 'low' &&
+            (gesturePhase === 'rendering' || gesturePhase === 'idle');
+          
+          if (shouldTriggerCallback && this.onTileReady) {
             try {
               const epoch = request.scaleEpoch ?? 0;
               this.onTileReady(request.tile.page, request.priority, epoch);
