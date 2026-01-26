@@ -445,4 +445,4 @@ The following integrations are designed but not yet implemented. See [`expansion
 
 ## License
 
-MIT
+Amnesia is licensed under the GNU Affero General Public License v3.0. See `LICENSE` for full terms.
