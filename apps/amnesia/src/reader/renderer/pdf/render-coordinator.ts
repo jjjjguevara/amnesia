@@ -73,6 +73,15 @@ export interface SemaphorePolicy {
   dropBehavior: 'aggressive' | 'moderate' | 'conservative';
   /** Maximum tiles per page to request (0 = unlimited) */
   maxTilesPerPage: number;
+  /**
+   * amnesia-aqv Phase 3C: Permit multiplier for dynamic concurrency scaling.
+   * 1.0 = base permits (from device detection)
+   * 1.5 = 50% more permits during settling
+   * 2.0 = double permits during rendering
+   * 
+   * Higher concurrency during stable phases means faster time to full coverage.
+   */
+  permitMultiplier?: number;
 }
 
 /**
@@ -88,62 +97,74 @@ export interface SemaphorePolicy {
  * During idle, we can prefetch and build up the cache.
  */
 export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): SemaphorePolicy {
-  // amnesia-e4i FIX: Apply zoom-based tile limits to ALL phases, not just idle.
-  // At extreme zoom (32x), each tile takes 500ms+ to render.
-  // Even during 'rendering' phase, 200 tiles × 500ms = 100 seconds is too long.
+  // amnesia-aqv FIX: Increased tile limits for full viewport coverage at high zoom.
   // 
-  // The zoom-based limit is the UPPER BOUND - phase-based limits can be lower.
-  // zoom >= 32: max 50 tiles (5s at 100ms/tile)
-  // zoom >= 16: max 100 tiles (10s at 100ms/tile)
-  // zoom >= 8: max 150 tiles (15s at 100ms/tile)
+  // PREVIOUS PROBLEM (amnesia-e4i): At 32x zoom, viewport needs ~135 tiles but
+  // limit was 50, causing only 37% coverage (blank areas never filled).
+  // 
+  // NEW LIMITS (amnesia-aqv):
+  // zoom >= 32: max 150 tiles (allows full viewport coverage)
+  // zoom >= 16: max 150 tiles (comfortable headroom)
+  // zoom >= 8: max 200 tiles
   // zoom < 8: no zoom-based limit
-  const zoomBasedMax = zoom >= 32 ? 50 : 
-                       zoom >= 16 ? 100 : 
-                       zoom >= 8 ? 150 : Infinity;
+  //
+  // With 4-8 permits and ~100-150ms per tile, full coverage takes:
+  // 150 tiles × 125ms / 6 permits ≈ 3.1 seconds (acceptable with fallback tiles)
+  const zoomBasedMax = zoom >= 32 ? 150 : 
+                       zoom >= 16 ? 150 : 
+                       zoom >= 8 ? 200 : Infinity;
 
   switch (gesturePhase) {
     case 'active':
       // During active zoom/pan: very aggressive
       // User is actively moving, tiles become stale instantly
+      // amnesia-aqv Phase 3C: Reduced permits during active to save resources
       return {
         maxQueueSize: 50,
         viewportOnlyThreshold: 2, // Always use viewport-only during gestures
         dropBehavior: 'aggressive',
         maxTilesPerPage: Math.min(30, zoomBasedMax),
+        permitMultiplier: 0.5, // Half permits during active gesture
       };
     
     case 'settling':
       // Gesture just ended, waiting for final position
       // Still moving but slowing down
+      // amnesia-aqv Phase 3C: Boost permits as we approach stable position
       return {
         maxQueueSize: 150,
         viewportOnlyThreshold: 4,
         dropBehavior: 'moderate',
         maxTilesPerPage: Math.min(100, zoomBasedMax),
+        permitMultiplier: 1.5, // 50% boost during settling
       };
     
     case 'rendering':
       // Settled, actively rendering final tiles
       // Position stable, can render more - BUT respect zoom-based limit
+      // amnesia-aqv Phase 3C: Maximum permits for fastest coverage
       return {
         maxQueueSize: 300,
         viewportOnlyThreshold: 8,
         dropBehavior: 'moderate',
         maxTilesPerPage: Math.min(200, zoomBasedMax),
+        permitMultiplier: 2.0, // Double permits for fast rendering
       };
     
     case 'idle':
     default:
       // Fully idle, can prefetch and build cache
-      // Use zoom-based limit directly
-      const maxTiles = zoom >= 32 ? 50 : 
-                       zoom >= 16 ? 100 : 
+      // amnesia-aqv: Increased limits for full viewport coverage at high zoom
+      // amnesia-aqv Phase 3C: Full permits during idle for prefetch
+      const maxTiles = zoom >= 32 ? 150 : 
+                       zoom >= 16 ? 150 : 
                        zoom >= 8 ? 200 : 300;
       return {
         maxQueueSize: 400,
         viewportOnlyThreshold: 8,
         dropBehavior: 'conservative',
         maxTilesPerPage: maxTiles,
+        permitMultiplier: 1.5, // Slight boost for prefetch
       };
   }
 }
@@ -449,6 +470,63 @@ class Semaphore {
   getMaxQueueSize(): number {
     return this.maxQueueSize;
   }
+
+  // ============================================================================
+  // DYNAMIC PERMIT SCALING (amnesia-aqv Phase 3C)
+  // ============================================================================
+  // During settling/rendering phases, we can safely increase concurrency since
+  // the viewport is stable and tiles won't become stale. More permits = faster
+  // time to full coverage.
+  // ============================================================================
+
+  /**
+   * Dynamically adjust the number of available permits.
+   * Used to boost concurrency during settling/rendering phases.
+   * 
+   * @param newMaxPermits New maximum permit count (clamped to 2-16)
+   */
+  setMaxPermits(newMaxPermits: number): void {
+    const clampedMax = Math.max(2, Math.min(16, newMaxPermits));
+    const oldMax = this.maxPermits;
+    
+    if (clampedMax === oldMax) return;
+    
+    // Calculate the delta
+    const delta = clampedMax - oldMax;
+    
+    // Update the max (need to cast away readonly for this dynamic operation)
+    (this as any).maxPermits = clampedMax;
+    
+    if (delta > 0) {
+      // Increasing permits: add delta to available, then wake up waiters
+      this.permits += delta;
+      
+      // Wake up waiters that can now proceed
+      let woken = 0;
+      while (this.permits > 0 && this.getTotalWaiters() > 0) {
+        for (const priority of Semaphore.PRIORITY_ORDER) {
+          const queue = this.priorityQueues.get(priority)!;
+          if (queue.length > 0) {
+            const waiter = queue.shift()!;
+            this.permits--;
+            waiter(true);
+            woken++;
+            break;
+          }
+        }
+      }
+      console.log(`[SEMAPHORE] Permit boost: ${oldMax} → ${clampedMax} (+${delta}), woke ${woken} waiters`);
+    } else {
+      // Decreasing permits: reduce available (but don't go negative)
+      this.permits = Math.max(0, this.permits + delta);
+      console.log(`[SEMAPHORE] Permit reduction: ${oldMax} → ${clampedMax} (${delta})`);
+    }
+  }
+
+  /** Get current max permits */
+  getMaxPermits(): number {
+    return this.maxPermits;
+  }
 }
 
 /**
@@ -474,6 +552,12 @@ export class RenderCoordinator {
 
   /** Concurrency semaphore */
   private semaphore: Semaphore;
+
+  /**
+   * amnesia-aqv Phase 3C: Base permit count from device detection.
+   * Used to calculate scaled permits during phase transitions.
+   */
+  private basePermitCount: number;
 
   /** Active render tracking for stats */
   private activeRenders = 0;
@@ -585,7 +669,9 @@ export class RenderCoordinator {
     // With 16 permits but only 4 workers, 12 requests would hold permits while
     // waiting for a worker, causing queue saturation (68+ tiles waiting 2-4 seconds).
     // Now permits match actual worker capacity for <100ms queue wait times.
-    this.semaphore = new Semaphore(options?.maxConcurrent ?? 4);
+    const permits = options?.maxConcurrent ?? 4;
+    this.semaphore = new Semaphore(permits);
+    this.basePermitCount = permits; // amnesia-aqv Phase 3C: Store for dynamic scaling
     this.contentTypeDetectionEnabled = options?.enableContentTypeDetection ?? false;
     
     // Register this instance for policy updates
@@ -609,13 +695,26 @@ export class RenderCoordinator {
     // Update semaphore queue size
     this.semaphore.setMaxQueueSize(policy.maxQueueSize);
     
+    // amnesia-aqv Phase 3C: Dynamic permit scaling
+    // Apply permit multiplier to boost concurrency during stable phases
+    if (policy.permitMultiplier !== undefined && policy.permitMultiplier !== oldPolicy.permitMultiplier) {
+      const basePermits = this.basePermitCount;
+      const scaledPermits = Math.round(basePermits * policy.permitMultiplier);
+      const clampedPermits = Math.max(2, Math.min(16, scaledPermits));
+      
+      console.log(`[RenderCoordinator] Permit scaling: base=${basePermits}, multiplier=${policy.permitMultiplier}, scaled=${clampedPermits}`);
+      this.semaphore.setMaxPermits(clampedPermits);
+    }
+    
     if (oldPolicy.maxQueueSize !== policy.maxQueueSize || 
-        oldPolicy.viewportOnlyThreshold !== policy.viewportOnlyThreshold) {
+        oldPolicy.viewportOnlyThreshold !== policy.viewportOnlyThreshold ||
+        oldPolicy.permitMultiplier !== policy.permitMultiplier) {
       console.log(`[RenderCoordinator] Policy update:`, {
         maxQueueSize: `${oldPolicy.maxQueueSize} → ${policy.maxQueueSize}`,
         viewportOnlyThreshold: `${oldPolicy.viewportOnlyThreshold} → ${policy.viewportOnlyThreshold}`,
         dropBehavior: policy.dropBehavior,
         maxTilesPerPage: policy.maxTilesPerPage || 'unlimited',
+        permitMultiplier: policy.permitMultiplier ?? 1.0,
       });
     }
   }
@@ -637,7 +736,7 @@ export class RenderCoordinator {
     this.currentZoom = zoom;
     
     // amnesia-e4i FIX: Update policy when zoom changes significantly.
-    // The maxTilesPerPage limit depends on zoom level (50 at 32x, 300 at 8x).
+    // The maxTilesPerPage limit depends on zoom level (150 at 32x, 300 at 8x).
     // Without this, policy only updates on gesture phase change, leaving
     // stale limits that cause queue saturation at extreme zoom.
     const zoomRatio = Math.max(zoom / oldZoom, oldZoom / zoom);
@@ -645,6 +744,23 @@ export class RenderCoordinator {
       const policy = getSemaphorePolicy(currentGesturePhase, zoom);
       this.updateSemaphorePolicy(policy);
       console.log(`[RenderCoordinator] Zoom-triggered policy update: zoom ${oldZoom.toFixed(0)} → ${zoom.toFixed(0)}, maxTilesPerPage=${policy.maxTilesPerPage}`);
+      
+      // amnesia-aqv Phase 2B: Proactive spatial eviction when entering high zoom.
+      // At high zoom (16x+), tiles are large and memory-hungry. Proactively evict
+      // distant tiles to make room for the new high-res tiles we're about to render.
+      // This prevents cache pressure from causing dropped renders.
+      if (zoom >= 16 && oldZoom < 16) {
+        const cacheManager = getTileCacheManager();
+        const stats = cacheManager.getStats();
+        const cacheUtilization = stats.l2Count / 360; // L2 max size
+        
+        // If cache is >50% full, evict distant tiles (current page unknown, use 1)
+        // The null focalTile uses center-of-page heuristic
+        if (cacheUtilization > 0.5) {
+          const evicted = cacheManager.evictByDistanceAndRecency(1, null, Math.floor(stats.l2Count * 0.25));
+          console.log(`[RenderCoordinator] Proactive eviction on zoom-in: evicted ${evicted} tiles (utilization was ${(cacheUtilization * 100).toFixed(0)}%)`);
+        }
+      }
     }
   }
 
@@ -683,10 +799,11 @@ export class RenderCoordinator {
    * Returns Infinity for no limit.
    */
   getMaxTilesPerPage(): number {
-    // Compute zoom-based limit dynamically (mirrors getSemaphorePolicy logic)
-    const zoomLimit = this.currentZoom >= 32 ? 50 : 
-                      this.currentZoom >= 16 ? 100 : 
-                      this.currentZoom >= 8 ? 150 : Infinity;
+    // amnesia-aqv: Increased limits for full viewport coverage at high zoom
+    // Mirrors getSemaphorePolicy logic - must stay in sync!
+    const zoomLimit = this.currentZoom >= 32 ? 150 : 
+                      this.currentZoom >= 16 ? 150 : 
+                      this.currentZoom >= 8 ? 200 : Infinity;
     
     // Return the stricter of policy limit and zoom limit
     const effectiveLimit = Math.min(this.currentPolicy.maxTilesPerPage, zoomLimit);
@@ -756,15 +873,26 @@ export class RenderCoordinator {
    * Call this after renders complete or on a periodic basis.
    * 
    * @param viewportBounds Optional viewport to filter out off-screen tiles
+   * @param duringGesture If true, use relaxed saturation threshold and smaller batch size (amnesia-aqv Phase 1E)
    * @returns Number of tiles queued for retry
    */
-  async processRetryQueue(viewportBounds?: { x: number; y: number; width: number; height: number }): Promise<number> {
+  async processRetryQueue(
+    viewportBounds?: { x: number; y: number; width: number; height: number },
+    duringGesture: boolean = false
+  ): Promise<number> {
     // amnesia-e4i FIX: Don't process retry queue if semaphore is saturated.
     // This prevents the infinite loop where retried tiles get immediately dropped
     // and re-added to the retry queue.
+    //
+    // amnesia-aqv Phase 1E: During gestures, use relaxed threshold (0.8 vs 0.5)
+    // to allow some retry processing even while actively panning. This helps
+    // fill in gaps caused by dropped tiles without overwhelming the queue.
+    const maxSaturation = duringGesture ? 0.8 : 0.5;
     const queueSaturation = this.semaphore.waiting / this.currentPolicy.maxQueueSize;
-    if (queueSaturation >= 0.5) {
-      console.log(`[RetryQueue] Skipping - queue ${(queueSaturation * 100).toFixed(0)}% saturated`);
+    if (queueSaturation >= maxSaturation) {
+      if (!duringGesture) {
+        console.log(`[RetryQueue] Skipping - queue ${(queueSaturation * 100).toFixed(0)}% saturated`);
+      }
       return 0;
     }
     
@@ -797,7 +925,8 @@ export class RenderCoordinator {
     }
     
     // Second pass: queue retries (limit batch size to prevent queue flood)
-    const BATCH_SIZE = 10;
+    // amnesia-aqv Phase 1E: Smaller batch during gestures to avoid overwhelming queue
+    const BATCH_SIZE = duringGesture ? 3 : 10;
     for (const { key, tile, priority } of toRetry.slice(0, BATCH_SIZE)) {
       this.retryQueue.delete(key); // Remove from retry queue before re-requesting
       
@@ -1031,6 +1160,111 @@ export class RenderCoordinator {
     if (scale >= 8) return 20;   // Scale 8-15: ~640ms tolerance
     if (scale >= 4) return 10;   // Scale 4-7: ~320ms tolerance
     return 5;                     // Scale < 4: ~160ms tolerance
+  }
+
+  /**
+   * amnesia-aqv Phase 1D: Cancel tiles that have moved completely off-viewport.
+   * 
+   * This is called during pan gestures when the queue is saturated. By canceling
+   * renders for tiles the user can no longer see, we free up permits for tiles
+   * they CAN see.
+   * 
+   * Only cancels when:
+   * 1. Queue is >75% full (saturated) - don't waste effort on light loads
+   * 2. Tile is COMPLETELY outside viewport (not just partially)
+   * 
+   * @param viewportBounds Viewport bounds in canvas coordinates
+   * @param pageLayouts Map of page layouts for coordinate conversion
+   * @param zoom Current zoom level for tile size calculation
+   * @returns Number of tiles cancelled
+   */
+  cancelOffViewportTiles(
+    viewportBounds: { x: number; y: number; width: number; height: number },
+    pageLayouts: Map<number, { x: number; y: number; width: number; height: number }>,
+    zoom: number
+  ): number {
+    // Only cancel if queue is saturated (>75% full)
+    const saturationThreshold = 0.75;
+    const queueSaturation = this.semaphore.waiting / this.currentPolicy.maxQueueSize;
+    if (queueSaturation < saturationThreshold) {
+      return 0;
+    }
+
+    const tileSize = getTileSize(zoom);
+    let cancelledCount = 0;
+
+    for (const [posKey, entry] of this.activeByPosition) {
+      // Parse position key: "docId-tile-p{page}-t{tileX}x{tileY}"
+      const tileMatch = posKey.match(/tile-p(\d+)-t(\d+)x(\d+)$/);
+      if (!tileMatch) continue; // Skip non-tile entries (pages)
+
+      const page = parseInt(tileMatch[1], 10);
+      const tileX = parseInt(tileMatch[2], 10);
+      const tileY = parseInt(tileMatch[3], 10);
+
+      // Get page layout
+      const layout = pageLayouts.get(page);
+      if (!layout) continue;
+
+      // Calculate tile bounds in canvas coordinates
+      // pdfTileSize = tileSize / scale (PDF units per tile)
+      // At high zoom, tiles cover small PDF regions
+      const pdfTileSize = tileSize / entry.scale;
+      const tileBoundsX = layout.x + tileX * pdfTileSize;
+      const tileBoundsY = layout.y + tileY * pdfTileSize;
+      const tileBoundsWidth = pdfTileSize;
+      const tileBoundsHeight = pdfTileSize;
+
+      // amnesia-aqv Phase 3B: Enhanced stale tile detection
+      // Cancel tiles that are:
+      // 1. Completely outside viewport (original behavior)
+      // 2. More than 1 viewport distance away from viewport center (new)
+      //
+      // At high zoom, tiles take 100-500ms to render. A tile that started
+      // rendering when user began scrolling may now be 2+ viewports away
+      // and will never be seen. Better to abort and free the permit.
+      
+      // Check 1: Completely outside viewport
+      const isOutside =
+        tileBoundsX + tileBoundsWidth < viewportBounds.x ||
+        tileBoundsX > viewportBounds.x + viewportBounds.width ||
+        tileBoundsY + tileBoundsHeight < viewportBounds.y ||
+        tileBoundsY > viewportBounds.y + viewportBounds.height;
+
+      // Check 2: More than 1 viewport distance from center
+      const viewportCenterX = viewportBounds.x + viewportBounds.width / 2;
+      const viewportCenterY = viewportBounds.y + viewportBounds.height / 2;
+      const tileCenterX = tileBoundsX + tileBoundsWidth / 2;
+      const tileCenterY = tileBoundsY + tileBoundsHeight / 2;
+      
+      // Distance in viewport units (1.0 = one viewport width/height)
+      const distanceX = Math.abs(tileCenterX - viewportCenterX) / viewportBounds.width;
+      const distanceY = Math.abs(tileCenterY - viewportCenterY) / viewportBounds.height;
+      const maxDistance = Math.max(distanceX, distanceY);
+      
+      // Cancel if >1.5 viewports away (includes some buffer for fast scroll)
+      const isTooFar = maxDistance > 1.5;
+
+      if (isOutside || isTooFar) {
+        entry.controller.abort();
+        this.activeByPosition.delete(posKey);
+        this.abortControllers.delete(entry.controller);
+        cancelledCount++;
+      }
+    }
+
+    if (cancelledCount > 0) {
+      console.log(`[amnesia-aqv] Cancelled ${cancelledCount} off-viewport/distant tiles (queue ${(queueSaturation * 100).toFixed(0)}% saturated)`);
+      
+      // Record for diagnostic overlay
+      try {
+        for (let i = 0; i < cancelledCount; i++) {
+          getTileDiagnosticOverlay().recordAbort('off-viewport-cancel');
+        }
+      } catch { /* overlay may not be initialized */ }
+    }
+
+    return cancelledCount;
   }
 
   /**

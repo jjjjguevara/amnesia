@@ -242,7 +242,7 @@ export class ScrollStrategy {
     zoom: number
   ): TileCoordinate[] {
     // Predict future viewport position based on scroll direction
-    const predictedViewport = this.predictViewport(viewport, velocity);
+    const predictedViewport = this.predictViewportForPrefetch(viewport, velocity);
 
     // Get current visible tile keys to exclude from prefetch
     const currentTiles = new Set(
@@ -576,12 +576,15 @@ export class ScrollStrategy {
   }
 
   /**
-   * Predict future viewport based on velocity
+   * Predict future viewport based on velocity (for prefetch).
    *
    * Uses scroll direction and adaptive lookahead to determine prefetch area.
    * Faster scrolling = look further ahead.
+   * 
+   * Note: For physics-based time prediction, use getPredictedViewport() instead.
+   * This method uses viewport-unit lookahead (1.5x viewport) rather than time.
    */
-  private predictViewport(viewport: Rect, velocity: ScrollVelocity): Rect {
+  private predictViewportForPrefetch(viewport: Rect, velocity: ScrollVelocity): Rect {
     // Use adaptive lookahead based on velocity
     const lookAheadFactor = this.getAdaptiveLookahead(velocity);
 
@@ -632,6 +635,146 @@ export class ScrollStrategy {
       x: velocity.x * decay,
       y: velocity.y * decay,
     };
+  }
+
+  // ============================================================================
+  // VIEWPORT PREDICTION (amnesia-aqv Phase 2C)
+  // ============================================================================
+  // Exposes momentum-based viewport prediction for use in cache eviction and
+  // prefetch prioritization decisions. Uses physics-based momentum decay to
+  // estimate where the viewport will be after a specified time interval.
+  // ============================================================================
+
+  /**
+   * Get predicted viewport position after a time interval.
+   * Uses momentum-based physics to estimate future viewport position.
+   * 
+   * amnesia-aqv Phase 2C: Public API for viewport prediction, useful for:
+   * - Cache eviction decisions (evict tiles far from predicted viewport)
+   * - Prefetch prioritization (render tiles in predicted direction first)
+   * - Render cancellation (don't render tiles moving out of predicted area)
+   * 
+   * Physics model:
+   * - Position integrates velocity over time with momentum decay
+   * - Decay factor simulates scroll friction (default 0.95 per 16ms)
+   * - Integration uses trapezoid rule for accuracy
+   * 
+   * @param viewport Current viewport bounds
+   * @param velocity Current scroll velocity (pixels/second)
+   * @param timeAheadMs How far ahead to predict (milliseconds, default 200)
+   * @returns Predicted viewport bounds after timeAheadMs
+   */
+  getPredictedViewport(
+    viewport: Rect,
+    velocity: ScrollVelocity,
+    timeAheadMs: number = 200
+  ): Rect {
+    // Integrate velocity with decay over time steps
+    // Use 16ms steps (60fps) for accuracy
+    const stepMs = 16;
+    const steps = Math.ceil(timeAheadMs / stepMs);
+    
+    let dx = 0;
+    let dy = 0;
+    let vx = velocity.x / 1000; // Convert to pixels/ms
+    let vy = velocity.y / 1000;
+    
+    for (let i = 0; i < steps; i++) {
+      // Trapezoid integration: position += (v_start + v_end) / 2 * dt
+      const decayedVx = vx * this.config.momentumDecay;
+      const decayedVy = vy * this.config.momentumDecay;
+      
+      dx += ((vx + decayedVx) / 2) * stepMs;
+      dy += ((vy + decayedVy) / 2) * stepMs;
+      
+      vx = decayedVx;
+      vy = decayedVy;
+    }
+    
+    return {
+      x: viewport.x + dx,
+      y: viewport.y + dy,
+      width: viewport.width,
+      height: viewport.height,
+    };
+  }
+
+  /**
+   * Get the predicted center page after a time interval.
+   * Useful for cache eviction decisions when you need page-level granularity.
+   * 
+   * @param viewport Current viewport bounds
+   * @param velocity Current scroll velocity
+   * @param pageLayouts Page layout information
+   * @param timeAheadMs How far ahead to predict
+   * @returns The page number predicted to be centered, or null if none
+   */
+  getPredictedCenterPage(
+    viewport: Rect,
+    velocity: ScrollVelocity,
+    pageLayouts: PageLayout[],
+    timeAheadMs: number = 200
+  ): number | null {
+    const predicted = this.getPredictedViewport(viewport, velocity, timeAheadMs);
+    const centerY = predicted.y + predicted.height / 2;
+    
+    // Find page containing the predicted center
+    for (const layout of pageLayouts) {
+      if (centerY >= layout.y && centerY < layout.y + layout.height) {
+        return layout.page;
+      }
+    }
+    
+    // If predicted center is past all pages, return last page
+    if (pageLayouts.length > 0 && centerY >= pageLayouts[pageLayouts.length - 1].y) {
+      return pageLayouts[pageLayouts.length - 1].page;
+    }
+    
+    // If predicted center is before first page, return first page
+    if (pageLayouts.length > 0 && centerY < pageLayouts[0].y) {
+      return pageLayouts[0].page;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Check if a tile is in the predicted scroll direction.
+   * Useful for deciding whether to evict or preserve a tile.
+   * 
+   * @param tile The tile to check
+   * @param viewport Current viewport
+   * @param velocity Current scroll velocity
+   * @param pageLayouts Page layouts for coordinate mapping
+   * @returns true if tile is in the direction of scroll, false otherwise
+   */
+  isTileInPredictedDirection(
+    tile: TileCoordinate,
+    viewport: Rect,
+    velocity: ScrollVelocity,
+    pageLayouts: PageLayout[]
+  ): boolean {
+    const speed = Math.sqrt(velocity.x ** 2 + velocity.y ** 2);
+    if (speed < 10) return true; // Stationary - all directions are "predicted"
+    
+    const layout = pageLayouts.find(l => l.page === tile.page);
+    if (!layout) return false;
+    
+    // Calculate tile center in viewport space
+    const tileSize = tile.tileSize ?? this.config.tileSize;
+    const tileCenterX = layout.x + (tile.tileX + 0.5) * tileSize;
+    const tileCenterY = layout.y + (tile.tileY + 0.5) * tileSize;
+    
+    // Vector from viewport center to tile center
+    const viewCenterX = viewport.x + viewport.width / 2;
+    const viewCenterY = viewport.y + viewport.height / 2;
+    const toTileX = tileCenterX - viewCenterX;
+    const toTileY = tileCenterY - viewCenterY;
+    
+    // Dot product with velocity direction
+    // Positive = tile is in direction of scroll
+    const dot = toTileX * velocity.x + toTileY * velocity.y;
+    return dot >= 0;
   }
 
   // Private helpers

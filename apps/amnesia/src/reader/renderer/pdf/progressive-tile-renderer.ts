@@ -695,30 +695,48 @@ export function getAdaptiveTileSize(zoom: number, pixelRatio?: number): number {
   // amnesia-rwe: CRITICAL FIX - account for devicePixelRatio
   //
   // For crisp rendering: neededScale = zoom * pixelRatio
-  // Max achievable scale: MAX_TILE_PIXELS (8192) / tileSize
+  // Max achievable scale: MAX_TILE_PIXELS (4096) / tileSize
   //
   // On Retina (pixelRatio=2):
-  //   - 512px tiles: max scale = 16 → max crisp zoom = 8
-  //   - 256px tiles: max scale = 32 → max crisp zoom = 16
-  //   - 128px tiles: max scale = 64 → max crisp zoom = 32
+  //   - 512px tiles: max scale = 8 → max crisp zoom = 4
+  //   - 256px tiles: max scale = 16 → max crisp zoom = 8
+  //   - 128px tiles: max scale = 32 → max crisp zoom = 16
   //
   // On non-Retina (pixelRatio=1):
-  //   - 512px tiles: max scale = 16 → max crisp zoom = 16
-  //   - 256px tiles: max scale = 32 → max crisp zoom = 32
-  //   - 128px tiles: max scale = 64 → max crisp zoom = 64
+  //   - 512px tiles: max scale = 8 → max crisp zoom = 8
+  //   - 256px tiles: max scale = 16 → max crisp zoom = 16
+  //   - 128px tiles: max scale = 32 → max crisp zoom = 32
   
   const dpr = pixelRatio ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 2);
   const neededScale = zoom * dpr;
   
-  // Pick smallest tile size that can achieve needed scale
-  // MAX_TILE_PIXELS = 8192, so:
-  // 512px tiles: max scale = 16
-  // 256px tiles: max scale = 32
-  // 128px tiles: max scale = 64
+  // amnesia-aqv A/B TEST: Use larger tiles at high zoom for faster coverage
+  // Trade-off: fewer tiles (40 vs 135) but max scale 16 instead of 32
+  // This flag lets users compare:
+  //   - useLargeTilesAtHighZoom=false: 128px tiles, max scale 32, ~135 tiles at 32x zoom
+  //   - useLargeTilesAtHighZoom=true:  256px tiles, max scale 16, ~40 tiles at 32x zoom
+  const useLargeTiles = isFeatureEnabled('useLargeTilesAtHighZoom');
   
-  if (neededScale <= 16) {
+  // Pick smallest tile size that can achieve needed scale
+  // MAX_TILE_PIXELS = 4096, so:
+  // 512px tiles: max scale = 8
+  // 256px tiles: max scale = 16
+  // 128px tiles: max scale = 32
+  
+  if (useLargeTiles) {
+    // A/B test: prefer larger tiles for faster coverage
+    // Cap at 256px tiles (max scale 16) even at extreme zoom
+    if (neededScale <= 8) {
+      return 512;
+    } else {
+      return 256; // Use 256px tiles even when 128px would give more detail
+    }
+  }
+  
+  // Default: use smallest tiles that achieve needed scale
+  if (neededScale <= 8) {
     return 512;
-  } else if (neededScale <= 32) {
+  } else if (neededScale <= 16) {
     return 256;
   } else {
     return 128;

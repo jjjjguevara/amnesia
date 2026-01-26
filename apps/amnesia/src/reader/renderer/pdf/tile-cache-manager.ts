@@ -610,6 +610,24 @@ export class TileCacheManager {
     height: number;
   }>) | null = null;
 
+  // ============================================================================
+  // SCALE-TIER INDEX (amnesia-aqv Phase 2A)
+  // ============================================================================
+  // Tracks which (page, scale, tileSize) combinations have any cached tiles.
+  // This enables O(1) lookup to skip scale tiers with no cached data during
+  // fallback tile search, reducing the search from O(scale_tiers × tile_sizes)
+  // to O(populated_tiers).
+  //
+  // Structure: page → scale → Set of tileSizes that have at least one tile
+  // Example: Map { 1 → Map { 8 → Set { 256, 512 }, 16 → Set { 256 } } }
+  // ============================================================================
+  
+  /**
+   * Index of cached tile scale tiers by page.
+   * Used for O(1) lookup during fallback tile search.
+   */
+  private scaleTierIndex: Map<number, Map<number, Set<number>>> = new Map();
+
   constructor(options?: {
     l1MaxSize?: number;
     l2MaxSize?: number;
@@ -1034,8 +1052,62 @@ export class TileCacheManager {
       this.l1Cache.set(key, cacheData, size);
     }
 
+    // amnesia-aqv Phase 2A: Update scale-tier index for fast fallback lookup
+    this.indexTile(tile);
+
     // Reset consecutive misses since we just cached something
     this.consecutiveMisses = 0;
+  }
+
+  /**
+   * Index a tile in the scale-tier index for O(1) fallback lookup.
+   * @internal
+   */
+  private indexTile(tile: TileCoordinate): void {
+    const page = tile.page;
+    const scale = tile.scale;
+    const tileSize = tile.tileSize ?? 256;
+
+    let pageIndex = this.scaleTierIndex.get(page);
+    if (!pageIndex) {
+      pageIndex = new Map();
+      this.scaleTierIndex.set(page, pageIndex);
+    }
+
+    let scaleSizes = pageIndex.get(scale);
+    if (!scaleSizes) {
+      scaleSizes = new Set();
+      pageIndex.set(scale, scaleSizes);
+    }
+
+    scaleSizes.add(tileSize);
+  }
+
+  /**
+   * Check if any tiles exist for a given page, scale, and tileSize.
+   * Used for O(1) fallback search optimization.
+   * @internal
+   */
+  private hasAnyTilesAtScale(page: number, scale: number, tileSize: number): boolean {
+    const pageIndex = this.scaleTierIndex.get(page);
+    if (!pageIndex) return false;
+
+    const scaleSizes = pageIndex.get(scale);
+    if (!scaleSizes) return false;
+
+    return scaleSizes.has(tileSize);
+  }
+
+  /**
+   * Get all scale tiers that have cached tiles for a page.
+   * Returns scales in descending order (highest first) for zoom-out fallback.
+   * @internal
+   */
+  private getPopulatedScaleTiers(page: number): number[] {
+    const pageIndex = this.scaleTierIndex.get(page);
+    if (!pageIndex) return [];
+
+    return Array.from(pageIndex.keys()).sort((a, b) => b - a);
   }
 
   /**
@@ -1484,11 +1556,17 @@ export class TileCacheManager {
     const POSSIBLE_TILE_SIZES = [512, 256, 128]; // Prefer larger tiles (better quality)
 
     // Helper: find cached tile at given scale+tileSize that covers the same PDF position
+    // amnesia-aqv Phase 2A: Uses scale-tier index for O(1) skip of empty tiers
     const findCachedTileForPdfPosition = (
       scaleTier: number
     ): { tile: TileCoordinate; data: CachedTileData } | null => {
       // Try each possible tileSize the fallback might have been rendered with
       for (const fallbackTileSize of POSSIBLE_TILE_SIZES) {
+        // O(1) check: Skip this tileSize if no tiles exist at this scale
+        if (!this.hasAnyTilesAtScale(tile.page, scaleTier, fallbackTileSize)) {
+          continue;
+        }
+        
         const fallbackPdfTileSize = fallbackTileSize / scaleTier;
         const fallbackTileX = Math.floor(pdfX / fallbackPdfTileSize);
         const fallbackTileY = Math.floor(pdfY / fallbackPdfTileSize);
@@ -2874,6 +2952,163 @@ export class TileCacheManager {
     return evicted;
   }
 
+  // ============================================================================
+  // SPATIAL-AWARE EVICTION (amnesia-aqv Phase 2B)
+  // ============================================================================
+  // Combines distance from viewport center with recency for smarter eviction.
+  // At high zoom (32x), this keeps nearby tiles cached while evicting distant
+  // tiles that the user is unlikely to pan back to.
+  //
+  // Score = DISTANCE_WEIGHT × normalized_distance + RECENCY_WEIGHT × normalized_age
+  // Higher score = more likely to evict.
+  // ============================================================================
+
+  /**
+   * Evict tiles based on combined distance + recency scoring.
+   * 
+   * This method improves on pure LRU by considering spatial proximity to the
+   * current viewport. At high zoom levels, a tile that was accessed recently
+   * but is now 10 pages away is less valuable than an older tile on the current page.
+   * 
+   * Scoring formula:
+   * - normalized_distance = distance / max_distance (0 = at center, 1 = farthest)
+   * - normalized_age = age / max_age (0 = just accessed, 1 = oldest)
+   * - score = 0.7 × normalized_distance + 0.3 × normalized_age
+   * 
+   * Distance is calculated as:
+   * - Page distance: |tile.page - currentPage| contributes 1.0 per page
+   * - Within-page: Manhattan distance from tile center to focal tile
+   * 
+   * @param currentPage The page currently centered in viewport
+   * @param focalTile Optional (tileX, tileY) of the focal point on currentPage
+   * @param targetEvictions Number of tiles to evict
+   * @returns Number of tiles actually evicted
+   */
+  evictByDistanceAndRecency(
+    currentPage: number,
+    focalTile: { tileX: number; tileY: number } | null,
+    targetEvictions: number
+  ): number {
+    const DISTANCE_WEIGHT = 0.7;
+    const RECENCY_WEIGHT = 0.3;
+    
+    // Collect all tiles with their metadata
+    type TileScore = {
+      key: string;
+      cache: 'l1' | 'l2';
+      page: number;
+      tileX: number;
+      tileY: number;
+      timestamp: number;
+      score: number;
+    };
+    
+    const tiles: TileScore[] = [];
+    const now = Date.now();
+    let maxDistance = 0;
+    let maxAge = 0;
+    
+    // Helper to calculate raw distance
+    const calculateRawDistance = (page: number, tileX: number, tileY: number): number => {
+      // Page distance contributes heavily (equivalent to ~10 tiles per page)
+      const pageDistance = Math.abs(page - currentPage) * 10;
+      
+      // Within-page distance using Manhattan distance from focal tile
+      let withinPageDistance = 0;
+      if (page === currentPage && focalTile) {
+        withinPageDistance = Math.abs(tileX - focalTile.tileX) + Math.abs(tileY - focalTile.tileY);
+      } else if (page === currentPage) {
+        // No focal tile - use distance from center (assume 4x4 grid center = 2,2)
+        withinPageDistance = Math.abs(tileX - 2) + Math.abs(tileY - 2);
+      }
+      
+      return pageDistance + withinPageDistance;
+    };
+    
+    // First pass: collect tiles and find max values for normalization
+    for (const [key, entry] of this.l1Cache.entries()) {
+      const parsed = this.parseKey(key);
+      if (!parsed || parsed.type !== 'tile') continue;
+      
+      const distance = calculateRawDistance(parsed.page, parsed.tileX!, parsed.tileY!);
+      const age = now - entry.timestamp;
+      
+      maxDistance = Math.max(maxDistance, distance);
+      maxAge = Math.max(maxAge, age);
+      
+      tiles.push({
+        key,
+        cache: 'l1',
+        page: parsed.page,
+        tileX: parsed.tileX!,
+        tileY: parsed.tileY!,
+        timestamp: entry.timestamp,
+        score: 0, // Calculated in second pass
+      });
+    }
+    
+    for (const [key, entry] of this.l2Cache.entries()) {
+      const parsed = this.parseKey(key);
+      if (!parsed || parsed.type !== 'tile') continue;
+      
+      const distance = calculateRawDistance(parsed.page, parsed.tileX!, parsed.tileY!);
+      const age = now - entry.timestamp;
+      
+      maxDistance = Math.max(maxDistance, distance);
+      maxAge = Math.max(maxAge, age);
+      
+      tiles.push({
+        key,
+        cache: 'l2',
+        page: parsed.page,
+        tileX: parsed.tileX!,
+        tileY: parsed.tileY!,
+        timestamp: entry.timestamp,
+        score: 0,
+      });
+    }
+    
+    // Avoid division by zero
+    if (maxDistance === 0) maxDistance = 1;
+    if (maxAge === 0) maxAge = 1;
+    
+    // Second pass: calculate normalized scores
+    for (const tile of tiles) {
+      const distance = calculateRawDistance(tile.page, tile.tileX, tile.tileY);
+      const age = now - tile.timestamp;
+      
+      const normalizedDistance = distance / maxDistance;
+      const normalizedAge = age / maxAge;
+      
+      tile.score = DISTANCE_WEIGHT * normalizedDistance + RECENCY_WEIGHT * normalizedAge;
+    }
+    
+    // Sort by score descending (highest score = evict first)
+    tiles.sort((a, b) => b.score - a.score);
+    
+    // Evict up to targetEvictions
+    let evicted = 0;
+    for (const tile of tiles) {
+      if (evicted >= targetEvictions) break;
+      
+      if (tile.cache === 'l1') {
+        this.l1Cache.delete(tile.key);
+      } else {
+        this.l2Cache.delete(tile.key);
+      }
+      evicted++;
+    }
+    
+    if (evicted > 0) {
+      console.log(
+        `[TileCacheManager] evictByDistanceAndRecency: evicted ${evicted}/${targetEvictions} tiles ` +
+        `(page=${currentPage}, focal=${focalTile ? `${focalTile.tileX},${focalTile.tileY}` : 'none'})`
+      );
+    }
+    
+    return evicted;
+  }
+
   /**
    * Get cache statistics
    */
@@ -3175,6 +3410,8 @@ export class TileCacheManager {
     this.l1Cache.clear();
     this.l2Cache.clear();
     this.l3Cache.clear();
+    // amnesia-aqv Phase 2A: Clear scale-tier index
+    this.scaleTierIndex.clear();
     this.documentId = null;
   }
 }

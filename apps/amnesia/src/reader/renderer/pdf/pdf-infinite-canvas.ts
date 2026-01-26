@@ -58,6 +58,7 @@ import {
 } from './zoom-scale-service';
 import { getRenderSessionManager } from './render-session';
 import { getTileIntegrityChecker, type TileRequest } from './tile-integrity-checker';
+import { getScrollStrategy } from './scroll-strategy';
 // amnesia-aqv Phase 0: Diagnostic overlay for mode transition tracking
 import { getTileDiagnosticOverlay, type ModeTransitionEvent } from './tile-diagnostic-overlay';
 // Diagnostic trackers for T2HR and focal-point analysis
@@ -2565,6 +2566,17 @@ export class PdfInfiniteCanvas {
       ? 'zoom'
       : (Math.abs(this.velocity.y) > 0.1 ? 'scroll' : 'pan');
     
+    // amnesia-aqv Phase 1C: Immediately composite fallback tiles BEFORE queueing high-res renders.
+    // This provides instant visual feedback (blurry but visible) while high-res tiles load.
+    // Fire-and-forget - don't wait for completion to avoid blocking the render queue.
+    this.compositeFallbackTilesImmediately(
+      tilesToQueue.map(t => ({ ...t, scale: tileScale })),
+      tileScale,
+      scaleSnapshot.epoch
+    ).catch(err => {
+      console.warn('[FALLBACK-COMPOSITE] Error compositing fallback tiles:', err);
+    });
+    
     for (const tile of tilesToQueue) {
       // Use consistent scale for all tiles in this batch
       const actualScale = tileScale;
@@ -2644,6 +2656,135 @@ export class PdfInfiniteCanvas {
           // Debug info
           zoom: zoom,
           requestedScale: tileScale,
+        }).catch(() => {
+          // Ignore prefetch failures
+        });
+      }
+    }
+  }
+
+  // ============================================================================
+  // FOCAL-POINT PREDICTIVE PREFETCH (amnesia-aqv Phase 3+)
+  // ============================================================================
+  // When a zoom gesture starts, predict the target zoom level and prefetch
+  // high-resolution tiles around the focal point BEFORE we reach that zoom.
+  // This ensures tiles are already cached when the user reaches high zoom.
+  // ============================================================================
+
+  /**
+   * Prefetch high-resolution tiles around a focal point for predicted zoom level.
+   * Called at zoom gesture start to preemptively render tiles we'll need.
+   * 
+   * @param focalPoint Focal point in screen coordinates
+   * @param currentZoom Current zoom level
+   * @param isZoomingIn Whether the gesture is zooming in (true) or out (false)
+   */
+  private prefetchFocalPointTiles(
+    focalPoint: Point,
+    currentZoom: number,
+    isZoomingIn: boolean
+  ): void {
+    // Only prefetch when zooming in and already at moderate zoom
+    if (!isZoomingIn || currentZoom < 4) return;
+    if (!this.renderCoordinator || !this.tileEngine) return;
+
+    // Predict target zoom levels to prefetch
+    // If at 8x, prefetch for 16x and 32x
+    // If at 16x, prefetch for 32x
+    const targetZooms: number[] = [];
+    if (currentZoom >= 4 && currentZoom < 16) targetZooms.push(16);
+    if (currentZoom >= 8) targetZooms.push(32);
+    
+    if (targetZooms.length === 0) return;
+
+    // Convert focal point to canvas coordinates
+    const focalCanvas = screenToCanvas(focalPoint, this.camera);
+    
+    // Find which page the focal point is on
+    let focalPage: number | null = null;
+    let focalLayout: PageLayout | null = null;
+    
+    for (const [page, layout] of this.pageLayouts) {
+      if (focalCanvas.x >= layout.x && focalCanvas.x <= layout.x + layout.width &&
+          focalCanvas.y >= layout.y && focalCanvas.y <= layout.y + layout.height) {
+        focalPage = page;
+        focalLayout = layout;
+        break;
+      }
+    }
+    
+    if (!focalPage || !focalLayout) return;
+
+    const pdfDims = this.tileEngine.pageDimensions.get(focalPage);
+    if (!pdfDims) return;
+
+    // Get epoch for tile requests
+    const epoch = this.zoomScaleService.getEpoch();
+
+    console.log(`[FOCAL-PREFETCH] Starting prefetch at focal (${focalCanvas.x.toFixed(0)}, ${focalCanvas.y.toFixed(0)}) page=${focalPage} currentZoom=${currentZoom.toFixed(1)} targets=[${targetZooms.join(',')}]`);
+
+    // For each target zoom, generate tiles around the focal point
+    for (const targetZoom of targetZooms) {
+      const pixelRatio = this.config.pixelRatio;
+      const targetScale = Math.min(32, Math.ceil(targetZoom * pixelRatio));
+      const tileSize = getTileSize(targetZoom);
+      const pdfTileSize = tileSize / targetScale;
+
+      // Convert focal point to PDF coordinates relative to page
+      const focalPdfX = (focalCanvas.x - focalLayout.x) * (pdfDims.width / focalLayout.width);
+      const focalPdfY = (focalCanvas.y - focalLayout.y) * (pdfDims.height / focalLayout.height);
+
+      // Calculate tile indices at focal point
+      const focalTileX = Math.floor(focalPdfX / pdfTileSize);
+      const focalTileY = Math.floor(focalPdfY / pdfTileSize);
+
+      // Calculate tile grid bounds
+      const maxTileX = Math.ceil(pdfDims.width / pdfTileSize) - 1;
+      const maxTileY = Math.ceil(pdfDims.height / pdfTileSize) - 1;
+
+      // Generate tiles in a 5x5 grid around focal point (25 tiles)
+      // This covers approximately the visible viewport at high zoom
+      const radius = 2;
+      const tiles: TileCoordinate[] = [];
+
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          const tileX = focalTileX + dx;
+          const tileY = focalTileY + dy;
+
+          // Skip out-of-bounds tiles
+          if (tileX < 0 || tileX > maxTileX || tileY < 0 || tileY > maxTileY) continue;
+
+          tiles.push({
+            page: focalPage,
+            tileX,
+            tileY,
+            scale: targetScale,
+            tileSize,
+          });
+        }
+      }
+
+      // Sort by distance from focal tile (center first)
+      tiles.sort((a, b) => {
+        const aDist = Math.abs(a.tileX - focalTileX) + Math.abs(a.tileY - focalTileY);
+        const bDist = Math.abs(b.tileX - focalTileX) + Math.abs(b.tileY - focalTileY);
+        return aDist - bDist;
+      });
+
+      console.log(`[FOCAL-PREFETCH] Queueing ${tiles.length} tiles at scale ${targetScale} for zoom ${targetZoom}`);
+
+      // Queue tiles at high priority (but not critical, to not block current render)
+      for (const tile of tiles) {
+        this.renderCoordinator.requestRender({
+          type: 'tile' as const,
+          tile,
+          priority: 'high', // High priority but not critical
+          documentId: this.documentId ?? undefined,
+          sessionId: this.pendingSessionId,
+          scaleEpoch: epoch,
+          zoom: targetZoom,
+          requestedScale: targetScale,
         }).catch(() => {
           // Ignore prefetch failures
         });
@@ -3083,6 +3224,100 @@ export class PdfInfiniteCanvas {
       console.log(`[CACHE-COMPOSITE] page=${page}: Skipped due to epoch mismatch`);
     } else {
       console.log(`[CACHE-COMPOSITE] page=${page}: Additive composite complete`);
+    }
+  }
+
+  /**
+   * amnesia-aqv Phase 1C: Immediately composite fallback tiles for visible tiles.
+   * 
+   * This is called BEFORE queueing high-res renders to provide instant visual feedback.
+   * Instead of showing blank areas while high-res tiles render, we show scaled-up
+   * lower-resolution tiles from the cache (Google Maps-style fallback).
+   * 
+   * Key differences from compositeCachedTilesForPage():
+   * - Called proactively BEFORE renders, not reactively after
+   * - No coverage threshold - show ANY available fallbacks immediately
+   * - Accepts higher cssStretch (up to 4x) since it's temporary
+   * - Grouped by page for efficient compositing
+   * 
+   * @param tiles - The tiles being requested (at target scale)
+   * @param targetScale - The target scale for these tiles
+   * @param epoch - Current scale epoch for validation
+   */
+  private async compositeFallbackTilesImmediately(
+    tiles: TileCoordinate[],
+    targetScale: number,
+    epoch: number
+  ): Promise<void> {
+    if (tiles.length === 0) return;
+    
+    const cacheManager = getTileCacheManager();
+    const zoom = this.camera.z;
+    
+    // Group tiles by page for efficient compositing
+    const tilesByPage = new Map<number, TileCoordinate[]>();
+    for (const tile of tiles) {
+      const pageTiles = tilesByPage.get(tile.page) || [];
+      pageTiles.push(tile);
+      tilesByPage.set(tile.page, pageTiles);
+    }
+    
+    // Process each page
+    for (const [page, pageTiles] of tilesByPage) {
+      const element = this.pageElements.get(page);
+      const layout = this.pageLayouts.get(page);
+      if (!element || !layout) continue;
+      
+      const fallbackTileImages: Array<{
+        tile: TileCoordinate;
+        bitmap: ImageBitmap;
+        cssStretch?: number;
+      }> = [];
+      
+      for (const tile of pageTiles) {
+        // Check if we already have exact-scale tile
+        const exactCached = await cacheManager.get(tile);
+        if (exactCached) {
+          // Already have high-res - no fallback needed
+          exactCached.close();
+          continue;
+        }
+        
+        // Try to find a fallback at any scale
+        const fallback = await cacheManager.getBestAvailableBitmap(tile);
+        if (fallback) {
+          // Accept higher stretch for immediate fallback (up to 4x)
+          // This is temporary - high-res will overdraw soon
+          const MAX_FALLBACK_STRETCH = 4.0;
+          if (fallback.cssStretch <= MAX_FALLBACK_STRETCH) {
+            fallbackTileImages.push({
+              tile: fallback.fallbackTile ?? tile,
+              bitmap: fallback.bitmap,
+              cssStretch: fallback.cssStretch,
+            });
+          } else {
+            // Stretch too large - would look bad, skip
+            fallback.bitmap.close();
+          }
+        }
+      }
+      
+      if (fallbackTileImages.length === 0) continue;
+      
+      // Get PDF dimensions for proper tile positioning
+      const pdfDimensions = this.tileEngine?.getPageDimensions(page);
+      
+      // Composite fallback tiles immediately (fire-and-forget)
+      // Note: Using addTilesToExistingCanvas for additive compositing
+      // so high-res tiles can overdraw later without clearing
+      console.log(`[FALLBACK-COMPOSITE] page=${page}: Compositing ${fallbackTileImages.length} fallback tiles (target scale ${targetScale})`);
+      
+      const success = element.addTilesToExistingCanvas(fallbackTileImages, epoch);
+      
+      if (!success) {
+        // Epoch mismatch - close bitmaps
+        fallbackTileImages.forEach(({ bitmap }) => bitmap.close());
+      }
     }
   }
 
@@ -3614,8 +3849,12 @@ export class PdfInfiniteCanvas {
         //
         // DIRECT FIX: Apply zoom-based limit here instead of relying on render coordinator,
         // because the coordinator's currentZoom may not be updated at the time of render.
+        //
+        // amnesia-aqv Phase 3 FIX: INCREASED limits to allow full viewport coverage.
+        // Previous limit of 50 at 32x caused only 24% coverage - tiles were limited
+        // before they could even be queued. Now matches render-coordinator limits.
         const coordinatorLimit = this.renderCoordinator?.getMaxTilesPerPage() ?? 0;
-        const zoomBasedLimit = zoom >= 32 ? 50 : zoom >= 16 ? 100 : zoom >= 8 ? 150 : Infinity;
+        const zoomBasedLimit = zoom >= 32 ? 150 : zoom >= 16 ? 150 : zoom >= 8 ? 200 : Infinity;
         const maxTilesPerPage = coordinatorLimit > 0 ? Math.min(coordinatorLimit, zoomBasedLimit) : zoomBasedLimit;
         
         // Ensure we have a sensible limit (use 200 as fallback if Infinity)
@@ -4309,10 +4548,44 @@ export class PdfInfiniteCanvas {
       Math.pow(tileCenterY - priorityCenterY, 2)
     );
 
-    // Priority based on distance
-    if (distance < viewport.width / 4) return 'critical';
-    if (distance < viewport.width / 2) return 'high';
-    if (distance < viewport.width) return 'medium';
+    // ============================================================================
+    // amnesia-aqv Phase 3A: Velocity-boosted priority
+    // ============================================================================
+    // Tiles in the scroll direction get priority boost because the user is
+    // moving toward them. This prevents "chasing" where we render tiles the
+    // user just left while the destination tiles wait in queue.
+    //
+    // Implementation: Check if tile is in the direction of scroll velocity.
+    // If so, tighten the distance thresholds for higher priority.
+    // ============================================================================
+    
+    let velocityBoost = false;
+    const speed = Math.sqrt(this.velocity.x ** 2 + this.velocity.y ** 2);
+    
+    if (speed > 1) {
+      // Vector from viewport center to tile center
+      const toTileX = tileCenterX - priorityCenterX;
+      const toTileY = tileCenterY - priorityCenterY;
+      
+      // Dot product with velocity direction
+      // Positive = tile is in direction of scroll (user moving toward it)
+      const dot = toTileX * this.velocity.x + toTileY * this.velocity.y;
+      velocityBoost = dot > 0;
+    }
+
+    // Priority based on distance, with velocity boost
+    // At high zoom (scale >= 16), use tighter thresholds to prioritize center
+    const isHighZoom = tile.scale >= 16;
+    const criticalRadius = isHighZoom ? viewport.width / 6 : viewport.width / 4;
+    const highRadius = isHighZoom ? viewport.width / 3 : viewport.width / 2;
+    const mediumRadius = isHighZoom ? viewport.width / 1.5 : viewport.width;
+    
+    // With velocity boost: shift thresholds to make tiles in scroll direction higher priority
+    const boostFactor = velocityBoost ? 1.5 : 1.0;
+    
+    if (distance < criticalRadius * boostFactor) return 'critical';
+    if (distance < highRadius * boostFactor) return 'high';
+    if (distance < mediumRadius * boostFactor) return 'medium';
     return 'low';
   }
 
@@ -5329,6 +5602,80 @@ export class PdfInfiniteCanvas {
         const keepRecent = this.renderCoordinator?.getAdaptiveKeepRecent(tileScale) ?? 2;
         this.renderCoordinator?.abortStaleSessions(keepRecent);
 
+        // amnesia-aqv Phase 1D: Cancel tiles that are now completely off-viewport.
+        // This frees permits for tiles the user can actually see.
+        // Only triggers when queue is saturated (>75% full).
+        if (this.renderCoordinator && inTiledMode) {
+          this.renderCoordinator.cancelOffViewportTiles(
+            snapshotBounds,
+            this.pageLayouts,
+            snapshot.camera.z
+          );
+          
+          // amnesia-aqv Phase 1E: Process retry queue during scroll gestures.
+          // This helps fill in gaps from dropped tiles while actively panning.
+          // Uses smaller batch size (3) and relaxed saturation threshold (0.8).
+          // Fire-and-forget to avoid blocking render queue.
+          this.renderCoordinator.processRetryQueue(snapshotBounds, true).catch(() => {
+            // Ignore errors - best effort retry during scroll
+          });
+          
+          // amnesia-aqv Phase 2B+2C: Spatial-aware eviction with viewport prediction.
+          // When cache is >70% full at high zoom, proactively evict tiles that are
+          // moving away from the predicted scroll direction. This combines spatial
+          // proximity with momentum-based prediction to keep cache primed for the
+          // direction the user is scrolling.
+          if (tileScale >= 16) {
+            const cacheStats = getTileCacheManager().getStats();
+            const cacheUtilization = cacheStats.l2Count / 360; // L2 max = 360
+            if (cacheUtilization > 0.7) {
+              // Phase 2C: Use predicted viewport (200ms ahead) for smarter eviction
+              // Convert velocity from canvas units to pixels/second
+              const scrollStrategy = getScrollStrategy();
+              const velocity = {
+                x: this.velocity.x * 60, // ~60fps tracking
+                y: this.velocity.y * 60,
+              };
+              
+              // Predict where viewport will be in 200ms
+              const predictedBounds = scrollStrategy.getPredictedViewport(
+                snapshotBounds,
+                velocity,
+                200 // 200ms ahead
+              );
+              
+              // Find predicted center page from page layouts
+              const predictedCenterPage = scrollStrategy.getPredictedCenterPage(
+                snapshotBounds,
+                velocity,
+                Array.from(this.pageLayouts.values()),
+                200
+              ) ?? (Math.min(...this.visiblePages) || 1);
+              
+              // Calculate focal tile from PREDICTED viewport center
+              const predictedCenterX = predictedBounds.x + predictedBounds.width / 2;
+              const predictedCenterY = predictedBounds.y + predictedBounds.height / 2;
+              const pageLayout = this.pageLayouts.get(predictedCenterPage);
+              
+              let focalTile: { tileX: number; tileY: number } | null = null;
+              if (pageLayout) {
+                // Convert predicted center to tile indices
+                const tileSize = 128; // CSS tile size at high zoom
+                const relX = predictedCenterX - pageLayout.x;
+                const relY = predictedCenterY - pageLayout.y;
+                focalTile = {
+                  tileX: Math.floor(relX / tileSize),
+                  tileY: Math.floor(relY / tileSize),
+                };
+              }
+              
+              // Evict ~15% of cache, prioritizing tiles moving away from prediction
+              const evictTarget = Math.floor(cacheStats.l2Count * 0.15);
+              getTileCacheManager().evictByDistanceAndRecency(predictedCenterPage, focalTile, evictTarget);
+            }
+          }
+        }
+
         // Mark pages as needing re-render
         for (const page of pagesToRerender) {
           const element = this.pageElements.get(page);
@@ -5567,7 +5914,7 @@ export class PdfInfiniteCanvas {
   // Safari gesture state
   private gestureStartZoom = 1;
 
-  private handleGestureStart(e: Event & { scale?: number }): void {
+  private handleGestureStart(e: Event & { scale?: number; clientX?: number; clientY?: number }): void {
     e.preventDefault();
     this.stopInertia();
     this.gestureStartZoom = this.camera.z;
@@ -5579,6 +5926,17 @@ export class PdfInfiniteCanvas {
     this.zoomScaleService.signalOngoingActivity();
     
     console.warn(`[GESTURE-START-DEBUG] gestureStartZoom=${this.gestureStartZoom.toFixed(2)}, gesturePhase=${this.zoomScaleService.getGesturePhase()}`);
+    
+    // amnesia-aqv Phase 3+: Start focal-point predictive prefetch
+    // Get focal point from gesture event or fall back to viewport center
+    const rect = this.viewport.getBoundingClientRect();
+    const focalPoint: Point = {
+      x: (e.clientX ?? rect.width / 2) - rect.left,
+      y: (e.clientY ?? rect.height / 2) - rect.top,
+    };
+    
+    // Assume zooming in (most common case) - prefetch will filter if not needed
+    this.prefetchFocalPointTiles(focalPoint, this.camera.z, true);
   }
 
   private handleGestureChange(e: Event & { scale?: number; clientX?: number; clientY?: number }): void {
@@ -5693,6 +6051,12 @@ export class PdfInfiniteCanvas {
       // This balances responsiveness with controllability.
       // Previous: 0.04 was too aggressive (3 events to max), 0.01 was too slow (14 events)
       this.zoomAtPoint(point, delta);
+      
+      // amnesia-aqv Phase 3+: Trigger focal-point predictive prefetch on zoom-in
+      // Only trigger occasionally to avoid flooding the queue
+      if (isZoomIn && this.camera.z >= 4 && Math.random() < 0.1) {
+        this.prefetchFocalPointTiles(point, this.camera.z, true);
+      }
     } else {
       // Pan gesture - direct 1:1 mapping for responsive scrolling
       // The panCamera function handles zoom-adjusted movement
@@ -6048,7 +6412,7 @@ export class PdfInfiniteCanvas {
       getTelemetry().trackZoomChange(oldZoom, this.camera.z);
 
       // amnesia-e4i FIX: Update render coordinator's zoom for policy decisions.
-      // Without this, maxTilesPerPage stays at 300 even at 32x zoom where it should be 50.
+      // Without this, maxTilesPerPage stays at 300 even at 32x zoom where it should be 150.
       this.renderCoordinator?.setCurrentZoom(this.camera.z);
 
       // FOCAL POINT PRESERVATION + SOFT CONSTRAINTS (amnesia-u9l):

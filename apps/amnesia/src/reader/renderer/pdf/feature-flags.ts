@@ -190,6 +190,26 @@ export interface FeatureFlagDefinitions {
    * Default: true (enabled for scanned PDF optimization)
    */
   useJpegTileSlicing: boolean;
+
+  /**
+   * A/B Test: Use larger tiles at high zoom levels (amnesia-aqv).
+   *
+   * When enabled:
+   * - At zoom 16-32x on Retina displays, uses 256px tiles instead of 128px
+   * - Reduces tile count from ~135 to ~40 for typical viewports
+   * - Trades maximum sharpness (scale 32 → scale 16) for faster coverage
+   *
+   * Trade-offs:
+   * - PRO: 3x fewer tiles = faster time to full coverage (~2s vs ~6s)
+   * - PRO: Lower memory pressure (fewer tiles in cache/queue)
+   * - CON: Maximum achievable scale is 16 instead of 32
+   * - CON: At 32x zoom, effective DPR is 0.5 (slightly soft on Retina)
+   *
+   * This is an A/B test flag - user can toggle to compare experience.
+   *
+   * Default: false (preserve maximum sharpness)
+   */
+  useLargeTilesAtHighZoom: boolean;
 }
 
 /** Runtime-resolved flag values (all booleans or numbers) */
@@ -213,6 +233,7 @@ export interface ResolvedFeatureFlags {
   enableDiagnosticsTab: boolean;
   exportDiagnosticsJson: boolean;
   useJpegTileSlicing: boolean;
+  useLargeTilesAtHighZoom: boolean;
 }
 
 /** Capability detection results */
@@ -270,6 +291,7 @@ const DEFAULT_FLAGS: FeatureFlagDefinitions = {
   enableDiagnosticsTab: false, // Diagnostics: disabled by default, enable via devtools
   exportDiagnosticsJson: false, // Diagnostics: disabled by default, enable for data collection
   useJpegTileSlicing: true, // amnesia-xlc.3: enabled for scanned PDF optimization
+  useLargeTilesAtHighZoom: false, // amnesia-aqv: A/B test - disabled by default (preserve max sharpness)
 };
 
 /**
@@ -519,6 +541,7 @@ export class FeatureFlagsManager {
       enableDiagnosticsTab: merged.enableDiagnosticsTab,
       exportDiagnosticsJson: merged.exportDiagnosticsJson,
       useJpegTileSlicing: merged.useJpegTileSlicing,
+      useLargeTilesAtHighZoom: merged.useLargeTilesAtHighZoom,
     };
   }
 
