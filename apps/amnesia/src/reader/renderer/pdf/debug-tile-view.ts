@@ -8,6 +8,7 @@
  */
 
 import { ItemView, WorkspaceLeaf } from 'obsidian';
+import { getDevicePixelRatio } from './dpr-utils';
 
 export const DEBUG_TILE_VIEW_TYPE = 'amnesia-debug-tiles';
 
@@ -279,7 +280,7 @@ export class DebugTileView extends ItemView {
     const container = this.canvas.parentElement;
     if (!container) return;
     
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = getDevicePixelRatio();
     this.canvas.width = container.clientWidth * dpr;
     this.canvas.height = container.clientHeight * dpr;
     this.canvas.style.width = `${container.clientWidth}px`;
@@ -291,7 +292,7 @@ export class DebugTileView extends ItemView {
     if (!this.ctx || !this.canvas) return;
 
     const ctx = this.ctx;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = getDevicePixelRatio();
     const width = this.canvas.width / dpr;
     const height = this.canvas.height / dpr;
 

@@ -6,6 +6,7 @@
  */
 
 import type { PdfRect } from '../document-renderer';
+import { getDevicePixelRatio } from './dpr-utils';
 
 /**
  * Region selection event data
@@ -337,7 +338,7 @@ export class PdfRegionSelection {
     this.displayHeight = height;
 
     // Update canvas size for HiDPI
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = getDevicePixelRatio();
     this.canvas.width = Math.floor(width * dpr);
     this.canvas.height = Math.floor(height * dpr);
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);

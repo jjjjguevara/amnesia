@@ -21,6 +21,7 @@ import type {
   PdfSelector,
 } from '../document-renderer';
 import { createPdfLocator, parsePdfLocator } from '../document-renderer';
+import { getDevicePixelRatio } from './dpr-utils';
 import type {
   TocEntry,
   HighlightColor,
@@ -270,7 +271,7 @@ export class PdfRenderer implements DocumentRenderer {
         userZoom: undefined,
         gap: 20,
         padding: this.config.margin ?? 20,
-        pixelRatio: window.devicePixelRatio ?? 1,
+        pixelRatio: getDevicePixelRatio(),
         enableTextAntialiasing: this.config.enableTextAntialiasing,
         enableImageSmoothing: this.config.enableImageSmoothing,
       }
@@ -393,7 +394,7 @@ export class PdfRenderer implements DocumentRenderer {
         pageWidth: 612,
         pageHeight: 792,
         renderScale: this.config.scale ?? 1.5,
-        pixelRatio: window.devicePixelRatio ?? 1,
+        pixelRatio: getDevicePixelRatio(),
         readingMode: 'device',
         layoutMode: this.config.scrollDirection === 'horizontal' ? 'horizontal' : 'vertical',
         pagesPerRow: 1,
@@ -1010,8 +1011,8 @@ export class PdfRenderer implements DocumentRenderer {
     const renderDpi = this.config.renderDpi ?? 150;
     const imageFormat = this.config.imageFormat ?? 'png';
     const imageQuality = this.config.imageQuality ?? 85;
-    const devicePixelRatio = window.devicePixelRatio ?? 1;
-    const renderScale = baseScale * devicePixelRatio;
+    const dpr = getDevicePixelRatio();
+    const renderScale = baseScale * dpr;
 
     for (const page of pagesToPreload) {
       const cacheKey = this.getCacheKey(page, renderScale, rotation, imageFormat);

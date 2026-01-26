@@ -22,6 +22,7 @@ import { getTileCacheManager, validateTileBatchCompliance } from './tile-cache-m
 // NOTE: ScaleStateManager removed - epoch now passed from PdfInfiniteCanvas (amnesia-aqv refactor)
 import { getTileDiagnosticOverlay } from './tile-diagnostic-overlay';
 import { getT2HRTracker } from './t2hr-tracker';
+import { getDevicePixelRatio } from './dpr-utils';
 
 export type ReadingMode = 'device' | 'light' | 'sepia' | 'dark' | 'night';
 export type RenderMode = 'page' | 'reflow';
@@ -290,10 +291,13 @@ export class PdfPageElement {
   private onHighlightClickCallback?: (annotationId: string, position: { x: number; y: number }) => void;
 
   constructor(config: PdfPageElementConfig) {
+    // amnesia-4a8: Use centralized DPR utility with consistent fallback = 2
     // Determine pixelRatio at runtime to handle cases where passed config captured incorrect value
-    let pixelRatio = config.pixelRatio ?? window.devicePixelRatio ?? 1;
-    if (pixelRatio === 1 && window.devicePixelRatio > 1) {
-      pixelRatio = window.devicePixelRatio;
+    let pixelRatio = config.pixelRatio ?? getDevicePixelRatio();
+    // Runtime correction: if config provided 1 but actual DPR is higher, use actual
+    const actualDpr = getDevicePixelRatio();
+    if (pixelRatio === 1 && actualDpr > 1) {
+      pixelRatio = actualDpr;
     }
 
     this.config = {

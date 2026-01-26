@@ -23,6 +23,7 @@
  */
 
 import type { PdfPerformancePreset } from '../../../settings/settings';
+import { getDevicePixelRatio } from './dpr-utils';
 
 /**
  * Device tier classification
@@ -431,7 +432,7 @@ export class SystemProfiler {
     return {
       os,
       isMobile,
-      devicePixelRatio: window.devicePixelRatio || 1,
+      devicePixelRatio: getDevicePixelRatio(),
       screen: {
         width: window.screen.width,
         height: window.screen.height,

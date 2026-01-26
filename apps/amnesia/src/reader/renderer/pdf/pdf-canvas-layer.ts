@@ -3,17 +3,22 @@
  *
  * Manages canvas element for page rendering with HiDPI support.
  * Handles rotation and scaling transformations.
+ *
+ * amnesia-4a8: H7 fix - Now reads DPR fresh on each resize to handle display switching.
  */
 
+import { getDevicePixelRatio } from './dpr-utils';
+
 export interface CanvasLayerConfig {
-  /** Device pixel ratio for HiDPI displays */
+  /** Device pixel ratio override (if not provided, uses current window DPR) */
   pixelRatio?: number;
 }
 
 export class PdfCanvasLayer {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  private devicePixelRatio: number;
+  /** Optional DPR override from config. If undefined, uses fresh window DPR. */
+  private pixelRatioOverride?: number;
 
   // Current state
   private currentWidth = 0;
@@ -38,9 +43,18 @@ export class PdfCanvasLayer {
     }
     this.ctx = ctx;
 
-    this.devicePixelRatio = config?.pixelRatio ?? window.devicePixelRatio ?? 1;
+    // amnesia-4a8: Store override only if explicitly provided, otherwise read fresh on resize
+    this.pixelRatioOverride = config?.pixelRatio;
 
     container.appendChild(this.canvas);
+  }
+
+  /**
+   * Get current DPR - uses override if set, otherwise reads fresh from window.
+   * This handles display switching (e.g., moving window between Retina and non-Retina displays).
+   */
+  private getDpr(): number {
+    return this.pixelRatioOverride ?? getDevicePixelRatio();
   }
 
   /**
@@ -50,16 +64,19 @@ export class PdfCanvasLayer {
     this.currentWidth = width;
     this.currentHeight = height;
 
+    // amnesia-4a8: Read fresh DPR on each resize to handle display switching
+    const dpr = this.getDpr();
+
     // Set actual size in memory (scaled for HiDPI)
-    this.canvas.width = Math.floor(width * this.devicePixelRatio);
-    this.canvas.height = Math.floor(height * this.devicePixelRatio);
+    this.canvas.width = Math.floor(width * dpr);
+    this.canvas.height = Math.floor(height * dpr);
 
     // Set display size (CSS pixels)
     this.canvas.style.width = `${width}px`;
     this.canvas.style.height = `${height}px`;
 
     // Scale context to handle HiDPI
-    this.ctx.setTransform(this.devicePixelRatio, 0, 0, this.devicePixelRatio, 0, 0);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
   /**

@@ -9,6 +9,7 @@
 import { PdfPageElement, type PageRenderData, type PageHighlight, type ReadingMode } from './pdf-page-element';
 import { calculateOptimalLayout, type LayoutResult, type LayoutMode } from './pdf-layout-calculator';
 import { getCanvasPool } from './pdf-canvas-pool';
+import { getDevicePixelRatio } from './dpr-utils';
 import type { PdfTextLayer as TextLayerData, PdfRenderOptions } from '../types';
 
 export type DisplayMode = 'paginated' | 'scrolled';
@@ -117,7 +118,7 @@ export class PdfMultiPageContainer {
       scale: config.scale ?? 1.5,
       gap: config.gap ?? 20,
       padding: config.padding ?? 20,
-      pixelRatio: config.pixelRatio ?? window.devicePixelRatio ?? 1,
+      pixelRatio: config.pixelRatio ?? getDevicePixelRatio(),
       enableTextAntialiasing: config.enableTextAntialiasing ?? true,
       enableImageSmoothing: config.enableImageSmoothing ?? true,
       readingMode: config.readingMode ?? 'device',

@@ -39,6 +39,7 @@ import type { RenderCoordinator, RenderMode, RenderPriority } from './render-coo
 import { getTelemetry } from './pdf-telemetry';
 import { isFeatureEnabled } from './feature-flags';
 import { getTileCacheManager } from './tile-cache-manager';
+import { getDevicePixelRatio } from './dpr-utils';
 import {
   getTargetScaleTier,
   getExactTargetScale,
@@ -2755,7 +2756,7 @@ export class PdfInfiniteCanvas {
     for (const page of pages) {
       // Queue render to warm cache (fire and forget)
       const options: PdfRenderOptions = {
-        scale: window.devicePixelRatio || 1,
+        scale: getDevicePixelRatio(),
       };
 
       // Fire and forget - we don't need the result, just warming cache
