@@ -650,8 +650,9 @@ export class PdfPageElement {
     this.container.style.height = `${roundedHeight}px`;
 
     // Update SVG text layer dimensions for proper scaling
+    // amnesia-5hf FIX: Pass rounded dimensions to maintain consistency
     if (this.svgTextLayer) {
-      this.svgTextLayer.setDimensions(width, height);
+      this.svgTextLayer.setDimensions(roundedWidth, roundedHeight);
     }
 
     // CRITICAL: Show placeholder immediately after dimensions are set
@@ -695,23 +696,26 @@ export class PdfPageElement {
     this.currentHeight = roundedHeight;
 
     // Update SVG text layer dimensions for proper scaling
+    // amnesia-5hf FIX: Pass rounded dimensions to maintain consistency
     if (this.svgTextLayer) {
-      this.svgTextLayer.setDimensions(finalWidth, finalHeight);
+      this.svgTextLayer.setDimensions(roundedWidth, roundedHeight);
     }
 
     // Resize canvas buffer to match final dimensions (with DPR scaling for sharpness)
     // This ensures the canvas can hold high-res content for the new zoom level
     // Use window.devicePixelRatio directly to handle DPR changes at runtime (e.g., moving window between displays)
     const dpr = window.devicePixelRatio || this.config.pixelRatio;
-    const bufferWidth = Math.ceil(finalWidth * dpr);
-    const bufferHeight = Math.ceil(finalHeight * dpr);
+    // amnesia-5hf FIX: Use rounded dimensions for consistent buffer sizing
+    const bufferWidth = Math.ceil(roundedWidth * dpr);
+    const bufferHeight = Math.ceil(roundedHeight * dpr);
 
     // ALWAYS update canvas CSS to match final dimensions
     // BUG FIX: Previously this was inside needsBufferResize block, causing canvas CSS
     // to retain old dimensions when buffer size matched but final size changed.
     // This caused content rendered at high zoom to appear stretched/oversized at low zoom.
-    this.canvas.style.width = `${Math.round(finalWidth)}px`;
-    this.canvas.style.height = `${Math.round(finalHeight)}px`;
+    // amnesia-5hf FIX: Use pre-computed rounded values instead of rounding again
+    this.canvas.style.width = `${roundedWidth}px`;
+    this.canvas.style.height = `${roundedHeight}px`;
 
     // Only resize buffer and clear if dimensions actually changed (avoid clearing content unnecessarily)
     const needsBufferResize = this.canvas.width !== bufferWidth || this.canvas.height !== bufferHeight;
@@ -3402,36 +3406,47 @@ export class PdfPageElement {
       return;
     }
 
-    // GOLDEN FRAME LOG (Protocol C): Capture all dimension-related values for hypothesis debugging
-    // This log is critical for diagnosing dimension mismatches during mode transitions
+    // amnesia-5hf AUDIT: GOLDEN FRAME LOG for H1 verification
+    // H1 INVARIANT: Canvas CSS dimensions must match container CSS dimensions
     const containerRect = this.container.getBoundingClientRect();
+    const canvasCssWidth = parseFloat(this.canvas.style.width) || 0;
+    const canvasCssHeight = parseFloat(this.canvas.style.height) || 0;
+    const containerCssWidth = this.container.offsetWidth;
+    const containerCssHeight = this.container.offsetHeight;
+    const widthDelta = canvasCssWidth - containerCssWidth;
+    const heightDelta = canvasCssHeight - containerCssHeight;
+    
     const goldenFrameLog = {
       mode: 'tiled→full-page transition',
       page: this.config.pageNumber,
+      epoch,
       camera: { zoom: this.currentZoom },
-      // CSS dimensions from state (may be floats, rounded at source since H1 fix)
-      cssWidth: this.currentWidth,
-      cssHeight: this.currentHeight,
-      // Container measurements (Protocol C recommended)
+      // H1 TARGET: Canvas CSS should match container CSS exactly
+      canvasCss: { w: canvasCssWidth, h: canvasCssHeight },
+      containerCss: { w: containerCssWidth, h: containerCssHeight },
+      widthDelta,
+      heightDelta,
+      // Internal tracking (not part of H1)
+      internalTracking: { w: this.currentWidth, h: this.currentHeight },
+      // Container bounding rect (may have subpixel values)
       containerBoundingRect: { w: containerRect.width, h: containerRect.height },
-      containerOffset: { w: this.container.offsetWidth, h: this.container.offsetHeight },
-      // Canvas buffer dimensions (integers via Math.ceil in renderTiles)
+      // Canvas buffer dimensions (PHYSICAL pixels = CSS × DPR)
       canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
-      // Parsed CSS style dimensions
-      canvasCss: {
-        w: parseFloat(this.canvas.style.width) || this.currentWidth,
-        h: parseFloat(this.canvas.style.height) || this.currentHeight,
-      },
-      // PDF coordinate system (native PDF points, e.g., 612×792)
       storedPdfDimensions: this.storedPdfDimensions,
-      // Snapshot canvas dimensions (if exists)
       snapshotCanvas: this.transitionSnapshot
         ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
         : null,
-      // Delta between buffer and CSS (H1 hypothesis target - should be 0 after fix)
-      heightDelta: this.canvas.height - (parseFloat(this.canvas.style.height) || this.currentHeight),
+      // H1 PASS: deltas should be 0
+      h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
     console.log('[GOLDEN-FRAME]', goldenFrameLog);
+    
+    // Warn if H1 mismatch detected (canvas CSS != container CSS)
+    if (goldenFrameLog.h1Mismatch) {
+      console.warn(`[H1-MISMATCH] page=${this.config.pageNumber}: ` +
+        `canvasCss=${canvasCssWidth}x${canvasCssHeight} vs containerCss=${containerCssWidth}x${containerCssHeight} ` +
+        `(delta: ${widthDelta.toFixed(1)}x${heightDelta.toFixed(1)})`);
+    }
 
     // amnesia-2t8 (H8): Record the epoch at which this transition starts.
     // The transition snapshot should only be cleared when tiles with epoch >= this value arrive.
@@ -3618,28 +3633,47 @@ export class PdfPageElement {
    * @param epoch Current epoch from ZoomScaleService (for transition snapshot gating)
    */
   prepareForTiledRender(epoch?: number): void {
-    // GOLDEN FRAME LOG (Protocol C): Capture dimensions at full-page→tiled transition
+    // amnesia-5hf AUDIT: GOLDEN FRAME LOG for H1 verification
+    // H1 INVARIANT: Canvas CSS dimensions must match container CSS dimensions
     const containerRect = this.container.getBoundingClientRect();
+    const canvasCssWidth = parseFloat(this.canvas.style.width) || 0;
+    const canvasCssHeight = parseFloat(this.canvas.style.height) || 0;
+    const containerCssWidth = this.container.offsetWidth;
+    const containerCssHeight = this.container.offsetHeight;
+    const widthDelta = canvasCssWidth - containerCssWidth;
+    const heightDelta = canvasCssHeight - containerCssHeight;
+    
     const goldenFrameLog = {
       mode: 'full-page→tiled transition',
       page: this.config.pageNumber,
+      epoch,
       camera: { zoom: this.currentZoom },
-      cssWidth: this.currentWidth,
-      cssHeight: this.currentHeight,
+      // H1 TARGET: Canvas CSS should match container CSS exactly
+      canvasCss: { w: canvasCssWidth, h: canvasCssHeight },
+      containerCss: { w: containerCssWidth, h: containerCssHeight },
+      widthDelta,
+      heightDelta,
+      // Internal tracking (not part of H1)
+      internalTracking: { w: this.currentWidth, h: this.currentHeight },
+      // Container bounding rect (may have subpixel values)
       containerBoundingRect: { w: containerRect.width, h: containerRect.height },
-      containerOffset: { w: this.container.offsetWidth, h: this.container.offsetHeight },
+      // Canvas buffer dimensions (PHYSICAL pixels = CSS × DPR)
       canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
-      canvasCss: {
-        w: parseFloat(this.canvas.style.width) || this.currentWidth,
-        h: parseFloat(this.canvas.style.height) || this.currentHeight,
-      },
       storedPdfDimensions: this.storedPdfDimensions,
       snapshotCanvas: this.transitionSnapshot
         ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
         : null,
-      heightDelta: this.canvas.height - (parseFloat(this.canvas.style.height) || this.currentHeight),
+      // H1 PASS: deltas should be 0
+      h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
     console.log('[GOLDEN-FRAME]', goldenFrameLog);
+    
+    // Warn if H1 mismatch detected (canvas CSS != container CSS)
+    if (goldenFrameLog.h1Mismatch) {
+      console.warn(`[H1-MISMATCH] page=${this.config.pageNumber}: ` +
+        `canvasCss=${canvasCssWidth}x${canvasCssHeight} vs containerCss=${containerCssWidth}x${containerCssHeight} ` +
+        `(delta: ${widthDelta.toFixed(1)}x${heightDelta.toFixed(1)})`);
+    }
 
     // amnesia-2t8 (H8): Record the epoch at which this transition starts.
     // The transition snapshot should only be cleared when tiles with epoch >= this value arrive.
@@ -3963,6 +3997,48 @@ export class PdfPageElement {
       console.log(`[OVERLAY-SKIP] page=${this.config.pageNumber}: Canvas never rendered, using main canvas`);
       this.canvas.style.opacity = '0'; // Hide blank canvas
       return this.ctx;
+    }
+
+    // amnesia-5hf AUDIT: GOLDEN FRAME LOG for H1 verification
+    // H1 INVARIANT: Canvas CSS dimensions must match container CSS dimensions
+    // This is what causes visual stretch if violated.
+    const containerRect = this.container.getBoundingClientRect();
+    const canvasCssWidth = parseFloat(this.canvas.style.width) || 0;
+    const canvasCssHeight = parseFloat(this.canvas.style.height) || 0;
+    const containerCssWidth = this.container.offsetWidth;
+    const containerCssHeight = this.container.offsetHeight;
+    
+    // H1 FIX VERIFICATION: Compare canvas CSS to container CSS
+    // Both should be integers after Math.round() fix, and should match exactly.
+    const widthDelta = canvasCssWidth - containerCssWidth;
+    const heightDelta = canvasCssHeight - containerCssHeight;
+    
+    const goldenFrameLog = {
+      mode: 'tiled→full-page (overlay)',
+      page: this.config.pageNumber,
+      epoch,
+      // H1 TARGET: Canvas CSS should match container CSS exactly
+      canvasCss: { w: canvasCssWidth, h: canvasCssHeight },
+      containerCss: { w: containerCssWidth, h: containerCssHeight },
+      // Delta should be 0 after Math.round() fix
+      widthDelta,
+      heightDelta,
+      // Internal tracking (not part of H1, for debugging only)
+      internalTracking: { w: this.currentWidth, h: this.currentHeight },
+      // Container bounding rect (may have subpixel values)
+      containerBoundingRect: { w: containerRect.width, h: containerRect.height },
+      // Canvas buffer dimensions (PHYSICAL pixels = CSS × DPR)
+      canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
+      // H1 PASS: deltas should be 0
+      h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
+    };
+    console.log('[GOLDEN-FRAME]', goldenFrameLog);
+    
+    // Warn if H1 mismatch detected (canvas CSS != container CSS)
+    if (goldenFrameLog.h1Mismatch) {
+      console.warn(`[H1-MISMATCH] page=${this.config.pageNumber}: ` +
+        `canvasCss=${canvasCssWidth}x${canvasCssHeight} vs containerCss=${containerCssWidth}x${containerCssHeight} ` +
+        `(delta: ${widthDelta.toFixed(1)}x${heightDelta.toFixed(1)})`);
     }
 
     // Cancel any previous overlay render
