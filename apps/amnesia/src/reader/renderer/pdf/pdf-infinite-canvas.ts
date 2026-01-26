@@ -4045,13 +4045,55 @@ export class PdfInfiniteCanvas {
       //
       // This reduces perceived T2HR from ~12s to ~1.5s (first critical batch).
       const useStreamingMode = zoom >= 16;
-      const CRITICAL_BATCH_SIZE = 12; // Wait for 12 tiles (~1.5s with 4 permits)
+      
+      // amnesia-aqv: Scale CRITICAL_BATCH_SIZE with viewport tile count
+      // PROBLEM: Fixed 12 tiles = only 10% coverage at 32x (120 tiles needed)
+      // SOLUTION: Use percentage-based sizing for 50% viewport coverage
+      // This ensures users see half the viewport quickly, regardless of zoom level
+      const MIN_CRITICAL_BATCH = 12;
+      const MAX_CRITICAL_BATCH = 60; // Don't wait forever - cap at 60 tiles
+      const CRITICAL_PERCENTAGE = 0.5; // Aim for 50% coverage
+      const CRITICAL_BATCH_SIZE = Math.min(
+        MAX_CRITICAL_BATCH,
+        Math.max(MIN_CRITICAL_BATCH, Math.floor(tiles.length * CRITICAL_PERCENTAGE))
+      );
+      console.log(`[CRITICAL-BATCH] page=${page}: ${tiles.length} tiles, critical batch size=${CRITICAL_BATCH_SIZE} (${(CRITICAL_BATCH_SIZE / tiles.length * 100).toFixed(0)}% coverage)`);
       
       if (useStreamingMode && tiles.length > CRITICAL_BATCH_SIZE) {
         console.log(`[STREAMING-RENDER] page=${page} zoom=${zoom.toFixed(2)}: Using partial-wait streaming for ${tiles.length} tiles, epoch=${scaleSnapshot.epoch}`);
         const streamingStartTime = performance.now();
         
-        // Split tiles: critical batch (first 20) + background (rest)
+        // amnesia-aqv: Pre-render low-res fallback for newly visible pages
+        // PROBLEM: When zooming to high zoom on a page that wasn't previously rendered,
+        // there's no cached fallback to show during tile loading. User sees blank canvas.
+        // SOLUTION: Fire off a quick low-res (scale 4) full-page render before tiles.
+        // This gets cached and provides a fallback while high-res tiles load.
+        const cacheManager = getTileCacheManager();
+        const FALLBACK_SCALE = 4;
+        const hasFallback = cacheManager.hasFullPage(page, FALLBACK_SCALE) || 
+                           cacheManager.hasFullPage(page, 2) || 
+                           cacheManager.hasFullPage(page, 1);
+        
+        if (!hasFallback && this.renderCoordinator) {
+          console.log(`[FALLBACK-PRERENDER] page=${page}: No cached fallback, triggering scale-${FALLBACK_SCALE} pre-render`);
+          // Fire and forget - don't wait for this, it runs in parallel with tile rendering
+          this.renderCoordinator.requestRender({
+            type: 'page' as const,
+            page,
+            scale: FALLBACK_SCALE,
+            priority: 'high', // High priority but not critical - tiles come first
+            documentId: this.documentId ?? undefined,
+            sessionId: this.pendingSessionId,
+          }).then(result => {
+            if (result.success) {
+              console.log(`[FALLBACK-PRERENDER] page=${page}: Scale-${FALLBACK_SCALE} fallback cached`);
+            }
+          }).catch(() => {
+            // Silently ignore - fallback is best-effort
+          });
+        }
+        
+        // Split tiles: critical batch + background (rest)
         const criticalTiles = tiles.slice(0, CRITICAL_BATCH_SIZE);
         const backgroundTiles = tiles.slice(CRITICAL_BATCH_SIZE);
         
