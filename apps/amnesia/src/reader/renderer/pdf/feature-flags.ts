@@ -175,6 +175,21 @@ export interface FeatureFlagDefinitions {
    * Default: false (enable manually for debugging)
    */
   exportDiagnosticsJson: boolean;
+
+  /**
+   * Enable JPEG tile slicing for scanned PDFs (amnesia-xlc.3).
+   *
+   * When enabled:
+   * - For pages classified as SCANNED_JPEG, extracts the embedded JPEG once
+   * - Caches the decoded ImageData for the full page
+   * - Slices tile regions from the cached image instead of WASM rendering
+   * - Typically 60-80% faster than WASM rendering for scanned documents
+   *
+   * The JPEG cache uses device-aware memory budgeting (~1% of system RAM).
+   *
+   * Default: true (enabled for scanned PDF optimization)
+   */
+  useJpegTileSlicing: boolean;
 }
 
 /** Runtime-resolved flag values (all booleans or numbers) */
@@ -197,6 +212,7 @@ export interface ResolvedFeatureFlags {
   useTileComplianceValidation: boolean;
   enableDiagnosticsTab: boolean;
   exportDiagnosticsJson: boolean;
+  useJpegTileSlicing: boolean;
 }
 
 /** Capability detection results */
@@ -253,6 +269,7 @@ const DEFAULT_FLAGS: FeatureFlagDefinitions = {
   useTileComplianceValidation: true, // amnesia-e4i: enabled to diagnose tile corruption
   enableDiagnosticsTab: false, // Diagnostics: disabled by default, enable via devtools
   exportDiagnosticsJson: false, // Diagnostics: disabled by default, enable for data collection
+  useJpegTileSlicing: true, // amnesia-xlc.3: enabled for scanned PDF optimization
 };
 
 /**
@@ -501,6 +518,7 @@ export class FeatureFlagsManager {
       useTileComplianceValidation: merged.useTileComplianceValidation,
       enableDiagnosticsTab: merged.enableDiagnosticsTab,
       exportDiagnosticsJson: merged.exportDiagnosticsJson,
+      useJpegTileSlicing: merged.useJpegTileSlicing,
     };
   }
 

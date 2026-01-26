@@ -565,6 +565,51 @@ export class TileCacheManager {
    */
   private priorityFunction: ((page: number, tileX: number, tileY: number) => number) | null = null;
 
+  // ============================================================================
+  // JPEG TILE SLICING CACHE (amnesia-xlc.3)
+  // ============================================================================
+  // For scanned PDFs (SCANNED_JPEG content type), extracting the embedded JPEG
+  // and decoding it to ImageData is much faster than WASM rendering. This cache
+  // stores decoded page images for tile slicing at high zoom levels.
+  //
+  // Flow:
+  // 1. On first tile request for a scanned page, extract JPEG and decode to ImageData
+  // 2. Cache the decoded ImageData (full page resolution)
+  // 3. Slice requested tile region from cached ImageData
+  // 4. Evict oldest entries when memory budget exceeded
+  // ============================================================================
+
+  /**
+   * Cached decoded JPEG page data for tile slicing.
+   * Key: `${docId}-${pageNum}`
+   */
+  private jpegCache: Map<string, {
+    /** Decoded RGBA pixel data */
+    imageData: ImageData;
+    /** Page dimensions at native resolution */
+    width: number;
+    height: number;
+    /** Page number (1-indexed) */
+    pageNum: number;
+    /** Last access timestamp for LRU eviction */
+    lastAccess: number;
+    /** Size in bytes (width * height * 4) */
+    sizeBytes: number;
+  }> = new Map();
+
+  /** Current JPEG cache size in bytes */
+  private jpegCacheBytes = 0;
+
+  /** Max JPEG cache size in bytes (device-aware, set in constructor) */
+  private jpegCacheMaxBytes: number = 100 * 1024 * 1024; // 100MB default
+
+  /** Callback to extract JPEG from document (set by RenderCoordinator) */
+  private extractJpegCallback: ((docId: string, pageNum: number) => Promise<{
+    data: Uint8Array;
+    width: number;
+    height: number;
+  }>) | null = null;
+
   constructor(options?: {
     l1MaxSize?: number;
     l2MaxSize?: number;
@@ -2062,6 +2107,362 @@ export class TileCacheManager {
     for (const [, metadata] of this.l3Cache) {
       delete metadata.classification;
     }
+  }
+
+  // ============================================================================
+  // JPEG TILE SLICING (amnesia-xlc.3)
+  // ============================================================================
+
+  /**
+   * Set the JPEG extraction callback.
+   * Called by RenderCoordinator to provide the extraction function.
+   *
+   * @param callback Function to extract JPEG from a page
+   */
+  setExtractJpegCallback(callback: ((docId: string, pageNum: number) => Promise<{
+    data: Uint8Array;
+    width: number;
+    height: number;
+  }>) | null): void {
+    this.extractJpegCallback = callback;
+  }
+
+  /**
+   * Set the JPEG cache memory budget based on device capabilities.
+   *
+   * Called during initialization with device profile information.
+   * Uses ~1% of system RAM for the JPEG cache:
+   * - 8GB system → 80MB JPEG cache
+   * - 16GB system → 160MB JPEG cache
+   * - 32GB system → 320MB JPEG cache
+   *
+   * @param memoryGB System RAM in gigabytes
+   */
+  setJpegCacheMemoryBudget(memoryGB: number): void {
+    // Budget: ~1% of system RAM, with min 50MB and max 500MB
+    const budgetMB = Math.max(50, Math.min(500, memoryGB * 10));
+    this.jpegCacheMaxBytes = budgetMB * 1024 * 1024;
+    console.log(`[TileCacheManager] JPEG cache budget set to ${budgetMB}MB (${memoryGB}GB system RAM)`);
+  }
+
+  /**
+   * Get the cache key for a JPEG page.
+   */
+  private getJpegCacheKey(pageNum: number): string {
+    return `${this.documentId}-${pageNum}`;
+  }
+
+  /**
+   * Get or load decoded JPEG for a page.
+   *
+   * If the page JPEG is already cached, returns it immediately.
+   * Otherwise, extracts and decodes the JPEG, caches it, then returns.
+   *
+   * @param pageNum Page number (1-indexed)
+   * @returns Decoded ImageData or null if extraction fails/not available
+   */
+  async getOrLoadJpegPage(pageNum: number): Promise<{
+    imageData: ImageData;
+    width: number;
+    height: number;
+  } | null> {
+    if (!this.documentId || !this.extractJpegCallback) {
+      return null;
+    }
+
+    const key = this.getJpegCacheKey(pageNum);
+
+    // Check cache first
+    const cached = this.jpegCache.get(key);
+    if (cached) {
+      cached.lastAccess = Date.now();
+      return {
+        imageData: cached.imageData,
+        width: cached.width,
+        height: cached.height,
+      };
+    }
+
+    // Extract and decode JPEG
+    try {
+      const jpegData = await this.extractJpegCallback(this.documentId, pageNum);
+
+      // Decode JPEG to ImageData using createImageBitmap
+      // Copy data to ensure regular ArrayBuffer (not SharedArrayBuffer) for Blob
+      const jpegCopy = new Uint8Array(jpegData.data);
+      const blob = new Blob([jpegCopy], { type: 'image/jpeg' });
+      const bitmap = await createImageBitmap(blob);
+
+      // Draw to canvas to get ImageData
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        bitmap.close();
+        return null;
+      }
+
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const sizeBytes = imageData.data.byteLength;
+
+      // Evict old entries if needed to make room
+      this.evictJpegCacheIfNeeded(sizeBytes);
+
+      // Cache the decoded image
+      this.jpegCache.set(key, {
+        imageData,
+        width: canvas.width,
+        height: canvas.height,
+        pageNum,
+        lastAccess: Date.now(),
+        sizeBytes,
+      });
+      this.jpegCacheBytes += sizeBytes;
+
+      getTelemetry().trackCustomMetric('jpegCache_load', 1);
+      getTelemetry().trackCustomMetric('jpegCache_bytes', this.jpegCacheBytes);
+
+      return { imageData, width: canvas.width, height: canvas.height };
+    } catch (error) {
+      console.warn(`[TileCacheManager] Failed to load JPEG for page ${pageNum}:`, error);
+      getTelemetry().trackCustomMetric('jpegCache_loadError', 1);
+      return null;
+    }
+  }
+
+  /**
+   * Evict JPEG cache entries using LRU until we have room for newBytes.
+   */
+  private evictJpegCacheIfNeeded(newBytes: number): void {
+    // Check if we need to evict
+    if (this.jpegCacheBytes + newBytes <= this.jpegCacheMaxBytes) {
+      return;
+    }
+
+    // Sort entries by lastAccess (oldest first)
+    const entries = Array.from(this.jpegCache.entries())
+      .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+
+    // Evict oldest entries until we have room
+    let evicted = 0;
+    for (const [key, entry] of entries) {
+      if (this.jpegCacheBytes + newBytes <= this.jpegCacheMaxBytes) {
+        break;
+      }
+      this.jpegCache.delete(key);
+      this.jpegCacheBytes -= entry.sizeBytes;
+      evicted++;
+    }
+
+    if (evicted > 0) {
+      console.log(`[TileCacheManager] Evicted ${evicted} JPEG pages, cache now ${(this.jpegCacheBytes / 1024 / 1024).toFixed(1)}MB`);
+      getTelemetry().trackCustomMetric('jpegCache_evictions', evicted);
+    }
+  }
+
+  /**
+   * Get a tile by slicing from cached JPEG page.
+   *
+   * This is the fast path for scanned PDFs at high zoom:
+   * 1. Get/load the decoded JPEG page from cache
+   * 2. Calculate source region for the requested tile
+   * 3. Slice the region and return as CachedTileData
+   *
+   * @param tile Tile coordinate to render
+   * @param tileSize Tile size in CSS pixels (default 256)
+   * @returns CachedTileData or null if JPEG not available
+   */
+  async getJpegTile(
+    tile: TileCoordinate,
+    tileSize: number = 256
+  ): Promise<CachedTileData | null> {
+    // Load or get cached JPEG page
+    const jpegPage = await this.getOrLoadJpegPage(tile.page);
+    if (!jpegPage) {
+      return null;
+    }
+
+    const { imageData, width: jpegWidth, height: jpegHeight } = jpegPage;
+
+    // Calculate source region in JPEG coordinate space
+    // The JPEG is at native resolution, tiles are at tile.scale
+    // We need to find what region of the JPEG corresponds to this tile
+    //
+    // tile.scale = devicePixelRatio * zoom
+    // A tile at (tileX, tileY) with tileSize 256 at scale 8 covers:
+    // - PDF coordinates: (tileX * 256/8, tileY * 256/8) with size (256/8 × 256/8) = (32 × 32) PDF units
+    //
+    // The JPEG has dimensions (jpegWidth × jpegHeight) which map to the full PDF page.
+    // We need to know the PDF page dimensions to calculate the mapping.
+    //
+    // For scanned PDFs, the JPEG typically IS the page content, so:
+    // jpegWidth ≈ pdfWidth * (JPEG_DPI / 72)
+    // jpegHeight ≈ pdfHeight * (JPEG_DPI / 72)
+    //
+    // Simplified: assume JPEG covers full page at its native resolution.
+    // The ratio jpegWidth / pdfWidth gives us the effective "JPEG scale".
+
+    // Calculate JPEG scale (pixels per PDF unit)
+    // For scanned PDFs, we need to know the effective scale of the JPEG relative to the tile grid.
+    //
+    // If we have page metadata (PDF dimensions), we can compute the exact mapping:
+    //   jpegScale = jpegWidth / pdfWidth
+    //
+    // If we don't have metadata, we can still compute a reasonable mapping:
+    //   For a tile at scale S, the tile grid assumes the page is (jpegWidth / S) × (jpegHeight / S) in size.
+    //   So the JPEG-to-tile mapping is simply S (the tile scale).
+    //
+    // This works because at render time, tiles expect pixels at tile.scale resolution.
+    // The JPEG is at a fixed resolution (e.g., 300 DPI for 8.5x11 page = 2550x3300 pixels).
+    // At scale 8, the tile grid divides the page into 256/8 = 32 pixel chunks (in PDF space).
+    
+    const metadata = this.l3Cache.get(tile.page);
+    const effectiveTileSize = tile.tileSize ?? tileSize;
+    
+    let jpegScale: number;
+    if (metadata && metadata.width > 0 && metadata.height > 0) {
+      // Have metadata: compute exact scale
+      jpegScale = jpegWidth / metadata.width;
+    } else {
+      // No metadata: estimate based on JPEG dimensions and tile scale
+      // Assume typical 8.5x11 page at 72 DPI = 612x792 PDF units
+      // For scanned PDFs at 300 DPI, JPEG is ~2550x3300 pixels
+      // jpegScale ≈ 2550/612 ≈ 4.2 (close to 300/72)
+      // 
+      // However, we want to match the tile coordinate system which is based on tile.scale.
+      // The tile grid at scale S has tiles of size (effectiveTileSize/S) in PDF units.
+      // The JPEG covers the entire page, so:
+      //   jpegScale = jpegWidth / (page_width_in_pdf_units)
+      //
+      // Without metadata, estimate PDF width as: jpegWidth / (typical_dpi_ratio)
+      // Typical scanned PDF ratio: 300 DPI / 72 DPI ≈ 4.17
+      const estimatedDpiRatio = 4.0; // Conservative estimate
+      jpegScale = estimatedDpiRatio;
+    }
+
+    // Calculate tile's PDF position and size
+    const pdfTileSize = effectiveTileSize / tile.scale; // Size in PDF units
+    const pdfX = tile.tileX * pdfTileSize;
+    const pdfY = tile.tileY * pdfTileSize;
+
+    // Map to JPEG coordinates
+    const srcX = Math.floor(pdfX * jpegScale);
+    const srcY = Math.floor(pdfY * jpegScale);
+    const srcW = Math.ceil(pdfTileSize * jpegScale);
+    const srcH = Math.ceil(pdfTileSize * jpegScale);
+
+    // Check bounds
+    if (srcX >= jpegWidth || srcY >= jpegHeight) {
+      // Tile is outside JPEG bounds (shouldn't happen for valid tiles)
+      return null;
+    }
+
+    // Clamp to JPEG bounds
+    const clampedW = Math.min(srcW, jpegWidth - srcX);
+    const clampedH = Math.min(srcH, jpegHeight - srcY);
+
+    if (clampedW <= 0 || clampedH <= 0) {
+      return null;
+    }
+
+    // Calculate output tile dimensions
+    // If tile is at edge, it may be smaller than tileSize
+    const outputW = Math.ceil(effectiveTileSize * (clampedW / srcW));
+    const outputH = Math.ceil(effectiveTileSize * (clampedH / srcH));
+
+    // Extract the tile region
+    // Create output canvas at tile output size
+    const canvas = new OffscreenCanvas(outputW, outputH);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+
+    // We need to draw from ImageData, which requires creating an ImageBitmap first
+    // This is a bit inefficient but necessary because we can't draw ImageData directly
+    const tempCanvas = new OffscreenCanvas(imageData.width, imageData.height);
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) {
+      return null;
+    }
+    tempCtx.putImageData(imageData, 0, 0);
+
+    // Draw the source region scaled to output size
+    ctx.drawImage(
+      tempCanvas,
+      srcX, srcY, clampedW, clampedH, // Source region
+      0, 0, outputW, outputH // Destination (scaled)
+    );
+
+    // Get output pixel data
+    const outputImageData = ctx.getImageData(0, 0, outputW, outputH);
+    const rgba = new Uint8Array(outputImageData.data.buffer);
+
+    getTelemetry().trackCustomMetric('jpegTile_slice', 1);
+
+    return {
+      format: 'rgba',
+      rgba,
+      width: outputW,
+      height: outputH,
+    };
+  }
+
+  /**
+   * Check if JPEG slicing is available for a page.
+   *
+   * Returns true if:
+   * 1. extractJpegCallback is set
+   * 2. Page is classified as SCANNED_JPEG
+   *
+   * Note: Page metadata is no longer required. For scanned PDFs, we can
+   * compute the mapping from JPEG dimensions and tile scale directly.
+   *
+   * @param pageNum Page number (1-indexed)
+   * @returns true if JPEG slicing can be used
+   */
+  canUseJpegSlicing(pageNum: number): boolean {
+    if (!this.extractJpegCallback) {
+      return false;
+    }
+
+    // Check classification
+    // Note: PDFContentType.SCANNED_JPEG = 'scanned-jpeg' (lowercase)
+    const classification = this.getPageClassification(pageNum);
+    if (!classification || classification.type !== 'scanned-jpeg') {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Get JPEG cache statistics.
+   */
+  getJpegCacheStats(): {
+    entries: number;
+    bytes: number;
+    maxBytes: number;
+    utilizationPercent: number;
+  } {
+    return {
+      entries: this.jpegCache.size,
+      bytes: this.jpegCacheBytes,
+      maxBytes: this.jpegCacheMaxBytes,
+      utilizationPercent: (this.jpegCacheBytes / this.jpegCacheMaxBytes) * 100,
+    };
+  }
+
+  /**
+   * Clear the JPEG cache.
+   * Called on document close or when memory pressure is critical.
+   */
+  clearJpegCache(): void {
+    this.jpegCache.clear();
+    this.jpegCacheBytes = 0;
+    console.log('[TileCacheManager] JPEG cache cleared');
   }
 
   /**

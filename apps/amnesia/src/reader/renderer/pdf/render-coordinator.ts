@@ -1068,6 +1068,9 @@ export class RenderCoordinator {
   }): void {
     this.classifyPageCallback = callbacks.classifyPage;
     this.extractJpegCallback = callbacks.extractJpeg;
+    
+    // amnesia-xlc.3: Also wire the JPEG callback to TileCacheManager for tile slicing
+    getTileCacheManager().setExtractJpegCallback(callbacks.extractJpeg);
   }
 
   /**
@@ -2008,51 +2011,39 @@ export class RenderCoordinator {
             // Track classification telemetry
             getTelemetry().trackCustomMetric(`render_contentType_${classification.type}`, 1);
 
-            // SCANNED_JPEG fast path: Direct JPEG extraction
-            // 2026-01-24 FIX: DISABLED for tile rendering!
-            // JPEG extraction returns the ENTIRE page JPEG, which is incorrect for tiles.
-            // When this was stored under tile keys, it caused the "checkerboard" visual bug
-            // where full-page bitmaps were drawn at each tile position.
-            // JPEG extraction should ONLY be used for full-page renders (request.type !== 'tile').
-            // For now, disable entirely in tile path until proper tile slicing is implemented.
-            const JPEG_EXTRACTION_ENABLED_FOR_TILES = false; // Set to true when tile slicing is added
+            // SCANNED_JPEG fast path: JPEG tile slicing (amnesia-xlc.3)
+            // For scanned PDFs, extract the embedded JPEG once, cache it, then slice
+            // tiles from the cached decoded image. This is much faster than WASM rendering.
+            //
+            // The old approach extracted the full-page JPEG and cached it under tile keys,
+            // causing the "checkerboard" visual bug. The new approach properly slices
+            // the tile region from the cached full-page decoded ImageData.
+            const JPEG_EXTRACTION_ENABLED_FOR_TILES = isFeatureEnabled('useJpegTileSlicing');
             if (
               JPEG_EXTRACTION_ENABLED_FOR_TILES &&
               strategy.useDirectExtraction &&
               classification.type === PDFContentType.SCANNED_JPEG &&
-              this.extractJpegCallback
+              getTileCacheManager().canUseJpegSlicing(pageNum)
             ) {
               try {
                 const jpegStartTime = performance.now();
-                const jpegData = await this.extractJpegCallback(this.documentId, pageNum);
+                const jpegTile = await getTileCacheManager().getJpegTile(
+                  request.tile,
+                  getTileSize(request.tile.scale)
+                );
                 const jpegDuration = performance.now() - jpegStartTime;
 
-                // Create blob from JPEG data
-                // Copy data to ensure regular ArrayBuffer (not SharedArrayBuffer)
-                const jpegCopy = new Uint8Array(jpegData.data);
-                const jpegBlob = new Blob([jpegCopy], { type: 'image/jpeg' });
-                // Store as 'png' format for cache compatibility (it's still a Blob)
-                cachedData = {
-                  format: 'png',
-                  blob: jpegBlob,
-                  width: jpegData.width,
-                  height: jpegData.height,
-                };
+                if (jpegTile) {
+                  cachedData = jpegTile;
+                  usedFastPath = true;
 
-                // Track fast path telemetry
-                getTelemetry().trackCustomMetric('jpegExtraction_count', 1);
-                getTelemetry().trackCustomMetric('jpegExtraction_time', jpegDuration);
-                usedFastPath = true;
-
-                console.log(
-                  `[RenderCoordinator] JPEG extraction for page ${pageNum}: ${jpegDuration.toFixed(1)}ms`
-                );
+                  // Track fast path telemetry
+                  getTelemetry().trackCustomMetric('jpegTileSlice_count', 1);
+                  getTelemetry().trackCustomMetric('jpegTileSlice_time', jpegDuration);
+                }
               } catch (error) {
-                // Fall back to standard rendering
-                console.warn(
-                  `[RenderCoordinator] JPEG extraction failed for page ${pageNum}, falling back:`,
-                  error
-                );
+                // Fall back to standard rendering - don't log to avoid spam
+                getTelemetry().trackCustomMetric('jpegTileSlice_fallback', 1);
               }
             }
 
@@ -2464,6 +2455,11 @@ export function getRenderCoordinator(): RenderCoordinator {
     const permits = getEffectiveConcurrency();
     console.log(`[RenderCoordinator] Initializing with ${permits} permits`);
     coordinatorInstance = new RenderCoordinator({ maxConcurrent: permits });
+    
+    // amnesia-xlc.3: Set JPEG cache memory budget based on device memory
+    // Use the same detection as concurrency to get system RAM
+    const memoryGB = getDeviceMemoryGB();
+    getTileCacheManager().setJpegCacheMemoryBudget(memoryGB);
   }
   return coordinatorInstance;
 }
@@ -2495,8 +2491,42 @@ export interface ConcurrencyConfig {
 // Cached device-detected concurrency
 let deviceConcurrency: number | null = null;
 
+// Cached device memory in GB
+let cachedDeviceMemoryGB: number | null = null;
+
 // User-configured override (null = use device detection)
 let userConcurrencyOverride: number | null = null;
+
+/**
+ * Get device memory in gigabytes (cached).
+ * Uses navigator.deviceMemory on Chrome, falls back to os.totalmem in Electron.
+ */
+export function getDeviceMemoryGB(): number {
+  if (cachedDeviceMemoryGB !== null) {
+    return cachedDeviceMemoryGB;
+  }
+  
+  let detected = 8; // Default fallback
+  
+  // Try navigator.deviceMemory (Chrome-only)
+  if (typeof navigator !== 'undefined' && (navigator as any).deviceMemory) {
+    detected = (navigator as any).deviceMemory;
+  } else {
+    // Try Node.js os.totalmem (Electron/Node)
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const os = require('os');
+      if (os && typeof os.totalmem === 'function') {
+        detected = os.totalmem() / (1024 * 1024 * 1024);
+      }
+    } catch {
+      // Not in Node.js environment
+    }
+  }
+  
+  cachedDeviceMemoryGB = detected;
+  return cachedDeviceMemoryGB;
+}
 
 /**
  * Detect optimal concurrency based on device capabilities.
