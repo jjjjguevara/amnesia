@@ -682,15 +682,28 @@ export function getRenderStrategy(classification: PageClassification): RenderStr
       };
 
     case PDFContentType.COMPLEX:
+      // amnesia-7vn: Enable scale reduction for complex pages to reduce
+      // render times from 15-28s to ~10-18s at high zoom.
+      // Skip for transparent content as CSS upscaling causes artifacts.
       return {
         useDirectExtraction: false,
-        useScaleReduction: false,
-        scaleReductionFactor: 1,
-        cachePriority: 'low', // Complex pages may not be worth caching
+        useScaleReduction: !classification.hasTransparency,
+        scaleReductionFactor: classification.hasTransparency ? 1 : 1.5,
+        cachePriority: 'normal', // Worth caching with optimization
         renderTextLayer: true,
       };
 
     case PDFContentType.MIXED:
+      // amnesia-7vn: Enable scale reduction for mixed pages.
+      // Skip for transparent content as CSS upscaling causes artifacts.
+      return {
+        useDirectExtraction: false,
+        useScaleReduction: !classification.hasTransparency,
+        scaleReductionFactor: classification.hasTransparency ? 1 : 1.5,
+        cachePriority: 'normal',
+        renderTextLayer: true,
+      };
+
     case PDFContentType.UNKNOWN:
     default:
       return {
