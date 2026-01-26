@@ -2196,6 +2196,15 @@ export class PdfInfiniteCanvas {
     // This ensures buffers always cover at least N complete tiles at high zoom.
     const { renderBuffer, elementBuffer, keepBuffer } = this.calculateBufferSizes(this.camera.z);
 
+    // UNIT FIX (amnesia-aqv): Convert screen-pixel buffers to canvas units.
+    // calculateBufferSizes() returns buffers in SCREEN pixels, but visibleBounds
+    // is in CANVAS coordinates. At zoom 32x, using 64px buffer directly creates
+    // a 64-unit expansion (should be 2 units = 64/32).
+    // This fix aligns with the same conversion in tile-render-engine (line 3540).
+    const zoom = this.camera.z;
+    const renderBufferCanvas = renderBuffer / zoom;
+    const elementBufferCanvas = elementBuffer / zoom;
+
     // O(1) page range calculation based on layout mode
     const { layoutMode, pagesPerRow } = this.config;
     const cellWidth = this.layoutBaseWidth + this.layoutGap;
@@ -2204,10 +2213,10 @@ export class PdfInfiniteCanvas {
 
     // Calculate page ranges for element buffer (largest zone)
     const elementPages = this.calculatePagesInBounds(
-      visibleBounds.x - elementBuffer,
-      visibleBounds.y - elementBuffer,
-      visibleBounds.width + elementBuffer * 2,
-      visibleBounds.height + elementBuffer * 2,
+      visibleBounds.x - elementBufferCanvas,
+      visibleBounds.y - elementBufferCanvas,
+      visibleBounds.width + elementBufferCanvas * 2,
+      visibleBounds.height + elementBufferCanvas * 2,
       layoutMode,
       pagesPerRow,
       cellWidth,
@@ -2217,10 +2226,10 @@ export class PdfInfiniteCanvas {
 
     // Calculate page ranges for render buffer
     const renderPages = this.calculatePagesInBounds(
-      visibleBounds.x - renderBuffer,
-      visibleBounds.y - renderBuffer,
-      visibleBounds.width + renderBuffer * 2,
-      visibleBounds.height + renderBuffer * 2,
+      visibleBounds.x - renderBufferCanvas,
+      visibleBounds.y - renderBufferCanvas,
+      visibleBounds.width + renderBufferCanvas * 2,
+      visibleBounds.height + renderBufferCanvas * 2,
       layoutMode,
       pagesPerRow,
       cellWidth,
@@ -2274,11 +2283,13 @@ export class PdfInfiniteCanvas {
     }
 
     // Remove elements for pages outside keep buffer - only iterate existing elements (small set)
+    // UNIT FIX (amnesia-aqv): Convert keepBuffer to canvas units (same as renderBuffer/elementBuffer)
+    const keepBufferCanvas = keepBuffer / zoom;
     const keepPages = this.calculatePagesInBounds(
-      visibleBounds.x - keepBuffer,
-      visibleBounds.y - keepBuffer,
-      visibleBounds.width + keepBuffer * 2,
-      visibleBounds.height + keepBuffer * 2,
+      visibleBounds.x - keepBufferCanvas,
+      visibleBounds.y - keepBufferCanvas,
+      visibleBounds.width + keepBufferCanvas * 2,
+      visibleBounds.height + keepBufferCanvas * 2,
       layoutMode,
       pagesPerRow,
       cellWidth,
@@ -2659,10 +2670,19 @@ export class PdfInfiniteCanvas {
 
     if (layoutMode === 'vertical') {
       // Single column layout - only need to calculate row range
+      // OVERLAP FIX (amnesia-aqv): For a page at row R to overlap with bounds:
+      // - Page starts at: padding + R * cellHeight
+      // - Page ends at: padding + R * cellHeight + pageHeight (= padding + (R+1) * cellHeight - gap)
+      // 
+      // firstRow: floor((boundsY - padding) / cellHeight) - includes pages whose bottom > boundsY
+      // lastRow: floor((boundsY + boundsHeight - padding) / cellHeight) - only pages whose top < boundsBottom
+      //
+      // Previous bug: Using ceil() for lastRow included pages whose top was ABOVE boundsBottom,
+      // causing pages to be queued but fail the tile overlap check in TileRenderEngine.
       const firstRow = Math.max(0, Math.floor((boundsY - padding) / cellHeight));
       const lastRow = Math.min(
         this.pageCount - 1,
-        Math.ceil((boundsY + boundsHeight - padding) / cellHeight)
+        Math.floor((boundsY + boundsHeight - padding) / cellHeight)
       );
 
       for (let row = firstRow; row <= lastRow; row++) {
@@ -2673,10 +2693,11 @@ export class PdfInfiniteCanvas {
       }
     } else if (layoutMode === 'horizontal') {
       // Single row layout - only need to calculate column range
+      // OVERLAP FIX (amnesia-aqv): Same fix for horizontal mode
       const firstCol = Math.max(0, Math.floor((boundsX - padding) / cellWidth));
       const lastCol = Math.min(
         this.pageCount - 1,
-        Math.ceil((boundsX + boundsWidth - padding) / cellWidth)
+        Math.floor((boundsX + boundsWidth - padding) / cellWidth)
       );
 
       for (let col = firstCol; col <= lastCol; col++) {
@@ -2687,10 +2708,11 @@ export class PdfInfiniteCanvas {
       }
     } else {
       // Grid layout - calculate both row and column ranges
+      // OVERLAP FIX (amnesia-aqv): Same fix for grid mode
       const firstRow = Math.max(0, Math.floor((boundsY - padding) / cellHeight));
-      const lastRow = Math.ceil((boundsY + boundsHeight - padding) / cellHeight);
+      const lastRow = Math.floor((boundsY + boundsHeight - padding) / cellHeight);
       const firstCol = Math.max(0, Math.floor((boundsX - padding) / cellWidth));
-      const lastCol = Math.min(pagesPerRow - 1, Math.ceil((boundsX + boundsWidth - padding) / cellWidth));
+      const lastCol = Math.min(pagesPerRow - 1, Math.floor((boundsX + boundsWidth - padding) / cellWidth));
 
       for (let row = firstRow; row <= lastRow; row++) {
         for (let col = firstCol; col <= lastCol; col++) {
@@ -5254,13 +5276,15 @@ export class PdfInfiniteCanvas {
       const { layoutMode, pagesPerRow, cellWidth, cellHeight, padding } = snapshot;
       // Use consistent buffer calculation with minimum floors (same as updateVisiblePages)
       const { renderBuffer } = this.calculateBufferSizes(snapshot.camera.z);
+      // UNIT FIX (amnesia-aqv): Convert screen-pixel buffer to canvas units
+      const renderBufferCanvas = renderBuffer / snapshot.camera.z;
 
       // Calculate pages that were visible at snapshot time
       const snapshotVisiblePages = this.calculatePagesInBounds(
-        snapshotBounds.x - renderBuffer,
-        snapshotBounds.y - renderBuffer,
-        snapshotBounds.width + renderBuffer * 2,
-        snapshotBounds.height + renderBuffer * 2,
+        snapshotBounds.x - renderBufferCanvas,
+        snapshotBounds.y - renderBufferCanvas,
+        snapshotBounds.width + renderBufferCanvas * 2,
+        snapshotBounds.height + renderBufferCanvas * 2,
         layoutMode,
         pagesPerRow,
         cellWidth,
