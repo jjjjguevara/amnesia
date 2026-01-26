@@ -271,9 +271,9 @@ export class TileRenderEngine {
     //
     // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), high scales produce
     // tiles that exceed GPU limits. Cap scale so tile pixels ≤ 8192.
-    // 8192 allows scale 16 with 512px tiles, covering most mid-zoom levels.
-    // Example: At scale 16 with 512px tiles = 8192px (within modern Canvas 2D limits)
-    const MAX_TILE_PIXELS = 8192;
+    // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles.
+    // 4096 allows scale 8 with 512px tiles, scale 16 with 256px, scale 32 with 128px.
+    const MAX_TILE_PIXELS = 4096;
     const tileSize = this.getTileSizeForZoom(zoom);
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     const rawScale = scale ?? Math.max(1, Math.ceil(zoom));

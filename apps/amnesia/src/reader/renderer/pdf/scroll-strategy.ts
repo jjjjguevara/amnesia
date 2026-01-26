@@ -333,8 +333,8 @@ export class ScrollStrategy {
 
     // TILE PIXEL CAP FIX (amnesia-d9f): Apply same cap as renderPageTiled.
     // With 512px tiles at scale 32, each tile would be 16384px which exceeds GPU limits.
-    // Cap scale so tile pixels ≤ MAX_TILE_PIXELS (8192).
-    const MAX_TILE_PIXELS = 8192;
+    // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles.
+    const MAX_TILE_PIXELS = 4096;
     const tileSize = getTileSize(zoom);
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     const finalScale = Math.min(rawScale, maxScaleForTileSize);

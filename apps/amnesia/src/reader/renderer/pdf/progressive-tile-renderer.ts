@@ -35,14 +35,79 @@ import { getTelemetry } from './pdf-telemetry';
 import { getSystemProfiler, type DeviceTier } from './system-profiler';
 
 /**
- * Discrete scale levels for multi-resolution rendering.
+ * Scale tier configurations for A/B testing.
+ * 
+ * Different tier strategies have tradeoffs:
+ * - Powers of 2: Better cache efficiency (fewer entries), matches GPU hardware
+ * - Fine-grained: Smoother zoom transitions, more cache entries
+ */
+export const SCALE_TIER_CONFIGS = {
+  /**
+   * Powers of 2 only (legacy, GPU-optimal).
+   * Fewer cache entries, aligns with GPU texture sizes.
+   * Larger jumps (2x) during zoom can feel jarring.
+   */
+  POWER_OF_2: [1, 2, 4, 8, 16, 32, 64] as const,
+  
+  /**
+   * Fine-grained tiers (current default).
+   * Smoother zoom transitions (1.33x-1.5x jumps).
+   * More cache entries but imperceptible quality transitions.
+   */
+  FINE_GRAINED: [2, 3, 4, 6, 8, 12, 16, 24, 32, 64] as const,
+  
+  /**
+   * Ultra-fine for extreme smoothness testing.
+   * Every integer scale from 1-16, then powers of 2.
+   */
+  ULTRA_FINE: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 64] as const,
+} as const;
+
+export type ScaleTierConfig = keyof typeof SCALE_TIER_CONFIGS;
+
+/**
+ * Active scale tier configuration.
+ * Changed via setScaleTierConfig() for A/B testing.
+ */
+let activeScaleTierConfig: ScaleTierConfig = 'FINE_GRAINED';
+
+/**
+ * Get the current scale tiers.
+ * Use this instead of directly accessing SCALE_TIERS for configurable behavior.
+ */
+export function getScaleTiers(): readonly number[] {
+  return SCALE_TIER_CONFIGS[activeScaleTierConfig];
+}
+
+/**
+ * Set the active scale tier configuration.
+ * 
+ * @param config Configuration name ('POWER_OF_2', 'FINE_GRAINED', 'ULTRA_FINE')
+ * @example
+ * // Switch to powers of 2 for A/B testing
+ * setScaleTierConfig('POWER_OF_2');
+ */
+export function setScaleTierConfig(config: ScaleTierConfig): void {
+  activeScaleTierConfig = config;
+  console.log(`[SCALE-TIERS] Switched to ${config}:`, SCALE_TIER_CONFIGS[config]);
+}
+
+/**
+ * Get the current scale tier configuration name.
+ */
+export function getScaleTierConfig(): ScaleTierConfig {
+  return activeScaleTierConfig;
+}
+
+/**
+ * Scale tiers for progressive rendering (default export for backward compatibility).
  *
- * SMOOTH ZOOM: Tiers are spaced at ~1.5x intervals (instead of 2x) to minimize
- * visible "pops" when transitioning between quality levels. The 2x jumps from
- * [2,4,8,16,32] created noticeable resolution changes during zoom.
+ * NOTE: This is the FINE_GRAINED configuration for backward compatibility.
+ * For configurable behavior, use getScaleTiers() instead.
  *
- * New spacing: [2, 3, 4, 6, 8, 12, 16, 24, 32]
- * - 2→3: 1.5x jump (was 2→4: 2x jump)
+ * Key insight: Large scale jumps (2x, 4x) during pinch zoom create jarring
+ * quality transitions. Finer tiers (1.33x-1.5x jumps) feel smoother:
+ * - 2→3: 1.5x jump
  * - 3→4: 1.33x jump
  * - 4→6: 1.5x jump (was 4→8: 2x jump)
  * - 6→8: 1.33x jump
@@ -50,8 +115,8 @@ import { getSystemProfiler, type DeviceTier } from './system-profiler';
  *
  * This trades slightly more cache entries for imperceptible quality transitions.
  */
-export const SCALE_TIERS = [2, 3, 4, 6, 8, 12, 16, 24, 32, 64] as const;
-export type ScaleTier = (typeof SCALE_TIERS)[number];
+export const SCALE_TIERS = SCALE_TIER_CONFIGS.FINE_GRAINED;
+export type ScaleTier = number;
 
 /**
  * Tile render result from progressive rendering
@@ -108,22 +173,55 @@ const DEFAULT_PHASE_CONFIG: ProgressivePhaseConfig = {
 export const DEFAULT_MAX_SCALE_TIER: ScaleTier = 16;
 
 /**
+ * Maximum tile buffer size in pixels.
+ * 
+ * MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent OOM.
+ * At 8192: scale 64 with 128px tiles = 8192×8192 = 256MB per tile (crashes on 8GB machines)
+ * At 4096: scale 32 with 128px tiles = 4096×4096 = 64MB per tile (safe)
+ * 
+ * This affects maximum achievable scale:
+ * - 512px tiles: max scale = 4096/512 = 8
+ * - 256px tiles: max scale = 4096/256 = 16
+ * - 128px tiles: max scale = 4096/128 = 32
+ * 
+ * IMPORTANT: This MUST match the value in tile-render-engine.ts, render-coordinator.ts,
+ * pdf-infinite-canvas.ts, and scroll-strategy.ts.
+ */
+export const MAX_TILE_PIXELS = 4096;
+
+/**
  * GPU-safe maximum scale tier (absolute cap).
  *
  * Canvas 2D MEMORY: Modern browsers support very large canvases (up to 32767px).
- * With MAX_TILE_PIXELS=8192 and adaptive tile sizing:
- * - 512px tiles @ scale 16 = 8192px (standard)
- * - 256px tiles @ scale 32 = 8192px (high zoom)
- * - 128px tiles @ scale 64 = 8192px (extreme zoom)
+ * With MAX_TILE_PIXELS=4096 and adaptive tile sizing:
+ * - 512px tiles @ scale 8 = 4096px (standard)
+ * - 256px tiles @ scale 16 = 4096px (high zoom)
+ * - 128px tiles @ scale 32 = 4096px (extreme zoom)
  *
- * All produce the same 8192×8192 pixel tiles (~268MB RGBA each).
+ * All produce the same 4096×4096 pixel tiles (~64MB RGBA each).
  *
  * With adaptive tile sizing:
- * - At zoom 16: scale 16, DPR = 1.0 (crisp)
- * - At zoom 24: scale 24, DPR = 1.0 (crisp with 256px tiles)
- * - At zoom 32: scale 32, DPR = 1.0 (crisp with 256px tiles)
+ * - At zoom 8: scale 16, DPR = 2.0 (Retina crisp with 512px tiles)
+ * - At zoom 16: scale 32, DPR = 2.0 (Retina crisp with 256px tiles)
+ * - At zoom 32: scale 32, DPR = 1.0 (non-Retina crisp, Retina 2x stretch)
  */
-export const GPU_SAFE_MAX_SCALE: ScaleTier = 64;
+export const GPU_SAFE_MAX_SCALE: ScaleTier = 32;
+
+/**
+ * Calculate the maximum achievable scale for a given zoom level.
+ * 
+ * This accounts for the MAX_TILE_PIXELS cap that limits how high we can
+ * render based on tile size. Without this, getTargetScaleTier might
+ * return scale 64 when the actual render is capped at 32.
+ * 
+ * @param zoom Current zoom level
+ * @param pixelRatio Device pixel ratio
+ * @returns Maximum achievable scale given tile size constraints
+ */
+export function getMaxScaleForZoom(zoom: number, pixelRatio?: number): number {
+  const tileSize = getAdaptiveTileSize(zoom, pixelRatio);
+  return Math.floor(MAX_TILE_PIXELS / tileSize);
+}
 
 // Cached dynamic max scale tier (computed once per session)
 let cachedDynamicMaxScale: ScaleTier | null = null;
@@ -281,9 +379,12 @@ export function getTargetScaleTier(
   // scale >= zoom × pixelRatio
   const minRequired = zoom * pixelRatio;
 
+  // amnesia-e4i: Use getScaleTiers() for configurable A/B testing
+  const scaleTiers = getScaleTiers();
+  
   // Find the natural tier (smallest tier >= required)
-  let tier: ScaleTier = SCALE_TIERS[0];
-  for (const t of SCALE_TIERS) {
+  let tier: ScaleTier = scaleTiers[0];
+  for (const t of scaleTiers) {
     if (t >= minRequired) {
       tier = t as ScaleTier;
       break;
@@ -319,10 +420,10 @@ export function getTargetScaleTier(
   if (effectiveMaxZoom !== undefined) {
     // Use maxZoom × pixelRatio as the upper bound, capped at highest available tier
     const configuredMaxScale = effectiveMaxZoom * pixelRatio;
-    const highestTier = SCALE_TIERS[SCALE_TIERS.length - 1]; // 32
+    const highestTier = scaleTiers[scaleTiers.length - 1];
     // Find the largest tier that doesn't exceed configuredMaxScale
-    maxScale = SCALE_TIERS[0];
-    for (const t of SCALE_TIERS) {
+    maxScale = scaleTiers[0];
+    for (const t of scaleTiers) {
       if (t <= configuredMaxScale) {
         maxScale = t as ScaleTier;
       } else {
@@ -339,8 +440,14 @@ export function getTargetScaleTier(
   }
 
   // CANVAS 2D MEMORY PROTECTION: Apply absolute cap to prevent OOM.
-  // Raised to 32 (prototype) to allow max-zoom crispness; rely on cache/eviction.
   maxScale = Math.min(maxScale, GPU_SAFE_MAX_SCALE) as ScaleTier;
+  
+  // amnesia-e4i FIX (2026-01-25): Apply MAX_TILE_PIXELS/tileSize cap.
+  // At high zoom with small tiles (128px), max achievable scale is limited by
+  // MAX_TILE_PIXELS (4096). Without this, we might return tier 64 when the
+  // actual render is capped at scale 32, causing compliance check violations.
+  const maxScaleForTileSize = getMaxScaleForZoom(zoom, pixelRatio);
+  maxScale = Math.min(maxScale, maxScaleForTileSize) as ScaleTier;
 
   tier = Math.min(tier, maxScale) as ScaleTier;
 
@@ -939,4 +1046,48 @@ export function resetProgressiveTileRenderer(): void {
     progressiveRendererInstance.cancelAll();
   }
   progressiveRendererInstance = null;
+}
+
+// Expose scale tier configuration API to window for A/B testing
+if (typeof window !== 'undefined') {
+  (window as any).amnesiaScaleTiers = {
+    /**
+     * Get available scale tier configurations.
+     * @returns Object mapping config names to tier arrays
+     */
+    getConfigs: () => ({ ...SCALE_TIER_CONFIGS }),
+    
+    /**
+     * Get the current active configuration.
+     * @returns Config name ('POWER_OF_2', 'FINE_GRAINED', 'ULTRA_FINE')
+     */
+    getActiveConfig: getScaleTierConfig,
+    
+    /**
+     * Get the current scale tiers in use.
+     * @returns Array of scale values
+     */
+    getTiers: getScaleTiers,
+    
+    /**
+     * Set the active configuration for A/B testing.
+     * @param config Config name ('POWER_OF_2', 'FINE_GRAINED', 'ULTRA_FINE')
+     * @example
+     * // Switch to powers of 2
+     * window.amnesiaScaleTiers.setConfig('POWER_OF_2');
+     * // Then reload the PDF to see effect
+     */
+    setConfig: setScaleTierConfig,
+    
+    /**
+     * Log current configuration info to console.
+     */
+    info: () => {
+      console.log('[SCALE-TIERS] Current config:', getScaleTierConfig());
+      console.log('[SCALE-TIERS] Active tiers:', getScaleTiers());
+      console.log('[SCALE-TIERS] Available configs:', Object.keys(SCALE_TIER_CONFIGS));
+      console.log('[SCALE-TIERS] MAX_TILE_PIXELS:', MAX_TILE_PIXELS);
+      console.log('[SCALE-TIERS] GPU_SAFE_MAX_SCALE:', GPU_SAFE_MAX_SCALE);
+    },
+  };
 }

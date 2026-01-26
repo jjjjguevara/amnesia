@@ -35,7 +35,7 @@
 import { getTelemetry } from './pdf-telemetry';
 import type { TileCoordinate, TileScale } from './tile-render-engine';
 import type { RenderFormat } from './mupdf-bridge';
-import { SCALE_TIERS, getDynamicMaxScaleTier, roundScaleForCache, type ScaleTier } from './progressive-tile-renderer';
+import { SCALE_TIERS, getScaleTiers, getDynamicMaxScaleTier, roundScaleForCache, getTargetScaleTier, type ScaleTier } from './progressive-tile-renderer';
 import { getTypedArrayPool } from './typed-array-pool';
 import { isFeatureEnabled } from './feature-flags';
 import { getTileSize } from './tile-render-engine';
@@ -163,17 +163,20 @@ export function validateTileCompliance(
   }
   
   // VIOLATION 4: Scale doesn't match zoom expectation
-  // At zoom Z with pixelRatio 2, expected scale is ~Z*2, quantized
+  // amnesia-e4i FIX (2026-01-25): Use getTargetScaleTier which accounts for:
+  // 1. SCALE_TIERS quantization
+  // 2. GPU_SAFE_MAX_SCALE cap
+  // 3. MAX_TILE_PIXELS/tileSize cap (critical for high zoom)
   // Allow 4x range for fallbacks (e.g., scale 4 at zoom 8 is a 2x fallback)
-  const idealScale = currentZoom * 2; // Assuming pixelRatio 2
-  const quantizedIdeal = quantizeScale(idealScale);
+  const pixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio : 2;
+  const { tier: idealTier } = getTargetScaleTier(currentZoom, pixelRatio);
   const tileScaleForKey = getScaleForCacheKey(tile.scale);
-  const scaleRatio = Math.max(quantizedIdeal, tileScaleForKey) / Math.min(quantizedIdeal, tileScaleForKey);
+  const scaleRatio = Math.max(idealTier, tileScaleForKey) / Math.min(idealTier, tileScaleForKey);
   
   if (scaleRatio > 4 && currentZoom >= 4) {
     violations.push(
       `SCALE_ZOOM_MISMATCH: tile.scale=${tile.scale} is ${scaleRatio.toFixed(1)}x off ` +
-      `from ideal=${quantizedIdeal} at zoom=${currentZoom.toFixed(2)}`
+      `from ideal=${idealTier} at zoom=${currentZoom.toFixed(2)}`
     );
   }
   
@@ -300,7 +303,7 @@ export function quantizeScale(scale: number): number {
   }
 
   // For scales >= 1, find the nearest scale tier
-  // SCALE_TIERS = [2, 3, 4, 6, 8, 12, 16, 24, 32, 64]
+  // amnesia-e4i: Use getScaleTiers() for configurable A/B testing
   // Scale 1-1.5 maps to 1, 1.5-2.5 maps to 2, etc.
   if (scale < 1.5) return 1;
 
@@ -308,9 +311,10 @@ export function quantizeScale(scale: number): number {
   const dynamicMaxScale = getDynamicMaxScaleTier();
   if (scale >= dynamicMaxScale) return dynamicMaxScale;
 
-  // Find closest tier
-  let prevTier: number = SCALE_TIERS[0];
-  for (const tier of SCALE_TIERS) {
+  // Find closest tier using active configuration
+  const scaleTiers = getScaleTiers();
+  let prevTier: number = scaleTiers[0];
+  for (const tier of scaleTiers) {
     // Stop at dynamic max scale
     if (tier > dynamicMaxScale) break;
 

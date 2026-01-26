@@ -202,8 +202,15 @@ export {
   ProgressiveTileRenderer,
   getProgressiveTileRenderer,
   resetProgressiveTileRenderer,
+  // amnesia-e4i: Scale tier configuration API
+  SCALE_TIER_CONFIGS,
+  getScaleTiers,
+  setScaleTierConfig,
+  getScaleTierConfig,
+  MAX_TILE_PIXELS,
+  getMaxScaleForZoom,
 } from './progressive-tile-renderer';
-export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig, ExactScaleResult } from './progressive-tile-renderer';
+export type { ScaleTier, ProgressiveTileResult, ProgressivePhaseConfig, ExactScaleResult, ScaleTierConfig } from './progressive-tile-renderer';
 
 // Zoom Scale Service (unified source of truth - amnesia-aqv)
 // Replaces: ZoomOrchestrator, ZoomStateMachine, ZoomStateManager, ScaleStateManager
@@ -222,8 +229,17 @@ export type {
   TileParams,
 } from './zoom-scale-service';
 
-export { RenderCoordinator, getRenderCoordinator, resetRenderCoordinator } from './render-coordinator';
-export type { RenderRequest, RenderResult, RenderMode, RenderPriority } from './render-coordinator';
+export { 
+  RenderCoordinator, 
+  getRenderCoordinator, 
+  resetRenderCoordinator,
+  // amnesia-e4i: Concurrency configuration API
+  detectDeviceConcurrency,
+  getConcurrencyConfig,
+  setConcurrencyOverride,
+  getEffectiveConcurrency,
+} from './render-coordinator';
+export type { RenderRequest, RenderResult, RenderMode, RenderPriority, ConcurrencyConfig } from './render-coordinator';
 
 // WASM renderer types
 export type { TileRenderResult } from './wasm-renderer';

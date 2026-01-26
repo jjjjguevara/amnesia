@@ -13,6 +13,15 @@
 5. [Zoom Level Matrix](#5-zoom-level-matrix)
 6. [Failure Mode Catalog](#6-failure-mode-catalog)
 7. [Performance Budgets](#7-performance-budgets)
+   - 7.1 [Quality Floor Metrics](#71-quality-floor-metrics)
+   - 7.2 [Preview.app-Inspired Optimizations](#72-previewapp-inspired-optimizations)
+   - 7.3 [Memory Budgets](#73-memory-budgets)
+   - 7.4 [Frame Budget Breakdown](#74-frame-budget-breakdown)
+   - 7.5 [Stage-Aware Tile Performance Targets](#75-stage-aware-tile-performance-targets-amnesia-e4i)
+   - 7.6 [Tile Count Formula](#76-tile-count-formula)
+   - 7.7 [Scale Tier Configuration](#77-scale-tier-configuration)
+   - 7.8 [Concurrency Configuration](#78-concurrency-configuration)
+   - 7.9 [MAX_TILE_PIXELS Constraint](#79-max_tile_pixels-constraint)
 8. [Debugging Protocols](#8-debugging-protocols)
 9. [File Reference Index](#9-file-reference-index)
 10. [Hypothesis Tracking Log](#10-hypothesis-tracking-log)
@@ -465,6 +474,104 @@ const cssHeight = pageHeight * scaleTier;  // 517.647
 ├── Compositing:          <4ms
 └── Buffer:               ~8ms
 ```
+
+### 7.5 Stage-Aware Tile Performance Targets (amnesia-e4i)
+
+The render pipeline operates in distinct stages during user interaction. Each stage has different performance requirements:
+
+| Stage | Description | Queue Limit | Max Tiles/Page | cssStretch Limit | Latency Target |
+|-------|-------------|-------------|----------------|------------------|----------------|
+| **IDLE** | No user input | 400 | 200-300 | 1.0x | N/A |
+| **ACTIVE** | During gesture | 50 | 30 | 8.0x | <16ms |
+| **SETTLING** | Gesture ended, coasting | 150 | 100 | 4.0x | <100ms |
+| **RENDERING** | Final quality render | 300 | 200 | 2.0x | <500ms |
+
+**Key Insights:**
+- During ACTIVE gestures, tile quality is secondary to responsiveness
+- cssStretch up to 8x is acceptable during gestures (user is moving anyway)
+- SETTLING phase allows ~6 frames (100ms) to improve quality
+- RENDERING phase must complete within 500ms for perceived responsiveness
+
+### 7.6 Tile Count Formula
+
+The number of visible tiles for a viewport is calculated as:
+
+```
+visibleTiles = ceil(viewportWidth / tileSize) × ceil(viewportHeight / tileSize)
+```
+
+With prefetch buffer:
+
+```
+prefetchTiles = ceil((viewportWidth + 2×buffer) / tileSize) × ceil((viewportHeight + 2×buffer) / tileSize)
+```
+
+**Example at zoom 16x:**
+- Viewport: 1440×900 screen pixels → 90×56.25 content units
+- Tile size: 256px CSS / scale 32 = 8 content units
+- Visible tiles: ceil(90/8) × ceil(56.25/8) = 12 × 8 = 96 tiles
+- With 1-tile buffer: 14 × 10 = 140 tiles
+
+### 7.7 Scale Tier Configuration
+
+Scale tiers determine the discrete render scales available. Different configurations trade cache efficiency vs. zoom smoothness:
+
+| Config | Tiers | Cache Entries | Smoothness | Use Case |
+|--------|-------|---------------|------------|----------|
+| POWER_OF_2 | [1,2,4,8,16,32,64] | Minimal | 2x jumps (jarring) | GPU-optimal |
+| FINE_GRAINED | [2,3,4,6,8,12,16,24,32,64] | Moderate | 1.3-1.5x jumps | Default |
+| ULTRA_FINE | [1-16,24,32,64] | High | ~1.1x jumps | Testing |
+
+**Console API for A/B Testing:**
+```javascript
+// Check current config
+window.amnesiaScaleTiers.info();
+
+// Switch to powers of 2
+window.amnesiaScaleTiers.setConfig('POWER_OF_2');
+
+// Reload PDF to see effect
+```
+
+### 7.8 Concurrency Configuration
+
+Semaphore permits control how many tiles render concurrently. Device detection sets defaults:
+
+| Device Profile | Cores | RAM | Permits |
+|----------------|-------|-----|---------|
+| High-end | 8+ | 8GB+ | 8 |
+| Mid-range | 4-7 | 4-7GB | 6 |
+| Low-end | 2-3 | <4GB | 4 |
+| Very low | 1 | - | 2 |
+
+**Console API for A/B Testing:**
+```javascript
+// Check current config
+window.amnesiaConcurrency.info();
+
+// Override to 8 permits
+window.amnesiaConcurrency.setPermits(8);
+
+// Reload PDF to see effect
+```
+
+### 7.9 MAX_TILE_PIXELS Constraint
+
+Tiles are capped to prevent GPU memory exhaustion:
+
+```
+MAX_TILE_PIXELS = 4096
+maxScale = MAX_TILE_PIXELS / tileSize
+```
+
+| Tile Size | Max Scale | Max Crisp Zoom (DPR 2) |
+|-----------|-----------|------------------------|
+| 512px | 8 | 4x |
+| 256px | 16 | 8x |
+| 128px | 32 | 16x |
+
+At zoom levels beyond max crisp zoom, cssStretch compensates:
+- Zoom 32x with 128px tiles: scale=32, cssStretch=2.0 (slight softening)
 
 ---
 

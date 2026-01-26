@@ -297,6 +297,15 @@ export class PdfInfiniteCanvas {
   private cumulativePanDistance = 0;
   private lastQueueClearPosition: Point = { x: 0, y: 0 };
 
+  // NAVIGATION RECOVERY FIX: Track "cold" pages that were outside keep buffer.
+  // When pages scroll back into view after being evicted, they need forced re-render
+  // because Chromium's tile manager may have dropped their GPU textures even though
+  // our isRendered flag is still true. Without this, pages appear blank after
+  // high-zoom pan followed by zoom-out scroll.
+  private coldPages: Set<number> = new Set();
+  // Track last known keep buffer pages for cold detection
+  private lastKeepBufferPages: Set<number> = new Set();
+
   // ZOOM SCALE SERVICE (amnesia-aqv): Unified service - single source of truth for:
   // - Zoom state and gesture phase (idle, active, settling, rendering)
   // - Epoch counter (incremented on zoom change, mode change, invalidation)
@@ -622,8 +631,9 @@ export class PdfInfiniteCanvas {
       
       // Calculate the ACTUAL max achievable scale (capped by tile pixel limits)
       // This is the scale tiles will actually be rendered at, not the ideal scale
-      const MAX_TILE_PIXELS = 8192;
-      const tileSize = getTileSize(zoom); // 512, 256, or 128 based on zoom
+      // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles
+      const MAX_TILE_PIXELS = 4096;
+      const tileSize = getTileSize(zoom);
       const maxAchievableScale = Math.min(scale, Math.floor(MAX_TILE_PIXELS / tileSize));
       
       // Start T2HR measurement for diagnostics
@@ -2185,8 +2195,21 @@ export class PdfInfiniteCanvas {
       }
     );
 
-    // Create elements for all pages in element zone
-    for (const page of newRenderPages) {
+    // MEMORY PRESSURE FIX: At high zoom, limit total page elements to prevent
+    // Chromium tile manager memory exhaustion. Each page element at scale 64
+    // creates ~64MB GPU textures. With 6+ elements, we exceed 256MB limit.
+    const maxPageElements = this.camera.z > 16 ? 3 : this.camera.z > 8 ? 6 : 12;
+    
+    // Create elements for pages in element zone, respecting limit
+    // Prioritize visible pages over buffer pages
+    const sortedPages = [...newRenderPages].sort((a, b) => {
+      const aVisible = newVisiblePages.has(a) ? 0 : 1;
+      const bVisible = newVisiblePages.has(b) ? 0 : 1;
+      return aVisible - bVisible;
+    });
+    
+    for (const page of sortedPages) {
+      if (this.pageElements.size >= maxPageElements) break;
       if (!this.pageElements.has(page)) {
         this.createPageElement(page);
       }
@@ -2206,10 +2229,51 @@ export class PdfInfiniteCanvas {
     );
     const keepSet = new Set(keepPages);
 
+    // NAVIGATION RECOVERY FIX: Track cold pages (pages that left the keep buffer).
+    // When pages return to visibility after being cold, force re-render to recover
+    // from Chromium tile manager memory eviction.
+    for (const page of this.lastKeepBufferPages) {
+      if (!keepSet.has(page)) {
+        this.coldPages.add(page);
+      }
+    }
+    this.lastKeepBufferPages = keepSet;
+
+    // Identify pages that were cold and are now visible - force their re-render
+    const rewarmedPages: number[] = [];
+    for (const page of newVisiblePages) {
+      if (this.coldPages.has(page)) {
+        rewarmedPages.push(page);
+        this.coldPages.delete(page);
+        // Clear isRendered flag to force re-render
+        const element = this.pageElements.get(page);
+        if (element) {
+          element.clearRendered();
+          console.log(`[COLD-RECOVERY] Page ${page} rewarmed - forcing re-render after being evicted`);
+        }
+      }
+    }
+
     for (const [page, element] of this.pageElements) {
       if (!keepSet.has(page)) {
         element.destroy();
         this.pageElements.delete(page);
+      }
+    }
+
+    // MEMORY PRESSURE FIX: If we still have too many elements, evict furthest from center
+    if (this.pageElements.size > maxPageElements) {
+      const centerPage = this.getCurrentPage();
+      const sortedByDistance = [...this.pageElements.entries()]
+        .filter(([p]) => !newVisiblePages.has(p)) // Don't evict visible pages
+        .sort((a, b) => Math.abs(b[0] - centerPage) - Math.abs(a[0] - centerPage));
+      
+      while (this.pageElements.size > maxPageElements && sortedByDistance.length > 0) {
+        const [page, element] = sortedByDistance.shift()!;
+        console.log(`[MEMORY-PRESSURE] Evicting page ${page} (distance ${Math.abs(page - centerPage)} from center ${centerPage})`);
+        element.destroy();
+        this.pageElements.delete(page);
+        this.coldPages.add(page); // Mark as cold for recovery when visible again
       }
     }
 
@@ -2222,10 +2286,16 @@ export class PdfInfiniteCanvas {
         immediateNeighbors.push(neighborPage);
       }
     }
+    // Add rewarmed pages to priority queue for immediate re-render
+    for (const page of rewarmedPages) {
+      if (!immediateNeighbors.includes(page)) {
+        immediateNeighbors.push(page);
+      }
+    }
 
     this.visiblePages = newVisiblePages;
 
-    // Queue rendering with priority for immediate neighbors
+    // Queue rendering with priority for immediate neighbors (includes rewarmed pages)
     this.queueRenderWithPriority(immediateNeighbors, [...newRenderPages]);
 
     // Prefetch pages based on display mode:
@@ -2313,10 +2383,11 @@ export class PdfInfiniteCanvas {
     // ADAPTIVE TILE SIZE: With useAdaptiveTileSize feature flag:
     // - zoom <= 16: 512px tiles → max scale 16 (8192/512)
     // - zoom <= 32: 256px tiles → max scale 32 (8192/256)
-    // - zoom > 32:  128px tiles → max scale 64 (8192/128)
-    // This allows crisp rendering at all zoom levels by using smaller tiles at high zoom.
-    const MAX_TILE_SCALE = 64; // Increased to allow 128px tiles at extreme zoom
-    const MAX_TILE_PIXELS = 8192;
+    // - zoom > 32:  128px tiles → max scale 32 (4096/128)
+    // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles
+    // At zoom 32x, cssStretch will be 2x (slight blur) but rendering is much faster.
+    const MAX_TILE_SCALE = 32; // Reduced from 64 to match MAX_TILE_PIXELS cap
+    const MAX_TILE_PIXELS = 4096;
     const tileSize = getTileSize(zoom); // Returns 512, 256, or 128 based on zoom
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     const rawScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
@@ -3246,9 +3317,9 @@ export class PdfInfiniteCanvas {
       }
 
       // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), scale 32 produces
-      // 16384px tiles which exceed GPU limits. Cap scale so tile pixels ≤ 8192.
-      // 8192 allows scale 16 with 512px tiles, covering most mid-zoom levels.
-      const MAX_TILE_PIXELS = 8192;
+      // 16384px tiles which exceed GPU limits. Cap scale so tile pixels ≤ 4096.
+      // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles.
+      const MAX_TILE_PIXELS = 4096;
       const tileSize = getTileSize(zoom);
       const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
       const tileScale = Math.min(rawTileScale, maxScaleForTileSize);
@@ -3460,9 +3531,20 @@ export class PdfInfiniteCanvas {
         // At high zoom (e.g., 16x with scale 32), a single page can require 4704 tiles.
         // This floods the queue and causes most tiles to be dropped.
         // Limit to the most important tiles (center of viewport first).
-        const maxTilesPerPage = this.renderCoordinator?.getMaxTilesPerPage() ?? 0;
-        if (maxTilesPerPage > 0 && tiles.length > maxTilesPerPage) {
-          console.warn(`[TILE-LIMIT] page=${page} zoom=${zoom.toFixed(2)}: Limiting from ${tiles.length} to ${maxTilesPerPage} tiles (policy limit)`);
+        //
+        // DIRECT FIX: Apply zoom-based limit here instead of relying on render coordinator,
+        // because the coordinator's currentZoom may not be updated at the time of render.
+        const coordinatorLimit = this.renderCoordinator?.getMaxTilesPerPage() ?? 0;
+        const zoomBasedLimit = zoom >= 32 ? 50 : zoom >= 16 ? 100 : zoom >= 8 ? 150 : Infinity;
+        const maxTilesPerPage = coordinatorLimit > 0 ? Math.min(coordinatorLimit, zoomBasedLimit) : zoomBasedLimit;
+        
+        // Ensure we have a sensible limit (use 200 as fallback if Infinity)
+        const effectiveLimit = Number.isFinite(maxTilesPerPage) ? maxTilesPerPage : 200;
+        
+        console.log(`[TILE-LIMIT-DIRECT] page=${page} zoom=${zoom.toFixed(2)}: coordLimit=${coordinatorLimit}, zoomLimit=${zoomBasedLimit}, effective=${effectiveLimit}, tiles=${tiles.length}`);
+        
+        if (effectiveLimit > 0 && tiles.length > effectiveLimit) {
+          console.warn(`[TILE-LIMIT] page=${page} zoom=${zoom.toFixed(2)}: Limiting from ${tiles.length} to ${effectiveLimit} tiles (zoom-based limit)`);
           // Sort tiles by distance from viewport center, keep closest
           const viewportCenterX = viewport.x + viewport.width / 2;
           const viewportCenterY = viewport.y + viewport.height / 2;
@@ -3476,7 +3558,7 @@ export class PdfInfiniteCanvas {
             const bDist = Math.hypot(bCenterX - viewportCenterX, bCenterY - viewportCenterY);
             return aDist - bDist;
           });
-          tiles = tiles.slice(0, maxTilesPerPage);
+          tiles = tiles.slice(0, effectiveLimit);
         }
 
         // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
@@ -3575,6 +3657,13 @@ export class PdfInfiniteCanvas {
         
         console.log(`[TransformSnapshot] EXPECTED-BOUNDS page=${page}: bounds=${boundsX.toFixed(1)},${boundsY.toFixed(1)} ${boundsWidth.toFixed(1)}x${boundsHeight.toFixed(1)}, tiles=[${minTileX}-${maxTileX}]x[${minTileY}-${maxTileY}], pdfTileSize=${pdfTileSize.toFixed(1)}`);
       }
+      
+      // amnesia-e4i FIX (2026-01-25): Record requested tile count for accurate coverage calculation.
+      // At high zoom, tiles are limited to prevent queue overflow. The coverage check in
+      // pdf-page-element.ts needs to know this expected count to avoid false positives.
+      // Without this, coverage calculation uses tile bounding box (e.g., 63×48 = 3024) when
+      // only 100 tiles were intentionally sent, resulting in 3.3% "coverage" = false positive.
+      transformSnapshot.requestedTileCount = tiles.length;
 
       if (tiles.length === 0) {
         // No tiles calculated - check if page is actually in viewport
@@ -3707,8 +3796,14 @@ export class PdfInfiniteCanvas {
           // - White gaps in text are far worse than slightly blurry areas
           // - The exact-scale tiles will arrive shortly and overdraw the blurry fallback
           // - 8x stretch is visible blur but still readable, gaps are not
+          //
+          // REGRESSION FIX (amnesia-e4i): Dynamic stretch limit based on zoom level.
+          // At zoom 32x with only scale 2 cached, cssStretch would be 16x.
+          // The 8x limit rejected ALL tiles, causing blank pages during pan.
+          // Solution: At very high zoom, accept even blurry content - blank is worse.
           const cssStretch = result.cssStretch ?? 1.0;
-          const MAX_FALLBACK_STRETCH = 8.0;
+          // At zoom 32x+ accept up to 32x stretch, at zoom 16x+ accept 16x, else 8x
+          const MAX_FALLBACK_STRETCH = zoom >= 32 ? 32.0 : zoom >= 16 ? 16.0 : 8.0;
           const isStretchTooLarge = cssStretch > MAX_FALLBACK_STRETCH;
 
           if (isStretchTooLarge) {
@@ -5525,7 +5620,51 @@ export class PdfInfiniteCanvas {
     this.thumbnailSuspensionResumeTimeout = setTimeout(() => {
       this.thumbnailSuspensionResumeTimeout = null;
       this.provider.resumeThumbnailGeneration?.();
+      
+      // NAVIGATION RECOVERY: Check for blank visible pages after interaction ends.
+      // This catches cases where Chromium evicted GPU textures but our isRendered
+      // flag is still true. Schedule after a short delay to let renders settle.
+      setTimeout(() => this.recoverBlankPages(), 200);
     }, this.THUMBNAIL_SUSPENSION_RESUME_DELAY);
+  }
+
+  /**
+   * NAVIGATION RECOVERY: Detect and recover blank visible pages.
+   * 
+   * Chromium's tile manager may evict GPU textures when memory is pressured
+   * (e.g., during high-zoom pan). Our JavaScript isRendered flag doesn't know
+   * about this eviction. This method:
+   * 1. Checks each visible page for actual content
+   * 2. Forces re-render if canvas appears blank despite isRendered=true
+   * 
+   * Called after interaction ends and periodically during idle.
+   */
+  private recoverBlankPages(): void {
+    // Don't recover during active gestures
+    if (!this.zoomScaleService.canRender()) return;
+    
+    const blankPages: number[] = [];
+    
+    for (const page of this.visiblePages) {
+      const element = this.pageElements.get(page);
+      if (!element) continue;
+      
+      // Check if page claims to be rendered but has no actual content
+      // hasRenderedContent() checks both isRendered AND canvas dimensions
+      const claimsRendered = element.getIsRendered();
+      const hasContent = element.hasRenderedContent();
+      
+      if (claimsRendered && !hasContent) {
+        blankPages.push(page);
+        element.clearRendered();
+        console.log(`[BLANK-RECOVERY] Page ${page} appears blank despite isRendered=true - forcing re-render`);
+      }
+    }
+    
+    if (blankPages.length > 0) {
+      // Force immediate re-render of blank pages
+      this.queueRenderWithPriority(blankPages, blankPages, true);
+    }
   }
 
   /**

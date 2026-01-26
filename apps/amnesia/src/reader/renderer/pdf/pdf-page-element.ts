@@ -107,6 +107,16 @@ export interface TransformSnapshot {
     width: number;
     height: number;
   };
+  
+  /**
+   * Number of tiles requested at request time (after limiting).
+   * Used for accurate coverage calculation in viewport-only mode.
+   * 
+   * amnesia-e4i FIX (2026-01-25): At high zoom, tiles are limited to prevent
+   * queue overflow (e.g., 100 tiles instead of 3024). The coverage calculation
+   * needs to know this limit to avoid false positives.
+   */
+  requestedTileCount?: number;
 }
 
 /**
@@ -1472,20 +1482,43 @@ export class PdfPageElement {
     // When many tiles are dropped from the render queue, we get sparse coverage.
     // Preserving old content with sparse new tiles causes mixed old/new corruption.
     //
-    // amnesia-rwe FIX: In VIEWPORT-ONLY mode (high zoom), expected tile count should be
-    // based on the VIEWPORT tile range, not the full canvas. At 32x zoom, the canvas
-    // might be sized for 720 tiles but we only REQUEST ~200 tiles for the visible area.
+    // amnesia-e4i FIX (2026-01-25): In VIEWPORT-ONLY mode (high zoom), expected tile count
+    // must be calculated from the VIEWPORT SIZE in PDF coordinates, NOT from the tile
+    // bounding box. The previous logic used (maxTileX - minTileX + 1) × (maxTileY - minTileY + 1)
+    // which gives the bounding box of potentially sparse tiles.
     //
-    // Calculate expected tiles from the actual tile range, not canvas size:
+    // Example at zoom 17x:
+    // - Viewport intersects a small region → 100 tiles generated
+    // - Tiles span coordinates (0,0) to (62,47) → bounding box = 63×48 = 3024
+    // - But expected should be ~100 (viewport size / tile size)
+    // - Result: 100/3024 = 3.3% coverage = false positive incomplete coverage
+    //
+    // Fix: Use transformSnapshot.expectedTileBounds (viewport in PDF coords) to calculate
+    // the expected tile count, matching how getVisibleTiles() generates tiles.
     const tileSizePixels = pdfTileSize * tileScale;
     const isViewportOnlyMode = zoom > 16;
     
     let expectedTileCount: number;
     if (isViewportOnlyMode && tiles.length > 0) {
-      // Calculate expected from the tile range that was requested
-      const tileRangeX = maxTileX - minTileX + 1;
-      const tileRangeY = maxTileY - minTileY + 1;
-      expectedTileCount = tileRangeX * tileRangeY;
+      // amnesia-e4i FIX (2026-01-25): Use requestedTileCount from snapshot for accurate coverage.
+      // At high zoom, tiles are intentionally limited (e.g., 100 of 3024) to prevent queue overflow.
+      // Using the tile bounding box would give 3024 expected → 3.3% coverage = false positive.
+      // Using requestedTileCount gives 100 expected → 100% coverage = correct.
+      if (transformSnapshot?.requestedTileCount !== undefined) {
+        // Use the exact count that was requested (most accurate)
+        expectedTileCount = transformSnapshot.requestedTileCount;
+      } else if (transformSnapshot?.expectedTileBounds) {
+        // Fallback: Calculate from viewport bounds in PDF coordinates
+        const viewportPdfWidth = transformSnapshot.expectedTileBounds.width;
+        const viewportPdfHeight = transformSnapshot.expectedTileBounds.height;
+        const expectedTileCountX = Math.ceil(viewportPdfWidth / pdfTileSize);
+        const expectedTileCountY = Math.ceil(viewportPdfHeight / pdfTileSize);
+        expectedTileCount = expectedTileCountX * expectedTileCountY;
+      } else {
+        // Last resort: In viewport-only mode without snapshot, tiles ARE the viewport
+        // Accept what we got as 100% coverage (can't calculate expected without bounds)
+        expectedTileCount = tiles.length;
+      }
     } else {
       // Full-canvas coverage for lower zoom levels
       const expectedTileCountX = Math.ceil(canvasWidth / tileSizePixels);
@@ -1505,10 +1538,20 @@ export class PdfPageElement {
 
     // Always log coverage calculation at mid-zoom for debugging
     if (zoom >= 4) {
-      const tileRangeInfo = isViewportOnlyMode && tiles.length > 0
-        ? `tileRange=${maxTileX - minTileX + 1}x${maxTileY - minTileY + 1}`
-        : `canvas=${canvasWidth}x${canvasHeight}`;
-      console.error(`[COVERAGE-CALC] page=${this.config.pageNumber}: ${tileRangeInfo}, tileSizePixels=${tileSizePixels.toFixed(1)}, expected=${expectedTileCount}, actual=${actualTileCount}, coverage=${coveragePercent.toFixed(1)}%, incomplete=${hasIncompleteCoverage}, viewportOnly=${isViewportOnlyMode}`);
+      let tileRangeInfo: string;
+      if (isViewportOnlyMode && tiles.length > 0) {
+        if (transformSnapshot?.requestedTileCount !== undefined) {
+          tileRangeInfo = `requestedCount=${transformSnapshot.requestedTileCount}`;
+        } else if (transformSnapshot?.expectedTileBounds) {
+          const vp = transformSnapshot.expectedTileBounds;
+          tileRangeInfo = `viewportPdf=${vp.width.toFixed(0)}x${vp.height.toFixed(0)}`;
+        } else {
+          tileRangeInfo = `noSnapshot(tiles=${tiles.length})`;
+        }
+      } else {
+        tileRangeInfo = `canvas=${canvasWidth}x${canvasHeight}`;
+      }
+      console.log(`[COVERAGE-CALC] page=${this.config.pageNumber}: ${tileRangeInfo}, pdfTileSize=${pdfTileSize.toFixed(1)}, expected=${expectedTileCount}, actual=${actualTileCount}, coverage=${coveragePercent.toFixed(1)}%, incomplete=${hasIncompleteCoverage}, viewportOnly=${isViewportOnlyMode}`);
     }
 
     if (hasIncompleteCoverage && zoom >= 4) {

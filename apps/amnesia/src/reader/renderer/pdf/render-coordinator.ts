@@ -88,6 +88,19 @@ export interface SemaphorePolicy {
  * During idle, we can prefetch and build up the cache.
  */
 export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): SemaphorePolicy {
+  // amnesia-e4i FIX: Apply zoom-based tile limits to ALL phases, not just idle.
+  // At extreme zoom (32x), each tile takes 500ms+ to render.
+  // Even during 'rendering' phase, 200 tiles × 500ms = 100 seconds is too long.
+  // 
+  // The zoom-based limit is the UPPER BOUND - phase-based limits can be lower.
+  // zoom >= 32: max 50 tiles (5s at 100ms/tile)
+  // zoom >= 16: max 100 tiles (10s at 100ms/tile)
+  // zoom >= 8: max 150 tiles (15s at 100ms/tile)
+  // zoom < 8: no zoom-based limit
+  const zoomBasedMax = zoom >= 32 ? 50 : 
+                       zoom >= 16 ? 100 : 
+                       zoom >= 8 ? 150 : Infinity;
+
   switch (gesturePhase) {
     case 'active':
       // During active zoom/pan: very aggressive
@@ -96,7 +109,7 @@ export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): Se
         maxQueueSize: 50,
         viewportOnlyThreshold: 2, // Always use viewport-only during gestures
         dropBehavior: 'aggressive',
-        maxTilesPerPage: 30, // Cap tiles per page
+        maxTilesPerPage: Math.min(30, zoomBasedMax),
       };
     
     case 'settling':
@@ -106,30 +119,23 @@ export function getSemaphorePolicy(gesturePhase: GesturePhase, zoom: number): Se
         maxQueueSize: 150,
         viewportOnlyThreshold: 4,
         dropBehavior: 'moderate',
-        maxTilesPerPage: 100,
+        maxTilesPerPage: Math.min(100, zoomBasedMax),
       };
     
     case 'rendering':
       // Settled, actively rendering final tiles
-      // Position stable, can render more
+      // Position stable, can render more - BUT respect zoom-based limit
       return {
         maxQueueSize: 300,
         viewportOnlyThreshold: 8,
         dropBehavior: 'moderate',
-        maxTilesPerPage: 200,
+        maxTilesPerPage: Math.min(200, zoomBasedMax),
       };
     
     case 'idle':
     default:
       // Fully idle, can prefetch and build cache
-      // amnesia-e4i FIX: Reduced threshold from 16 to 8 because at zoom 16 with
-      // scale 32, a full-page render can require 4704 tiles (56×84 grid).
-      // At zoom 8 with scale 16, it's ~1176 tiles (28×42) - still high but manageable.
-      // Also added maxTilesPerPage limit that scales inversely with zoom.
-      //
-      // At extreme zoom (32x), each tile can take 500ms+ to render.
-      // 300 tiles × 500ms = 150 seconds! Way too long.
-      // Scale the limit inversely: zoom 8 = 200, zoom 16 = 100, zoom 32 = 50
+      // Use zoom-based limit directly
       const maxTiles = zoom >= 32 ? 50 : 
                        zoom >= 16 ? 100 : 
                        zoom >= 8 ? 200 : 300;
@@ -160,8 +166,12 @@ export function setGesturePhase(phase: GesturePhase): void {
     // Update semaphore policy
     const coordinator = getRenderCoordinatorInstance();
     if (coordinator) {
-      const policy = getSemaphorePolicy(phase, coordinator.getCurrentZoom?.() ?? 1);
+      const currentZoom = coordinator.getCurrentZoom?.() ?? 1;
+      const policy = getSemaphorePolicy(phase, currentZoom);
+      console.log(`[PHASE-CHANGE-POLICY] phase=${phase}, zoom=${currentZoom.toFixed(2)}, maxTilesPerPage=${policy.maxTilesPerPage}`);
       coordinator.updateSemaphorePolicy(policy);
+    } else {
+      console.warn(`[PHASE-CHANGE-POLICY] NO COORDINATOR for phase=${phase} - policy NOT updated!`);
     }
   }
 }
@@ -591,6 +601,8 @@ export class RenderCoordinator {
    * Called when gesture phase changes or zoom level changes significantly.
    */
   updateSemaphorePolicy(policy: SemaphorePolicy): void {
+    const stack = new Error().stack?.split('\n').slice(1, 4).join(' <- ') || 'no stack';
+    console.log(`[POLICY-UPDATE-CALLER] maxTilesPerPage=${policy.maxTilesPerPage}, caller: ${stack}`);
     const oldPolicy = this.currentPolicy;
     this.currentPolicy = policy;
     
@@ -657,11 +669,34 @@ export class RenderCoordinator {
   }
 
   /**
-   * Get max tiles per page based on current policy.
-   * Returns 0 for no limit (idle state).
+   * Get max tiles per page based on current policy AND current zoom.
+   * 
+   * amnesia-e4i FIX: Compute zoom-based limit dynamically instead of relying
+   * on cached policy. This fixes the issue where policy updates during
+   * gesture phase transitions weren't being applied correctly during render.
+   * 
+   * The issue: During `settling → rendering` transition, the policy update
+   * might not have propagated by the time `renderPageTiled()` calls this method.
+   * By computing the zoom limit here, we guarantee correct behavior regardless
+   * of policy update timing.
+   * 
+   * Returns Infinity for no limit.
    */
   getMaxTilesPerPage(): number {
-    return this.currentPolicy.maxTilesPerPage;
+    // Compute zoom-based limit dynamically (mirrors getSemaphorePolicy logic)
+    const zoomLimit = this.currentZoom >= 32 ? 50 : 
+                      this.currentZoom >= 16 ? 100 : 
+                      this.currentZoom >= 8 ? 150 : Infinity;
+    
+    // Return the stricter of policy limit and zoom limit
+    const effectiveLimit = Math.min(this.currentPolicy.maxTilesPerPage, zoomLimit);
+    
+    // Debug log to verify fix is working
+    if (this.currentZoom >= 8) {
+      console.log(`[getMaxTilesPerPage] zoom=${this.currentZoom.toFixed(2)}, policyLimit=${this.currentPolicy.maxTilesPerPage}, zoomLimit=${zoomLimit}, effective=${effectiveLimit}`);
+    }
+    
+    return effectiveLimit;
   }
 
   // ============================================================
@@ -1760,8 +1795,13 @@ export class RenderCoordinator {
 
     // TILE PIXEL CAP FIX (amnesia-d9f): Apply same cap as renderPageTiled.
     // With 512px tiles at scale 32, each tile would be 16384px which exceeds GPU limits.
-    // Cap scale so tile pixels ≤ MAX_TILE_PIXELS (8192).
-    const MAX_TILE_PIXELS = 8192;
+    // Cap scale so tile pixels ≤ MAX_TILE_PIXELS.
+    //
+    // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096.
+    // At 8192: 128px tile × scale 64 = 8192px = 256MB per tile (causes 7+ second render times)
+    // At 4096: 128px tile × scale 32 = 4096px = 64MB per tile (much faster rendering)
+    // This means zoom 32x will have cssStretch=2x (slight blur) but remains responsive.
+    const MAX_TILE_PIXELS = 4096;
     const tileSize = getTileSize(zoom);
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     scale = Math.min(scale, maxScaleForTileSize);
@@ -2349,7 +2389,10 @@ let coordinatorInstance: RenderCoordinator | null = null;
  */
 export function getRenderCoordinator(): RenderCoordinator {
   if (!coordinatorInstance) {
-    coordinatorInstance = new RenderCoordinator();
+    // amnesia-e4i Phase 4: Use device-detected concurrency
+    const permits = getEffectiveConcurrency();
+    console.log(`[RenderCoordinator] Initializing with ${permits} permits`);
+    coordinatorInstance = new RenderCoordinator({ maxConcurrent: permits });
   }
   return coordinatorInstance;
 }
@@ -2362,4 +2405,150 @@ export function resetRenderCoordinator(): void {
     coordinatorInstance.cancelAll();
   }
   coordinatorInstance = null;
+}
+
+// ============================================================
+// Device-Aware Concurrency (amnesia-e4i Phase 4)
+// ============================================================
+
+/**
+ * Concurrency configuration for A/B testing.
+ */
+export interface ConcurrencyConfig {
+  /** Number of concurrent render permits */
+  permits: number;
+  /** How the value was determined */
+  source: 'device-detected' | 'user-configured' | 'default';
+}
+
+// Cached device-detected concurrency
+let deviceConcurrency: number | null = null;
+
+// User-configured override (null = use device detection)
+let userConcurrencyOverride: number | null = null;
+
+/**
+ * Detect optimal concurrency based on device capabilities.
+ * 
+ * Heuristics:
+ * - Uses navigator.hardwareConcurrency (CPU cores)
+ * - Uses navigator.deviceMemory (RAM in GB, Chrome only)
+ * - Clamps between 2 and 8 permits
+ * 
+ * @returns Optimal number of concurrent renders
+ */
+export function detectDeviceConcurrency(): number {
+  if (deviceConcurrency !== null) {
+    return deviceConcurrency;
+  }
+  
+  const cores = typeof navigator !== 'undefined' 
+    ? navigator.hardwareConcurrency || 4 
+    : 4;
+    
+  // navigator.deviceMemory is Chrome-only, returns RAM in GB
+  const memoryGB = typeof navigator !== 'undefined'
+    ? (navigator as any).deviceMemory || 4
+    : 4;
+    
+  // Heuristics:
+  // - 8+ cores and 8+ GB RAM: 8 permits (high-end desktop/laptop)
+  // - 4-7 cores or 4-7 GB RAM: 6 permits (mid-range)
+  // - 2-3 cores or <4 GB RAM: 4 permits (low-end/mobile)
+  // - 1 core: 2 permits (very low-end)
+  
+  let permits: number;
+  if (cores >= 8 && memoryGB >= 8) {
+    permits = 8;
+  } else if (cores >= 4 && memoryGB >= 4) {
+    permits = 6;
+  } else if (cores >= 2) {
+    permits = 4;
+  } else {
+    permits = 2;
+  }
+  
+  console.log(`[DEVICE-CONCURRENCY] Detected: cores=${cores}, memory=${memoryGB}GB → permits=${permits}`);
+  deviceConcurrency = permits;
+  return permits;
+}
+
+/**
+ * Get the current concurrency configuration.
+ */
+export function getConcurrencyConfig(): ConcurrencyConfig {
+  if (userConcurrencyOverride !== null) {
+    return { permits: userConcurrencyOverride, source: 'user-configured' };
+  }
+  return { permits: detectDeviceConcurrency(), source: 'device-detected' };
+}
+
+/**
+ * Set the concurrency override for A/B testing.
+ * 
+ * @param permits Number of permits (2-12), or null to use device detection
+ * @example
+ * // Test with 8 concurrent renders
+ * window.amnesiaConcurrency.setPermits(8);
+ * // Then reload the PDF to see effect
+ */
+export function setConcurrencyOverride(permits: number | null): void {
+  if (permits !== null) {
+    permits = Math.max(2, Math.min(12, permits)); // Clamp between 2-12
+  }
+  userConcurrencyOverride = permits;
+  console.log(`[CONCURRENCY] Override set to: ${permits ?? 'device-detected'}`);
+  
+  // Note: Existing coordinator will continue using old value.
+  // User needs to reload PDF for change to take effect.
+  // To apply immediately, we'd need to expose semaphore.setPermits()
+}
+
+/**
+ * Get the effective concurrency (used when creating coordinator).
+ */
+export function getEffectiveConcurrency(): number {
+  const config = getConcurrencyConfig();
+  return config.permits;
+}
+
+// Expose concurrency configuration API to window for A/B testing
+if (typeof window !== 'undefined') {
+  (window as any).amnesiaConcurrency = {
+    /**
+     * Get the current concurrency configuration.
+     * @returns Object with permits and source
+     */
+    getConfig: getConcurrencyConfig,
+    
+    /**
+     * Get device-detected concurrency (ignoring overrides).
+     * @returns Number of detected permits
+     */
+    detectDevice: detectDeviceConcurrency,
+    
+    /**
+     * Set concurrency override for A/B testing.
+     * @param permits Number of permits (2-12), or null to use device detection
+     * @example
+     * // Test with 8 concurrent renders
+     * window.amnesiaConcurrency.setPermits(8);
+     */
+    setPermits: setConcurrencyOverride,
+    
+    /**
+     * Clear the override and use device detection.
+     */
+    clearOverride: () => setConcurrencyOverride(null),
+    
+    /**
+     * Log current configuration info to console.
+     */
+    info: () => {
+      const config = getConcurrencyConfig();
+      console.log('[CONCURRENCY] Current config:', config);
+      console.log('[CONCURRENCY] Device-detected:', detectDeviceConcurrency());
+      console.log('[CONCURRENCY] User override:', userConcurrencyOverride);
+    },
+  };
 }
