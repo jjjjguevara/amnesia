@@ -1206,12 +1206,38 @@ export class RenderCoordinator {
 
   /**
    * Set current document
+   *
+   * amnesia-81w: When switching documents, we must disable content-type
+   * detection and clear callbacks until the new document is loaded on
+   * workers. Otherwise, classification requests fail with "Document not
+   * loaded" errors because wireContentTypeCallbacks() is async and takes
+   * ~400ms to load the document on all workers.
    */
   setDocument(docId: string): void {
+    // amnesia-81w: Track if we're switching documents (for telemetry)
+    const wasPreviouslyEnabled = this.contentTypeDetectionEnabled;
+    const hadPreviousDoc = this.documentId !== null;
+
     this.documentId = docId;
     getTileCacheManager().setDocument(docId);
+
     // Clear classification in-flight cache when switching documents
     this.classificationInFlight.clear();
+
+    // amnesia-81w: Disable content-type detection and clear all callbacks
+    // until new document is loaded on workers. This prevents "Document not
+    // loaded" errors when switching between documents.
+    // wireContentTypeCallbacks() will re-wire everything after
+    // loadDocumentOnAllWorkers() completes successfully.
+    this.contentTypeDetectionEnabled = false;
+    this.classifyPageCallback = null;
+    this.extractJpegCallback = null;
+    getTileCacheManager().setExtractJpegCallback(null);
+
+    // Telemetry: Track when doc switch disables active detection
+    if (wasPreviouslyEnabled && hadPreviousDoc) {
+      getTelemetry().trackCustomMetric('contentType_disabledOnDocSwitch', 1);
+    }
   }
 
   /**
