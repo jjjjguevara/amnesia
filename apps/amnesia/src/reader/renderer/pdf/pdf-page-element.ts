@@ -3441,6 +3441,8 @@ export class PdfPageElement {
         ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
         : null,
       // H1 PASS: deltas should be 0
+      // Tolerance of 0.5px accounts for potential subpixel rounding.
+      // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
     console.log('[GOLDEN-FRAME]', goldenFrameLog);
@@ -3668,6 +3670,8 @@ export class PdfPageElement {
         ? { w: this.transitionSnapshot.width, h: this.transitionSnapshot.height }
         : null,
       // H1 PASS: deltas should be 0
+      // Tolerance of 0.5px accounts for potential subpixel rounding.
+      // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
     console.log('[GOLDEN-FRAME]', goldenFrameLog);
@@ -4034,6 +4038,8 @@ export class PdfPageElement {
       // Canvas buffer dimensions (PHYSICAL pixels = CSS × DPR)
       canvasBuffer: { w: this.canvas.width, h: this.canvas.height },
       // H1 PASS: deltas should be 0
+      // Tolerance of 0.5px accounts for potential subpixel rounding.
+      // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
     console.log('[GOLDEN-FRAME]', goldenFrameLog);
