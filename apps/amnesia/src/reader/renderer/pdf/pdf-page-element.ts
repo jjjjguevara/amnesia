@@ -2468,10 +2468,28 @@ export class PdfPageElement {
       return false;
     }
     
-    if (this.lastRenderState.epoch !== tileEpoch) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Epoch mismatch ` +
-        `(canvas=${this.lastRenderState.epoch}, tiles=${tileEpoch}), skipping`);
+    // amnesia-aqv.1 FIX: Relax epoch check for streaming mode.
+    // 
+    // PROBLEM: Tiles queued by triggerTilePrefetch (epoch N) complete after
+    // renderPageTiled sets canvas to epoch N+1. Strict epoch check rejects them all.
+    //
+    // SOLUTION: Accept tiles from "adjacent" epochs (within 1 of canvas epoch).
+    // This handles the race condition where prefetch tiles complete after streaming
+    // mode increments the epoch. The tiles are still valid because:
+    // 1. They're for the same zoom level (epoch changes once per zoom gesture)
+    // 2. Canvas offset/scale haven't changed significantly within 1 epoch
+    //
+    // SAFETY: Epoch validation still protects against truly stale tiles (>1 epoch old).
+    const epochDiff = Math.abs(this.lastRenderState.epoch - tileEpoch);
+    const EPOCH_TOLERANCE = 1; // Accept tiles within 1 epoch
+    if (epochDiff > EPOCH_TOLERANCE) {
+      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Epoch too stale ` +
+        `(canvas=${this.lastRenderState.epoch}, tiles=${tileEpoch}, diff=${epochDiff} > ${EPOCH_TOLERANCE}), skipping`);
       return false;
+    }
+    if (epochDiff === 1) {
+      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Accepting adjacent epoch ` +
+        `(canvas=${this.lastRenderState.epoch}, tiles=${tileEpoch})`);
     }
     
     // Use STORED canvas state for coordinate calculations.

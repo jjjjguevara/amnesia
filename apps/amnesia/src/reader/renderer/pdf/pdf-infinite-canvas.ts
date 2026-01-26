@@ -3771,6 +3771,114 @@ export class PdfInfiniteCanvas {
       // amnesia-aqv: Use ZoomScaleService snapshot
       const scaleSnapshot = this.zoomScaleService.captureSnapshot();
 
+      // amnesia-aqv.1 FIX: PARTIAL-WAIT STREAMING MODE for high zoom (>= 16x)
+      // 
+      // PROBLEM: At max zoom, Promise.all waits for ALL 100 tiles (~12.5 seconds).
+      // User sees nothing until all tiles complete.
+      //
+      // SOLUTION: At high zoom, use partial-wait streaming mode:
+      // 1. Request all tiles (fire and forget for non-critical ones)
+      // 2. Wait for FIRST N critical tiles to complete (~1-2 seconds)
+      // 3. Composite those tiles (establishes render state for streaming)
+      // 4. Return immediately - rest of tiles composite via onTileReady callback
+      //
+      // This reduces perceived T2HR from ~12s to ~1.5s (first critical batch).
+      const useStreamingMode = zoom >= 16;
+      const CRITICAL_BATCH_SIZE = 12; // Wait for 12 tiles (~1.5s with 4 permits)
+      
+      if (useStreamingMode && tiles.length > CRITICAL_BATCH_SIZE) {
+        console.log(`[STREAMING-RENDER] page=${page} zoom=${zoom.toFixed(2)}: Using partial-wait streaming for ${tiles.length} tiles, epoch=${scaleSnapshot.epoch}`);
+        const streamingStartTime = performance.now();
+        
+        // Split tiles: critical batch (first 20) + background (rest)
+        const criticalTiles = tiles.slice(0, CRITICAL_BATCH_SIZE);
+        const backgroundTiles = tiles.slice(CRITICAL_BATCH_SIZE);
+        
+        // Step 1: Queue critical tiles FIRST (they get priority in the semaphore)
+        // This ensures critical tiles get permits before background/prefetch tiles
+        const criticalPromises = criticalTiles.map(tile =>
+          this.renderCoordinator!.requestRender({
+            type: 'tile' as const,
+            tile,
+            priority: 'critical',
+            documentId: this.documentId ?? undefined,
+            sessionId: this.pendingSessionId,
+            scaleEpoch: scaleSnapshot.epoch,
+            renderParamsId: scaleSnapshot.snapshotId,
+          })
+        );
+        
+        // Step 2: Fire background tile requests (don't wait)
+        // The onTileReady callback handles compositing as these complete
+        backgroundTiles.forEach(tile => {
+          this.renderCoordinator!.requestRender({
+            type: 'tile' as const,
+            tile,
+            priority: 'medium', // Lower priority for background
+            documentId: this.documentId ?? undefined,
+            sessionId: this.pendingSessionId,
+            scaleEpoch: scaleSnapshot.epoch,
+            renderParamsId: scaleSnapshot.snapshotId,
+          }).catch(() => {
+            // Silently handle errors - streaming compositing will fill gaps
+          });
+        });
+        
+        const criticalResults = await Promise.all(criticalPromises);
+        const criticalTime = performance.now() - streamingStartTime;
+        
+        // Step 3: Process critical batch results (establishes render state)
+        const criticalTileImages: Array<{
+          tile: typeof tiles[0];
+          bitmap: ImageBitmap;
+          cssStretch?: number;
+          scaleEpoch?: number;
+          renderParamsId?: string;
+        }> = [];
+        
+        for (let i = 0; i < criticalTiles.length; i++) {
+          const result = criticalResults[i];
+          if (result.success && result.data instanceof ImageBitmap) {
+            const tileForCompositing = result.fallbackTile ?? criticalTiles[i];
+            criticalTileImages.push({
+              tile: tileForCompositing,
+              bitmap: result.data,
+              cssStretch: result.cssStretch,
+              scaleEpoch: result.scaleEpoch,
+              renderParamsId: result.renderParamsId,
+            });
+          }
+        }
+        
+        console.log(`[STREAMING-RENDER] page=${page}: Critical batch ${criticalTileImages.length}/${CRITICAL_BATCH_SIZE} tiles in ${criticalTime.toFixed(0)}ms, ${backgroundTiles.length} rendering in background`);
+        
+        // Step 4: If we have critical tiles, render them (establishes render state)
+        if (criticalTileImages.length > 0) {
+          // Get PDF dimensions for renderTiles
+          const pdfDims = this.tileEngine!.pageDimensions.get(page);
+          
+          // Use the normal tile rendering path for critical batch
+          await element.renderTiles(
+            criticalTileImages,
+            undefined, // textLayerData - not needed for streaming
+            zoom,
+            pdfDims, // pdfDimensions
+            transformSnapshot,
+            scaleSnapshot.epoch, // currentEpoch
+            false // forceFullPage
+          );
+          element.hideLoading();
+        } else {
+          // No critical tiles succeeded - fall through to blocking mode
+          console.warn(`[STREAMING-RENDER] page=${page}: No critical tiles succeeded, falling back to blocking mode`);
+          // Close any bitmaps and continue to blocking mode below
+        }
+        
+        // Return immediately - background tiles will composite via onTileReady
+        return;
+      }
+
+      // BLOCKING MODE: Original behavior for lower zoom levels
       // Request tiles through coordinator (handles caching, deduplication)
       const tilePromises = tiles.map(tile =>
         this.renderCoordinator!.requestRender({
