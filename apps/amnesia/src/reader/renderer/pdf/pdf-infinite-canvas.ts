@@ -651,6 +651,19 @@ export class PdfInfiniteCanvas {
       this.handleZoomRenderPhase(scale as ScaleTier, 'final');
     };
 
+    // amnesia-aqv.1: Speculative rendering during settling phase
+    // Start intermediate renders early to reduce perceived settling time
+    this.zoomScaleService.onSettlingProgress = (elapsedMs, isAtBoundary) => {
+      console.log(`[PdfInfiniteCanvas] Speculative render at ${elapsedMs}ms, atBoundary=${isAtBoundary}`);
+
+      // Get current scale for intermediate render
+      const { scale } = this.zoomScaleService.getScale();
+
+      // Use intermediate phase - this renders visible tiles at lower priority
+      // The final phase will complete these renders or upgrade them
+      this.handleZoomRenderPhase(scale as ScaleTier, 'intermediate');
+    };
+
     this.zoomScaleService.onRenderModeChange = (mode) => {
       console.log(`[PdfInfiniteCanvas] ZoomScaleService: render mode changed to ${mode}`);
     };

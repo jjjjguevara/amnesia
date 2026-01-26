@@ -178,6 +178,21 @@ export class ZoomScaleService {
   private static readonly PHASE_WATCHDOG_TIMEOUT_MS = 3000; // 3 seconds max in non-idle phase
 
   // ─────────────────────────────────────────────────────────────────
+  // amnesia-aqv.1: Speculative Render Timer
+  // ─────────────────────────────────────────────────────────────────
+  private speculativeRenderTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ─────────────────────────────────────────────────────────────────
+  // amnesia-aqv.1: Velocity-Adaptive Delays
+  // ─────────────────────────────────────────────────────────────────
+  /** Zoom history for velocity calculation */
+  private zoomHistory: Array<{ zoom: number; timestamp: number }> = [];
+  /** Sample window for velocity calculation (ms) */
+  private static readonly VELOCITY_SAMPLE_WINDOW_MS = 150;
+  /** Threshold below which zoom is considered "slow" (zoom units per second) */
+  private static readonly SLOW_ZOOM_THRESHOLD = 0.5;
+
+  // ─────────────────────────────────────────────────────────────────
   // Rebound Detection
   // ─────────────────────────────────────────────────────────────────
   private gestureEndTime: number = 0;
@@ -217,6 +232,8 @@ export class ZoomScaleService {
   onSettlingComplete: ((scale: number, zoom: number) => void) | null = null;
   /** Called when render mode changes */
   onRenderModeChange: ((mode: RenderMode) => void) | null = null;
+  /** amnesia-aqv.1: Called partway through settling to start early renders */
+  onSettlingProgress: ((elapsedMs: number, isAtBoundary: boolean) => void) | null = null;
 
   constructor(config: ZoomScaleServiceConfig) {
     this.config = {
@@ -433,6 +450,77 @@ export class ZoomScaleService {
     if (this.state.gesturePhase === 'active') return false;
     const timeSinceGestureEnd = performance.now() - this.gestureEndTime;
     return timeSinceGestureEnd <= windowMs && this.wasAtMinZoom;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // amnesia-aqv.1: Velocity-Adaptive Settling Delays
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Calculate zoom velocity from recent history.
+   * Returns zoom units per second.
+   */
+  private getZoomVelocity(): number {
+    if (this.zoomHistory.length < 2) return 0;
+
+    const first = this.zoomHistory[0];
+    const last = this.zoomHistory[this.zoomHistory.length - 1];
+    const deltaZoom = Math.abs(last.zoom - first.zoom);
+    const deltaTime = (last.timestamp - first.timestamp) / 1000; // seconds
+
+    return deltaTime > 0 ? deltaZoom / deltaTime : 0;
+  }
+
+  /**
+   * Get boundary-aware and velocity-adaptive settling delays.
+   * 
+   * amnesia-aqv.1: Reduces settling time at zoom boundaries and for slow zooms:
+   * - At max/min zoom: 100ms + 50ms = 150ms (vs 500ms default)
+   * - Slow zoom (< 0.5 units/sec): 150ms + 100ms = 250ms
+   * - Fast zoom: 300ms + 200ms = 500ms (default, for momentum handling)
+   */
+  private getBoundaryAwareDelays(): { gestureEnd: number; settling: number; reason: string } {
+    // Fast path 1: At zoom boundaries
+    // User can't zoom further, no need to wait for potential continuation
+    if (this.isAtMaxZoom() || this.isAtMinZoom()) {
+      return { gestureEnd: 100, settling: 50, reason: 'boundary' };
+    }
+
+    // Fast path 2: Low velocity zoom (deliberate positioning)
+    // User is zooming slowly, likely settling on a position
+    const velocity = this.getZoomVelocity();
+    if (velocity < ZoomScaleService.SLOW_ZOOM_THRESHOLD) {
+      return { gestureEnd: 150, settling: 100, reason: 'low_velocity' };
+    }
+
+    // Default: Full delays for high-velocity zoom (momentum handling)
+    return {
+      gestureEnd: this.config.gestureEndDelay,
+      settling: this.config.settlingDelay,
+      reason: 'normal',
+    };
+  }
+
+  /**
+   * Track zoom sample for velocity calculation.
+   * Called on each zoom gesture event.
+   */
+  private trackZoomVelocity(zoom: number): void {
+    const now = performance.now();
+    this.zoomHistory.push({ zoom, timestamp: now });
+
+    // Prune old samples outside the window
+    this.zoomHistory = this.zoomHistory.filter(
+      s => now - s.timestamp < ZoomScaleService.VELOCITY_SAMPLE_WINDOW_MS
+    );
+  }
+
+  /**
+   * Clear zoom velocity history.
+   * Called when gesture ends or is cancelled.
+   */
+  private clearZoomVelocity(): void {
+    this.zoomHistory = [];
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -660,6 +748,9 @@ export class ZoomScaleService {
     }
     // Note: Don't set to 'none' if zoom unchanged - keep last known direction
 
+    // amnesia-aqv.1: Track zoom velocity for adaptive delays
+    this.trackZoomVelocity(clampedZoom);
+
     // Check if zoom actually changed
     const zoomChanged = clampedZoom !== this.state.zoom;
     if (!zoomChanged) {
@@ -858,6 +949,11 @@ export class ZoomScaleService {
       clearTimeout(this.settlingTimer);
       this.settlingTimer = null;
     }
+    // amnesia-aqv.1: Clear speculative render timer when resuming
+    if (this.speculativeRenderTimer) {
+      clearTimeout(this.speculativeRenderTimer);
+      this.speculativeRenderTimer = null;
+    }
     this.state = { ...this.state, gesturePhase: 'active' };
     setGesturePhase('active'); // amnesia-e4i: Update semaphore policy
     this.notifyListeners();
@@ -866,12 +962,19 @@ export class ZoomScaleService {
   private endGesture(): void {
     if (this.state.gesturePhase !== 'active') return;
 
-    console.log('[ZoomScaleService] Gesture ended, entering settling');
-
     // Record rebound detection state
     this.gestureEndTime = performance.now();
     this.wasAtMaxZoom = this.isAtMaxZoom();
     this.wasAtMinZoom = this.isAtMinZoom();
+
+    // amnesia-aqv.1: Get boundary-aware and velocity-adaptive delays
+    const { settling, reason } = this.getBoundaryAwareDelays();
+    const isAtBoundary = this.wasAtMaxZoom || this.wasAtMinZoom;
+
+    console.log(`[ZoomScaleService] Gesture ended, entering settling (delay=${settling}ms, reason=${reason}, atBoundary=${isAtBoundary})`);
+
+    // amnesia-aqv.1: Clear velocity history - gesture is done
+    this.clearZoomVelocity();
 
     // amnesia-x6q Phase 3-4: Reset gesture tracking on gesture end
     // Note: We don't reset immediately - let settling phase preserve context
@@ -881,11 +984,30 @@ export class ZoomScaleService {
     setGesturePhase('settling'); // amnesia-e4i: Update semaphore policy
     this.onGestureEnd?.();
 
+    // amnesia-aqv.1: Schedule speculative render partway through settling
+    // Start early renders at 50ms or half the settling delay, whichever is smaller
+    const speculativeDelay = Math.min(50, settling / 2);
+    if (this.onSettlingProgress && settling > speculativeDelay) {
+      this.speculativeRenderTimer = setTimeout(() => {
+        this.speculativeRenderTimer = null;
+        // Only fire if still in settling phase
+        if (this.state.gesturePhase === 'settling') {
+          console.log(`[ZoomScaleService] Speculative render at ${speculativeDelay}ms, atBoundary=${isAtBoundary}`);
+          this.onSettlingProgress?.(speculativeDelay, isAtBoundary);
+        }
+      }, speculativeDelay);
+    }
+
     // Schedule settling -> rendering transition
     this.settlingTimer = setTimeout(() => {
       this.settlingTimer = null;
+      // Clear speculative render timer if it hasn't fired yet
+      if (this.speculativeRenderTimer) {
+        clearTimeout(this.speculativeRenderTimer);
+        this.speculativeRenderTimer = null;
+      }
       this.completeSettling();
-    }, this.config.settlingDelay);
+    }, settling);
 
     // amnesia-e4i: Start watchdog timer for stuck phases
     this.startPhaseWatchdog('settling');
@@ -922,10 +1044,12 @@ export class ZoomScaleService {
     if (this.gestureEndTimer) {
       clearTimeout(this.gestureEndTimer);
     }
+    // amnesia-aqv.1: Use boundary-aware and velocity-adaptive delays
+    const { gestureEnd } = this.getBoundaryAwareDelays();
     this.gestureEndTimer = setTimeout(() => {
       this.gestureEndTimer = null;
       this.endGesture();
-    }, this.config.gestureEndDelay);
+    }, gestureEnd);
   }
 
   private clearTimers(): void {
@@ -936,6 +1060,11 @@ export class ZoomScaleService {
     if (this.settlingTimer) {
       clearTimeout(this.settlingTimer);
       this.settlingTimer = null;
+    }
+    // amnesia-aqv.1: Clear speculative render timer
+    if (this.speculativeRenderTimer) {
+      clearTimeout(this.speculativeRenderTimer);
+      this.speculativeRenderTimer = null;
     }
     // Also clear watchdog (amnesia-e4i)
     this.clearPhaseWatchdog();
@@ -1029,8 +1158,10 @@ export class ZoomScaleService {
     this.onGestureEnd = null;
     this.onSettlingComplete = null;
     this.onRenderModeChange = null;
+    this.onSettlingProgress = null; // amnesia-aqv.1
     this.focalPoint = null;
     this.zoomSnapshot = null;
+    this.zoomHistory = []; // amnesia-aqv.1: Clear velocity history
   }
 }
 
