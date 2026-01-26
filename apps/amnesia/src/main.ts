@@ -58,10 +58,12 @@ import { prewarmWorkerPool, destroyWorkerPool } from './reader/renderer/pdf/work
 // Document WASM Worker Path Configuration (for unified document provider)
 import { setDocumentPluginPath, destroySharedDocumentBridge } from './reader/renderer/document-bridge';
 import { destroyDocumentWorkerPool } from './reader/renderer/document-worker-pool-manager';
-import { getTelemetry } from './reader/renderer/pdf/pdf-telemetry';
+import { getTelemetry, getClassificationStats } from './reader/renderer/pdf/pdf-telemetry';
 import { initializeTestHarness } from './reader/renderer/pdf/mcp-test-harness';
 import { getBenchmarkSuite } from './reader/renderer/pdf/benchmark-suite';
 import { getFeatureFlags, initializeFeatureFlags } from './reader/renderer/pdf/feature-flags';
+import { getRenderCoordinator } from './reader/renderer/pdf/render-coordinator';
+import { getTileCacheManager } from './reader/renderer/pdf/tile-cache-manager';
 import { toggleDebugTileMode, isDebugTileModeEnabled } from './reader/renderer/pdf/debug-mock-pdf';
 import { 
 	initializeResourceDetector, 
@@ -449,6 +451,72 @@ export default class AmnesiaPlugin extends Plugin {
 		(window as any).Amnesia.benchmarks = getBenchmarkSuite();
 		(window as any).Amnesia.featureFlags = getFeatureFlags();
 		(window as any).Amnesia.telemetry = getTelemetry();
+
+		// Expose content-type diagnostics API (amnesia-xlc.1)
+		(window as any).Amnesia.diagnostics = {
+			/**
+			 * Get comprehensive content-type optimization state.
+			 * Use this to validate optimizations are running.
+			 * 
+			 * @example
+			 * ```js
+			 * const state = window.Amnesia.diagnostics.contentType();
+			 * console.log('Callbacks wired:', state.callbacksWired);
+			 * console.log('Vector optimizations:', state.vectorOptimizations);
+			 * ```
+			 */
+			contentType: () => {
+				const coordinator = getRenderCoordinator();
+				const callbackState = coordinator.getContentTypeCallbackState();
+				const cacheManager = getTileCacheManager();
+				const cacheStats = cacheManager.getClassificationStats();
+				const telemetryStats = getClassificationStats();
+				const allClassifications = cacheManager.getAllClassifications();
+				
+				// Convert Map to Record for easier inspection
+				const classifications: Record<number, string> = {};
+				for (const [page, type] of allClassifications) {
+					classifications[page] = type;
+				}
+				
+				return {
+					// Callback wiring state
+					callbacksWired: callbackState.classifyCallbackWired && callbackState.extractJpegCallbackWired,
+					detectionEnabled: callbackState.detectionEnabled,
+					classifyCallbackWired: callbackState.classifyCallbackWired,
+					extractJpegCallbackWired: callbackState.extractJpegCallbackWired,
+					documentId: callbackState.documentId,
+					classificationsInFlight: callbackState.classificationsInFlight,
+					
+					// Classification cache state
+					classifications,
+					totalClassified: Object.keys(classifications).length,
+					
+					// Cache statistics
+					cacheStats: cacheStats ? {
+						totalClassified: cacheStats.totalClassified,
+						byType: cacheStats.byType,
+						avgConfidence: cacheStats.avgConfidence,
+						avgClassificationTimeMs: cacheStats.avgClassificationTimeMs,
+					} : null,
+					
+					// Telemetry (optimization counts)
+					telemetry: telemetryStats ? {
+						totalClassified: telemetryStats.totalClassified,
+						distributionByType: telemetryStats.distributionByType,
+						avgClassificationTime: telemetryStats.avgClassificationTime,
+						avgRenderTimeByType: telemetryStats.avgRenderTimeByType,
+						optimizationImpact: telemetryStats.optimizationImpact,
+						cacheHitRateByType: telemetryStats.cacheHitRateByType,
+					} : null,
+					
+					// Convenience: optimization counts
+					vectorOptimizations: telemetryStats?.optimizationImpact?.vectorOptimizations ?? 0,
+					jpegExtractions: telemetryStats?.optimizationImpact?.jpegExtractions ?? 0,
+					estimatedTimeSaved: telemetryStats?.optimizationImpact?.estimatedTimeSaved ?? 0,
+				};
+			},
+		};
 
 		// Initialize feature flags in background (non-blocking, fire-and-forget)
 		initializeFeatureFlags(3000).then(() => {

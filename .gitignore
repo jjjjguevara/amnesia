@@ -43,6 +43,7 @@ apps/amnesia/screenshots/
 
 # Docs
 apps/amnesia/docs/
+docs/
 
 # Logs
 *.log
