@@ -191,6 +191,16 @@ export class ZoomScaleService {
   private focalPointGestureType: 'zoom' | 'pan' | 'idle' = 'idle';
 
   // ─────────────────────────────────────────────────────────────────
+  // amnesia-x6q Phase 3-4: Gesture Type and Zoom Direction
+  // ─────────────────────────────────────────────────────────────────
+  /** Current gesture type for quality preservation decisions */
+  private activeGestureType: 'zoom' | 'pan' | 'none' = 'none';
+  /** Zoom direction for cache eviction strategy */
+  private zoomDirection: 'in' | 'out' | 'none' = 'none';
+  /** Previous zoom level for direction detection */
+  private previousZoom: number = 1;
+
+  // ─────────────────────────────────────────────────────────────────
   // Zoom Snapshot (merged from ZoomOrchestrator)
   // ─────────────────────────────────────────────────────────────────
   private zoomSnapshot: { zoom: number; focalPoint: Point; camera: { x: number; y: number; z: number }; timestamp: number } | null = null;
@@ -426,6 +436,61 @@ export class ZoomScaleService {
   }
 
   // ─────────────────────────────────────────────────────────────────
+  // amnesia-x6q Phase 3-4: Gesture Type and Zoom Direction API
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Get the current active gesture type.
+   * Used for quality preservation decisions during pan gestures.
+   */
+  getActiveGestureType(): 'zoom' | 'pan' | 'none' {
+    return this.activeGestureType;
+  }
+
+  /**
+   * Set the active gesture type (called by pdf-infinite-canvas).
+   * @param type 'zoom' for pinch/wheel zoom, 'pan' for drag/scroll, 'none' when idle
+   */
+  setActiveGestureType(type: 'zoom' | 'pan' | 'none'): void {
+    if (this.activeGestureType !== type) {
+      this.activeGestureType = type;
+      console.log(`[ZoomScaleService] Gesture type: ${type}`);
+    }
+  }
+
+  /**
+   * Get the current zoom direction ('in', 'out', or 'none').
+   * Used for cache eviction strategy decisions.
+   */
+  getZoomDirection(): 'in' | 'out' | 'none' {
+    return this.zoomDirection;
+  }
+
+  /**
+   * Check if the user is currently panning (vs zooming).
+   * During pan gestures, we should preserve tile quality.
+   */
+  isPanGesture(): boolean {
+    return this.activeGestureType === 'pan';
+  }
+
+  /**
+   * Check if the user is currently zooming in.
+   * Zoom-in: evict distant pages, prioritize focal point.
+   */
+  isZoomingIn(): boolean {
+    return this.activeGestureType === 'zoom' && this.zoomDirection === 'in';
+  }
+
+  /**
+   * Check if the user is currently zooming out.
+   * Zoom-out: preserve high-quality cache, add thumbnails for new pages.
+   */
+  isZoomingOut(): boolean {
+    return this.activeGestureType === 'zoom' && this.zoomDirection === 'out';
+  }
+
+  // ─────────────────────────────────────────────────────────────────
   // Focal Point API (merged from ScaleStateManager)
   // ─────────────────────────────────────────────────────────────────
 
@@ -586,6 +651,15 @@ export class ZoomScaleService {
       this.resumeGesture();
     }
 
+    // amnesia-x6q Phase 4: Track zoom direction for cache eviction strategy
+    this.activeGestureType = 'zoom';
+    if (clampedZoom > this.previousZoom) {
+      this.zoomDirection = 'in';
+    } else if (clampedZoom < this.previousZoom) {
+      this.zoomDirection = 'out';
+    }
+    // Note: Don't set to 'none' if zoom unchanged - keep last known direction
+
     // Check if zoom actually changed
     const zoomChanged = clampedZoom !== this.state.zoom;
     if (!zoomChanged) {
@@ -593,6 +667,9 @@ export class ZoomScaleService {
       this.resetGestureEndTimer();
       return;
     }
+
+    // Store previous zoom for next direction detection
+    this.previousZoom = this.state.zoom;
 
     // Determine new render mode with hysteresis
     const newRenderMode = this.deriveRenderMode(clampedZoom, this.state.renderMode);
@@ -691,6 +768,10 @@ export class ZoomScaleService {
     // Clear zoom snapshot - gesture cycle is complete
     this.zoomSnapshot = null;
     
+    // amnesia-x6q Phase 3-4: Reset gesture tracking on idle
+    this.activeGestureType = 'none';
+    this.zoomDirection = 'none';
+    
     this.state = {
       ...this.state,
       gesturePhase: 'idle',
@@ -711,6 +792,11 @@ export class ZoomScaleService {
     
     this.clearTimers();
     this.clearPhaseWatchdog();
+    
+    // amnesia-x6q Phase 3-4: Reset gesture tracking on force idle
+    this.activeGestureType = 'none';
+    this.zoomDirection = 'none';
+    
     this.state = { ...this.state, gesturePhase: 'idle' };
     setGesturePhase('idle');
     this.notifyListeners();
@@ -786,6 +872,10 @@ export class ZoomScaleService {
     this.gestureEndTime = performance.now();
     this.wasAtMaxZoom = this.isAtMaxZoom();
     this.wasAtMinZoom = this.isAtMinZoom();
+
+    // amnesia-x6q Phase 3-4: Reset gesture tracking on gesture end
+    // Note: We don't reset immediately - let settling phase preserve context
+    // for quality decisions. Reset happens when entering idle.
 
     this.state = { ...this.state, gesturePhase: 'settling' };
     setGesturePhase('settling'); // amnesia-e4i: Update semaphore policy

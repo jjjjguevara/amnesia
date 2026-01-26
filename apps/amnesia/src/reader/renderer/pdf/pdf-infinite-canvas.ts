@@ -656,23 +656,67 @@ export class PdfInfiniteCanvas {
 
     console.log('[PdfInfiniteCanvas] ZoomScaleService initialized');
 
-    // amnesia-x6q: Set up focal-point-aware cache eviction
+    // amnesia-x6q: Set up focal-point-aware cache eviction with gesture awareness
     // amnesia-aqv: Updated to use ZoomScaleService
+    // amnesia-x6q Phase 3-4: Added gesture type and zoom direction awareness
     const cacheManager = getTileCacheManager();
     cacheManager.setPriorityFunction((page, tileX, tileY) => {
       const focalPoint = this.zoomScaleService.getFocalPoint();
+      const gestureType = this.zoomScaleService.getActiveGestureType();
+      const zoomDirection = this.zoomScaleService.getZoomDirection();
+      const currentPage = Math.min(...this.visiblePages) || 1;
+      
+      // amnesia-x6q Phase 3: During pan gestures, preserve visible tiles
+      // Lower priority value = more important = evicted last
+      if (gestureType === 'pan') {
+        // During pan: prioritize by page visibility only
+        // Visible pages get priority 0-1, buffer pages get 2, distant pages get 3
+        if (this.visiblePages.has(page)) {
+          return 0; // critical: currently visible
+        }
+        const pageDistance = Math.abs(page - currentPage);
+        if (pageDistance <= 2) {
+          return 1; // high: within 2 pages of current
+        }
+        return 3; // low: distant pages can be evicted
+      }
+      
+      // amnesia-x6q Phase 4: Adjust strategy based on zoom direction
+      if (gestureType === 'zoom') {
+        if (zoomDirection === 'in') {
+          // Zooming in: aggressively protect focal point, evict distant pages
+          if (!focalPoint) {
+            // No focal point - use page distance with wider eviction
+            const pageDistance = Math.abs(page - currentPage);
+            if (pageDistance === 0) return 0;
+            if (pageDistance <= 1) return 1;
+            return 3; // More aggressive: distant pages get low priority
+          }
+        } else if (zoomDirection === 'out') {
+          // Zooming out: preserve high-quality cache for current region
+          // Don't aggressively evict - user may zoom back in
+          if (this.visiblePages.has(page)) {
+            return 0; // critical: visible pages
+          }
+          const pageDistance = Math.abs(page - currentPage);
+          if (pageDistance <= 3) {
+            return 1; // high: nearby pages (wider buffer for zoom-out)
+          }
+          return 2; // medium: allow eviction but not aggressive
+        }
+      }
+      
+      // Default: focal-point-based priority
       if (!focalPoint) {
-        // No focal point - use page distance as priority (fallback)
-        const currentPage = Math.min(...this.visiblePages) || 1;
         return Math.abs(page - currentPage);
       }
+      
       // Get actual page layout for correct canvas coordinates
       const layout = this.pageLayouts.get(page);
       if (!layout) {
-        // Page not yet laid out - use page distance as fallback
-        const currentPage = Math.min(...this.visiblePages) || 1;
         return Math.abs(page - currentPage);
       }
+      
       // Calculate distance from focal point to tile center
       const { scale } = this.zoomScaleService.getScale();
       const tileSize = 256; // CSS pixels
@@ -5276,6 +5320,9 @@ export class PdfInfiniteCanvas {
     this.viewport.style.cursor = 'grabbing';
     // Disable text selection during pan to prevent accidental selection
     this.viewport.style.userSelect = 'none';
+    
+    // amnesia-x6q Phase 3: Track pan gesture for quality preservation
+    this.zoomScaleService.setActiveGestureType('pan');
   }
 
   private handlePointerMove(e: PointerEvent): void {
@@ -5350,6 +5397,9 @@ export class PdfInfiniteCanvas {
     this.viewport.style.cursor = '';
     // Re-enable text selection after pan completes
     this.viewport.style.userSelect = '';
+
+    // amnesia-x6q Phase 3: Clear pan gesture type
+    this.zoomScaleService.setActiveGestureType('none');
 
     // Update current page based on what's visible
     this.updateCurrentPage();

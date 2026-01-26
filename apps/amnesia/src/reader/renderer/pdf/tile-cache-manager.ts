@@ -2570,6 +2570,202 @@ export class TileCacheManager {
     console.log('[TileCacheManager] Cache limits restored to default');
   }
 
+  // ─────────────────────────────────────────────────────────────────
+  // amnesia-x6q Phase 3-4: Gesture-Aware Eviction Strategies
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Evict tiles during zoom-in gesture.
+   * Strategy: Aggressively evict distant pages, keep focal point high quality.
+   * 
+   * @param currentPage Current page number
+   * @param focalPoint Focal point in canvas coordinates
+   * @param keepRadius Number of pages around focal point to preserve
+   * @returns Number of tiles evicted
+   */
+  evictForZoomIn(currentPage: number, focalPoint?: { x: number; y: number }, keepRadius: number = 2): number {
+    let evicted = 0;
+    const pagesToKeep = new Set<number>();
+    
+    // Keep pages near current page
+    for (let i = -keepRadius; i <= keepRadius; i++) {
+      pagesToKeep.add(currentPage + i);
+    }
+
+    // Collect tiles to evict (distant pages only)
+    const keysToEvict: string[] = [];
+    
+    for (const key of this.l1Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+      
+      if (!pagesToKeep.has(parsed.page)) {
+        keysToEvict.push(key);
+      }
+    }
+    
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+      
+      if (!pagesToKeep.has(parsed.page)) {
+        keysToEvict.push(key);
+      }
+    }
+
+    // Evict collected tiles
+    for (const key of keysToEvict) {
+      if (this.l1Cache.has(key)) {
+        this.l1Cache.delete(key);
+        evicted++;
+      } else if (this.l2Cache.has(key)) {
+        this.l2Cache.delete(key);
+        evicted++;
+      }
+    }
+
+    if (evicted > 0) {
+      console.log(`[TileCacheManager] evictForZoomIn: evicted ${evicted} tiles from distant pages (kept pages ${currentPage - keepRadius} to ${currentPage + keepRadius})`);
+    }
+
+    return evicted;
+  }
+
+  /**
+   * Evict tiles during zoom-out gesture.
+   * Strategy: Preserve high-quality cache for current pages, only add thumbnails for new pages.
+   * Don't evict high-scale tiles aggressively - user may zoom back in.
+   * 
+   * @param currentPage Current page number
+   * @param maxPagesToKeep Maximum pages to keep in cache
+   * @returns Number of tiles evicted
+   */
+  evictForZoomOut(currentPage: number, maxPagesToKeep: number = 10): number {
+    let evicted = 0;
+    
+    // Get all pages in cache with their distances
+    const pageDistances = new Map<number, number>();
+    
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+      
+      const distance = Math.abs(parsed.page - currentPage);
+      if (!pageDistances.has(parsed.page) || pageDistances.get(parsed.page)! > distance) {
+        pageDistances.set(parsed.page, distance);
+      }
+    }
+    
+    // Sort pages by distance, keep closest maxPagesToKeep pages
+    const sortedPages = [...pageDistances.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([page]) => page);
+    
+    const pagesToKeep = new Set(sortedPages.slice(0, maxPagesToKeep));
+    
+    // Only evict from L2 (persistent cache) - don't touch L1 during zoom-out
+    // because L1 contains recent high-quality tiles user may want when zooming back in
+    const keysToEvict: string[] = [];
+    
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+      
+      if (!pagesToKeep.has(parsed.page)) {
+        keysToEvict.push(key);
+      }
+    }
+
+    for (const key of keysToEvict) {
+      this.l2Cache.delete(key);
+      evicted++;
+    }
+
+    if (evicted > 0) {
+      console.log(`[TileCacheManager] evictForZoomOut: evicted ${evicted} tiles from L2 (kept ${pagesToKeep.size} pages near page ${currentPage})`);
+    }
+
+    return evicted;
+  }
+
+  /**
+   * Pan-gesture quality preservation.
+   * During pan gestures, we should NOT evict tiles from the current viewport.
+   * Only evict tiles that have scrolled completely out of view.
+   * 
+   * @param visiblePages Set of currently visible page numbers
+   * @param bufferPages Number of additional pages to keep as buffer
+   * @returns Number of tiles evicted
+   */
+  evictForPan(visiblePages: Set<number>, bufferPages: number = 1): number {
+    let evicted = 0;
+    
+    // Build set of pages to keep (visible + buffer)
+    const pagesToKeep = new Set<number>();
+    for (const page of visiblePages) {
+      for (let i = -bufferPages; i <= bufferPages; i++) {
+        pagesToKeep.add(page + i);
+      }
+    }
+    
+    // Only evict from L2 to preserve L1 quality tiles
+    const keysToEvict: string[] = [];
+    
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed) continue;
+      
+      if (!pagesToKeep.has(parsed.page)) {
+        keysToEvict.push(key);
+      }
+    }
+
+    for (const key of keysToEvict) {
+      this.l2Cache.delete(key);
+      evicted++;
+    }
+
+    if (evicted > 0) {
+      console.log(`[TileCacheManager] evictForPan: evicted ${evicted} tiles from L2 (kept ${visiblePages.size} visible + ${bufferPages} buffer pages)`);
+    }
+
+    return evicted;
+  }
+
+  /**
+   * Get tiles to preserve at current quality during gesture.
+   * Returns the cache keys that should NOT be evicted during quality preservation.
+   * 
+   * @param visiblePages Set of currently visible pages
+   * @param currentScale The current render scale
+   * @returns Array of cache keys to preserve
+   */
+  getQualityPreservationKeys(visiblePages: Set<number>, currentScale: number): string[] {
+    const keysToPreserve: string[] = [];
+    const scaleThreshold = currentScale * 0.5; // Keep tiles at 50%+ of current scale
+    
+    for (const key of this.l1Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed || !visiblePages.has(parsed.page)) continue;
+      
+      // Check if this is a high-quality tile (scale >= threshold)
+      if ('scale' in parsed && (parsed as { scale: number }).scale >= scaleThreshold) {
+        keysToPreserve.push(key);
+      }
+    }
+    
+    for (const key of this.l2Cache.keys()) {
+      const parsed = this.parseKey(key);
+      if (!parsed || !visiblePages.has(parsed.page)) continue;
+      
+      if ('scale' in parsed && (parsed as { scale: number }).scale >= scaleThreshold) {
+        keysToPreserve.push(key);
+      }
+    }
+    
+    return keysToPreserve;
+  }
+
   /**
    * Clear all caches
    */
