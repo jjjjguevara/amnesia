@@ -4001,6 +4001,17 @@ export class PdfInfiniteCanvas {
         transformSnapshot.canvasOffsetX = boundsX;
         transformSnapshot.canvasOffsetY = boundsY;
         
+        // TWO-TRACK FIX: Pre-set canvas CSS NOW in Interaction Track.
+        // This respects the Two-Track Pipeline (balancing-forces.md Section 3):
+        // - Don't wait for tiles to arrive (Refinement Track)
+        // - Set CSS immediately for correct visual feedback
+        // This prevents the 44x56px bug where CSS was calculated from incomplete tiles.
+        element.presetViewportOnlyCss(
+          transformSnapshot.expectedTileBounds!,
+          transformSnapshot.pdfToElementScale
+        );
+        transformSnapshot.cssPreset = true;
+        
         console.log(`[TransformSnapshot] EXPECTED-BOUNDS page=${page}: bounds=${boundsX.toFixed(1)},${boundsY.toFixed(1)} ${boundsWidth.toFixed(1)}x${boundsHeight.toFixed(1)}, tiles=[${minTileX}-${maxTileX}]x[${minTileY}-${maxTileY}], pdfTileSize=${pdfTileSize.toFixed(1)}`);
       } else {
         // amnesia-0ej FIX: In full-page mode, canvas offset is always (0,0)
@@ -4094,18 +4105,42 @@ export class PdfInfiniteCanvas {
         console.log(`[STREAMING-RENDER] page=${page} zoom=${zoom.toFixed(2)}: Using partial-wait streaming for ${tiles.length} tiles, epoch=${scaleSnapshot.epoch}`);
         const streamingStartTime = performance.now();
         
-        // amnesia-aqv: Pre-render low-res fallback for newly visible pages
+        // amnesia-aqv: Pre-render fallback for newly visible pages
         // PROBLEM: When zooming to high zoom on a page that wasn't previously rendered,
         // there's no cached fallback to show during tile loading. User sees blank canvas.
-        // SOLUTION: Fire off a quick low-res (scale 4) full-page render before tiles.
-        // This gets cached and provides a fallback while high-res tiles load.
+        // SOLUTION: Fire off a fallback render before tiles load.
+        //
+        // FIX (2026-01-27): Use ADAPTIVE fallback scale based on target zoom.
+        // Previously used fixed FALLBACK_SCALE=4, which at zoom 32 means 8× stretching.
+        // Now: use scale that gives max 4× stretch for acceptable quality.
+        //
+        // Target scale = zoom × DPR (e.g., 32 × 2 = 64)
+        // For 4× max stretch: fallback scale = target / 4
+        // Capped at 16 to avoid excessive fallback render time.
         const cacheManager = getTileCacheManager();
-        const FALLBACK_SCALE = 4;
-        const hasScale4 = cacheManager.hasFullPage(page, FALLBACK_SCALE);
+        const targetScale = tileScale; // Already computed above
+        const adaptiveFallbackScale = Math.min(16, Math.max(4, Math.ceil(targetScale / 4)));
+        
+        // Check for available fallbacks from highest to lowest scale
+        const hasScale16 = cacheManager.hasFullPage(page, 16);
+        const hasScale8 = cacheManager.hasFullPage(page, 8);
+        const hasScale4 = cacheManager.hasFullPage(page, 4);
         const hasScale2 = cacheManager.hasFullPage(page, 2);
         const hasScale1 = cacheManager.hasFullPage(page, 1);
-        const hasFallback = hasScale4 || hasScale2 || hasScale1;
-        console.log(`[FALLBACK-CHECK] page=${page}: hasScale4=${hasScale4}, hasScale2=${hasScale2}, hasScale1=${hasScale1}, hasFallback=${hasFallback}`);
+        
+        // Use the BEST available fallback (highest scale up to adaptive target)
+        let bestAvailableFallbackScale = 0;
+        if (hasScale16 && 16 <= adaptiveFallbackScale) bestAvailableFallbackScale = 16;
+        else if (hasScale8 && 8 <= adaptiveFallbackScale) bestAvailableFallbackScale = 8;
+        else if (hasScale16) bestAvailableFallbackScale = 16; // Accept any available
+        else if (hasScale8) bestAvailableFallbackScale = 8;
+        else if (hasScale4) bestAvailableFallbackScale = 4;
+        else if (hasScale2) bestAvailableFallbackScale = 2;
+        else if (hasScale1) bestAvailableFallbackScale = 1;
+        
+        const hasFallback = bestAvailableFallbackScale > 0;
+        const FALLBACK_SCALE = hasFallback ? bestAvailableFallbackScale : adaptiveFallbackScale;
+        console.log(`[FALLBACK-CHECK] page=${page}: target=${targetScale}, adaptive=${adaptiveFallbackScale}, best available=${bestAvailableFallbackScale}, using=${FALLBACK_SCALE}`);
         
         // amnesia-aqv FIX: Render fallback IMMEDIATELY as placeholder
         // PROBLEM: User sees nothing for 2-3 seconds while waiting for critical batch
@@ -4115,23 +4150,34 @@ export class PdfInfiniteCanvas {
         const pdfDims = this.tileEngine?.pageDimensions.get(page);
         
         if (hasFallback && pdfDims) {
-          // Fallback already cached - render it immediately!
-          console.log(`[FALLBACK-IMMEDIATE] page=${page}: Cached fallback found, rendering as placeholder`);
-          try {
-            await element.renderTiles(
-              [], // No tiles yet - just base layer from cache
-              undefined,
-              zoom,
-              pdfDims,
-              transformSnapshot,
-              scaleSnapshot.epoch,
-              false,
-              this.currentGestureId // amnesia-aqv: pass gestureId
-            );
-            element.hideLoading();
-            console.log(`[FALLBACK-IMMEDIATE] page=${page}: Placeholder rendered from cache, now starting tile rendering`);
-          } catch (e) {
-            console.warn(`[FALLBACK-IMMEDIATE] page=${page}: Failed to render cached placeholder:`, e);
+          // TWO-TRACK FIX: Check if high-res tiles are already on the canvas.
+          // compositeCachedTilesForPage may have already drawn high-res tiles from the spatial index.
+          // Don't overwrite them with a low-res fallback!
+          const lastRenderScale = element.getLastRenderStateEpoch?.() !== null ? 
+            (element as any).lastRenderState?.tileScale : null;
+          
+          // Skip fallback if canvas already has content at a good scale (within 2x of target)
+          if (lastRenderScale && lastRenderScale >= tileScale * 0.5) {
+            console.log(`[FALLBACK-IMMEDIATE] page=${page}: SKIPPED - canvas already has scale ${lastRenderScale} content (target=${tileScale})`);
+          } else {
+            // Fallback already cached - render it immediately!
+            console.log(`[FALLBACK-IMMEDIATE] page=${page}: Cached fallback found, rendering as placeholder (lastScale=${lastRenderScale}, target=${tileScale})`);
+            try {
+              await element.renderTiles(
+                [], // No tiles yet - just base layer from cache
+                undefined,
+                zoom,
+                pdfDims,
+                transformSnapshot,
+                scaleSnapshot.epoch,
+                false,
+                this.currentGestureId // amnesia-aqv: pass gestureId
+              );
+              element.hideLoading();
+              console.log(`[FALLBACK-IMMEDIATE] page=${page}: Placeholder rendered from cache, now starting tile rendering`);
+            } catch (e) {
+              console.warn(`[FALLBACK-IMMEDIATE] page=${page}: Failed to render cached placeholder:`, e);
+            }
           }
         } else if (this.renderCoordinator && pdfDims) {
           // No cached fallback - render one quickly
@@ -4157,26 +4203,37 @@ export class PdfInfiniteCanvas {
           const fallbackTime = performance.now() - fallbackStartTime;
           
           if (fallbackResult && fallbackResult.success) {
-            console.log(`[FALLBACK-PRERENDER] page=${page}: Scale-${FALLBACK_SCALE} fallback ready in ${fallbackTime.toFixed(0)}ms, rendering as placeholder`);
+            // TWO-TRACK FIX: Check if high-res tiles are already on the canvas.
+            const lastRenderScalePrerender = element.getLastRenderStateEpoch?.() !== null ? 
+              (element as any).lastRenderState?.tileScale : null;
             
-            try {
-              await element.renderTiles(
-                [], // No tiles yet - just base layer from cache
-                undefined,
-                zoom,
-                pdfDims,
-                transformSnapshot,
-                scaleSnapshot.epoch,
-                false,
-                this.currentGestureId // amnesia-aqv: pass gestureId
-              );
-              element.hideLoading();
-              console.log(`[FALLBACK-PRERENDER] page=${page}: Placeholder rendered, now starting tile rendering`);
-            } catch (e) {
-              console.warn(`[FALLBACK-PRERENDER] page=${page}: Failed to render placeholder:`, e);
-            }
-            if (fallbackResult.data instanceof ImageBitmap) {
-              fallbackResult.data.close();
+            if (lastRenderScalePrerender && lastRenderScalePrerender >= tileScale * 0.5) {
+              console.log(`[FALLBACK-PRERENDER] page=${page}: SKIPPED - canvas already has scale ${lastRenderScalePrerender} content (target=${tileScale})`);
+              if (fallbackResult.data instanceof ImageBitmap) {
+                fallbackResult.data.close();
+              }
+            } else {
+              console.log(`[FALLBACK-PRERENDER] page=${page}: Scale-${FALLBACK_SCALE} fallback ready in ${fallbackTime.toFixed(0)}ms, rendering as placeholder`);
+              
+              try {
+                await element.renderTiles(
+                  [], // No tiles yet - just base layer from cache
+                  undefined,
+                  zoom,
+                  pdfDims,
+                  transformSnapshot,
+                  scaleSnapshot.epoch,
+                  false,
+                  this.currentGestureId // amnesia-aqv: pass gestureId
+                );
+                element.hideLoading();
+                console.log(`[FALLBACK-PRERENDER] page=${page}: Placeholder rendered, now starting tile rendering`);
+              } catch (e) {
+                console.warn(`[FALLBACK-PRERENDER] page=${page}: Failed to render placeholder:`, e);
+              }
+              if (fallbackResult.data instanceof ImageBitmap) {
+                fallbackResult.data.close();
+              }
             }
           } else {
             console.log(`[FALLBACK-PRERENDER] page=${page}: Fallback timed out after ${FALLBACK_TIMEOUT_MS}ms, proceeding with tiles`);
