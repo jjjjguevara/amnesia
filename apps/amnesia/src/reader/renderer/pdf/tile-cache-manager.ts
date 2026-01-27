@@ -1040,6 +1040,28 @@ export class TileCacheManager {
   }
 
   /**
+   * Get raw cached tile data by cache key.
+   * 
+   * MEMORY FIX (amnesia-aqv): Used by spatial index queries which return cache keys
+   * instead of storing data directly.
+   */
+  getCachedDataByKey(key: string): CachedTileData | null {
+    // Check L1 first
+    const l1Result = this.l1Cache.get(key);
+    if (l1Result) {
+      return l1Result;
+    }
+
+    // Check L2
+    const l2Result = this.l2Cache.get(key);
+    if (l2Result) {
+      return l2Result;
+    }
+
+    return null;
+  }
+
+  /**
    * Get tile as Blob (without decoding to ImageBitmap)
    * @deprecated Use getCachedData for format-agnostic access
    */
@@ -1136,7 +1158,8 @@ export class TileCacheManager {
 
     // CATiledLayer architecture: Also insert into spatial index
     // This enables O(log n) multi-resolution lookup without epoch validation
-    this.spatialIndex.insert(tile, cacheData);
+    // MEMORY FIX (amnesia-aqv): Only pass cache key, not actual data - prevents memory duplication
+    this.spatialIndex.insert(tile, key);
 
     // Reset consecutive misses since we just cached something
     this.consecutiveMisses = 0;

@@ -17,7 +17,6 @@
  */
 
 import type { TileCoordinate } from './tile-render-engine';
-import type { CachedTileData } from './tile-cache-manager';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -69,10 +68,14 @@ export interface EvictionPolicy {
 
 /**
  * Entry stored in the quadtree.
+ * 
+ * MEMORY FIX (amnesia-aqv): No longer stores CachedTileData to avoid memory duplication.
+ * The actual tile data is stored in L1/L2 cache only. When queried, callers look up
+ * data from the cache using the tile coordinates.
  */
 interface TileEntry {
   tile: TileCoordinate;
-  data: CachedTileData;
+  cacheKey: string;  // Key to look up data in L1/L2 cache
   region: PdfRegion;
   insertTime: number;
   accessTime: number;
@@ -90,10 +93,13 @@ interface QuadNode {
 
 /**
  * Result from a best-available query.
+ * 
+ * MEMORY FIX (amnesia-aqv): No longer includes CachedTileData. Callers must look up
+ * data from the L1/L2 cache using the cacheKey.
  */
 export interface SpatialQueryResult {
   tile: TileCoordinate;
-  data: CachedTileData;
+  cacheKey: string;  // Key to look up data in L1/L2 cache
   cssStretch: number;  // targetScale / actualScale
   region: PdfRegion;
 }
@@ -121,6 +127,13 @@ const DEFAULT_CONFIG: SpatialIndexConfig = {
   fixedDepth: 8,
   maxNodesPerPage: 1000,
 };
+
+/**
+ * Maximum tiles per page in the spatial index.
+ * At 32x zoom, viewport needs ~120 tiles. With scrolling, we allow 3x viewport (360 tiles).
+ * This prevents unbounded memory growth that causes GPU crashes.
+ */
+const MAX_TILES_PER_PAGE = 400;
 
 /** Default eviction policy */
 const DEFAULT_EVICTION_POLICY: EvictionPolicy = {
@@ -161,11 +174,14 @@ class PageQuadTree {
   
   /**
    * Insert a tile into the quadtree.
+   * 
+   * MEMORY FIX (amnesia-aqv): Only stores cacheKey, not the actual data.
+   * Also enforces MAX_TILES_PER_PAGE limit with LRU eviction.
    */
-  insert(tile: TileCoordinate, data: CachedTileData, region: PdfRegion): void {
+  insert(tile: TileCoordinate, cacheKey: string, region: PdfRegion): void {
     const entry: TileEntry = {
       tile,
-      data,
+      cacheKey,
       region,
       insertTime: performance.now(),
       accessTime: performance.now(),
@@ -173,6 +189,43 @@ class PageQuadTree {
     
     this.insertIntoNode(this.root, entry);
     this.tileCount++;
+    
+    // MEMORY FIX (amnesia-aqv): Enforce tile limit to prevent unbounded growth
+    // At 32x zoom with scrolling, we can accumulate thousands of tiles causing GPU crash
+    if (this.tileCount > MAX_TILES_PER_PAGE) {
+      this.evictOldestTiles(this.tileCount - MAX_TILES_PER_PAGE);
+    }
+  }
+  
+  /**
+   * Evict oldest tiles (LRU) to stay under the limit.
+   * Prefers evicting high-zoom tiles over fallback (low-zoom) tiles.
+   */
+  private evictOldestTiles(count: number): void {
+    const allTiles = this.getAllTiles();
+    
+    // Sort by accessTime ascending (oldest first), but protect fallback tiles (scale <= 4)
+    allTiles.sort((a, b) => {
+      // Protect fallback tiles - sort them to the end
+      const aIsFallback = a.tile.scale <= 4;
+      const bIsFallback = b.tile.scale <= 4;
+      if (aIsFallback !== bIsFallback) {
+        return aIsFallback ? 1 : -1; // Fallback tiles go to end (less likely to evict)
+      }
+      // Within same protection level, sort by accessTime (oldest first)
+      return a.accessTime - b.accessTime;
+    });
+    
+    // Evict the oldest tiles
+    let evicted = 0;
+    for (const entry of allTiles) {
+      if (evicted >= count) break;
+      
+      const tileKey = this.getTileKey(entry.tile);
+      if (this.remove(tileKey)) {
+        evicted++;
+      }
+    }
   }
   
   /**
@@ -223,7 +276,7 @@ class PageQuadTree {
         
         results.push({
           tile: entry.tile,
-          data: entry.data,
+          cacheKey: entry.cacheKey,
           cssStretch: targetScale / scale,
           region: entry.region,
         });
@@ -575,8 +628,11 @@ export class SpatialTileIndex {
   
   /**
    * Insert a tile into the spatial index.
+   * 
+   * MEMORY FIX (amnesia-aqv): Only stores cacheKey, not the actual data.
+   * The cacheKey is used to look up data from L1/L2 cache when queried.
    */
-  insert(tile: TileCoordinate, data: CachedTileData): void {
+  insert(tile: TileCoordinate, cacheKey: string): void {
     const tree = this.getOrCreateTree(tile.page);
     if (!tree) {
       console.warn(`[SpatialTileIndex] Cannot insert tile for page ${tile.page}: dimensions not set`);
@@ -584,7 +640,13 @@ export class SpatialTileIndex {
     }
     
     const region = this.tileToRegion(tile);
-    tree.insert(tile, data, region);
+    tree.insert(tile, cacheKey, region);
+    
+    // DEBUG: Log every 20th insert at scale 32
+    const stats = tree.getStats();
+    if (tile.scale === 32 && stats.tileCount % 20 === 0) {
+      console.log(`[SpatialTileIndex] INSERT page=${tile.page} tileCount=${stats.tileCount}`);
+    }
   }
   
   /**

@@ -991,6 +991,9 @@ export class PdfPageElement {
     const startTime = performance.now();
     const telemetry = getTelemetry();
 
+    // amnesia-aqv DIAGNOSTIC: Log entry to renderTiles with tile count
+    console.log(`[PdfPageElement.renderTiles] page=${this.config.pageNumber}: ENTRY with ${tiles.length} tiles, zoom=${zoom.toFixed(2)}`);
+
     // === TILE-RECEIVE-DEBUG === Log what tiles renderTiles actually receives
     const renderSeq = ++PdfPageElement.renderSequence;
     // CONCURRENT RENDER FIX: Track this as the latest render for this page instance.
@@ -2091,6 +2094,9 @@ export class PdfPageElement {
       tilesDrawn++;
     }
 
+    // amnesia-aqv DIAGNOSTIC: Log how many tiles were actually drawn
+    console.log(`[PdfPageElement.renderTiles] page=${this.config.pageNumber}: DREW ${tilesDrawn}/${tiles.length} tiles (skipped OOB=${tilesSkippedOutOfBounds})`);
+    
     // ALL-TILES-OUT-OF-BOUNDS FIX: If all tiles were skipped, throw an error
     // to trigger fallback to full-page rendering in the caller.
     // This can happen at extreme zoom when tile coordinates are calculated for

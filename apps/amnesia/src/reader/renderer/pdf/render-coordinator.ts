@@ -176,7 +176,6 @@ let currentGesturePhase: GesturePhase = 'idle';
 export function setGesturePhase(phase: GesturePhase): void {
   if (currentGesturePhase !== phase) {
     const oldPhase = currentGesturePhase;
-    console.log(`[SemaphorePolicy] Gesture phase: ${oldPhase} → ${phase}`);
     currentGesturePhase = phase;
     
     // Record transition for timing analysis (amnesia-e4i)
@@ -189,10 +188,7 @@ export function setGesturePhase(phase: GesturePhase): void {
     if (coordinator) {
       const currentZoom = coordinator.getCurrentZoom?.() ?? 1;
       const policy = getSemaphorePolicy(phase, currentZoom);
-      console.log(`[PHASE-CHANGE-POLICY] phase=${phase}, zoom=${currentZoom.toFixed(2)}, maxTilesPerPage=${policy.maxTilesPerPage}`);
       coordinator.updateSemaphorePolicy(policy);
-    } else {
-      console.warn(`[PHASE-CHANGE-POLICY] NO COORDINATOR for phase=${phase} - policy NOT updated!`);
     }
   }
 }
@@ -240,6 +236,12 @@ export interface TileRenderRequest {
   zoom?: number;
   /** Originally requested scale before any capping (for debug). */
   requestedScale?: number;
+  /**
+   * amnesia-aqv: Force fresh render (skip fallback path).
+   * Used for critical batch at high zoom to ensure we get high-res tiles
+   * instead of blurry fallbacks that require later upgrade.
+   */
+  forceFreshRender?: boolean;
 }
 
 /** Page render request */
@@ -459,10 +461,7 @@ class Semaphore {
     
     // If we're over the new limit, drop excess waiters
     if (this.getTotalWaiters() > newSize) {
-      console.log(`[SEMAPHORE] Policy change: maxQueue ${oldSize} → ${newSize}, trimming queue`);
       this.dropLowestPriorityWaiters();
-    } else if (oldSize !== newSize) {
-      console.log(`[SEMAPHORE] Policy change: maxQueue ${oldSize} → ${newSize}`);
     }
   }
 
@@ -502,7 +501,6 @@ class Semaphore {
       this.permits += delta;
       
       // Wake up waiters that can now proceed
-      let woken = 0;
       while (this.permits > 0 && this.getTotalWaiters() > 0) {
         for (const priority of Semaphore.PRIORITY_ORDER) {
           const queue = this.priorityQueues.get(priority)!;
@@ -510,16 +508,13 @@ class Semaphore {
             const waiter = queue.shift()!;
             this.permits--;
             waiter(true);
-            woken++;
             break;
           }
         }
       }
-      console.log(`[SEMAPHORE] Permit boost: ${oldMax} → ${clampedMax} (+${delta}), woke ${woken} waiters`);
     } else {
       // Decreasing permits: reduce available (but don't go negative)
       this.permits = Math.max(0, this.permits + delta);
-      console.log(`[SEMAPHORE] Permit reduction: ${oldMax} → ${clampedMax} (${delta})`);
     }
   }
 
@@ -687,8 +682,6 @@ export class RenderCoordinator {
    * Called when gesture phase changes or zoom level changes significantly.
    */
   updateSemaphorePolicy(policy: SemaphorePolicy): void {
-    const stack = new Error().stack?.split('\n').slice(1, 4).join(' <- ') || 'no stack';
-    console.log(`[POLICY-UPDATE-CALLER] maxTilesPerPage=${policy.maxTilesPerPage}, caller: ${stack}`);
     const oldPolicy = this.currentPolicy;
     this.currentPolicy = policy;
     
@@ -701,21 +694,7 @@ export class RenderCoordinator {
       const basePermits = this.basePermitCount;
       const scaledPermits = Math.round(basePermits * policy.permitMultiplier);
       const clampedPermits = Math.max(2, Math.min(16, scaledPermits));
-      
-      console.log(`[RenderCoordinator] Permit scaling: base=${basePermits}, multiplier=${policy.permitMultiplier}, scaled=${clampedPermits}`);
       this.semaphore.setMaxPermits(clampedPermits);
-    }
-    
-    if (oldPolicy.maxQueueSize !== policy.maxQueueSize || 
-        oldPolicy.viewportOnlyThreshold !== policy.viewportOnlyThreshold ||
-        oldPolicy.permitMultiplier !== policy.permitMultiplier) {
-      console.log(`[RenderCoordinator] Policy update:`, {
-        maxQueueSize: `${oldPolicy.maxQueueSize} → ${policy.maxQueueSize}`,
-        viewportOnlyThreshold: `${oldPolicy.viewportOnlyThreshold} → ${policy.viewportOnlyThreshold}`,
-        dropBehavior: policy.dropBehavior,
-        maxTilesPerPage: policy.maxTilesPerPage || 'unlimited',
-        permitMultiplier: policy.permitMultiplier ?? 1.0,
-      });
     }
   }
 
@@ -743,7 +722,6 @@ export class RenderCoordinator {
     if (zoomRatio >= 1.5 || (zoom >= 16 && oldZoom < 16) || (zoom >= 32 && oldZoom < 32)) {
       const policy = getSemaphorePolicy(currentGesturePhase, zoom);
       this.updateSemaphorePolicy(policy);
-      console.log(`[RenderCoordinator] Zoom-triggered policy update: zoom ${oldZoom.toFixed(0)} → ${zoom.toFixed(0)}, maxTilesPerPage=${policy.maxTilesPerPage}`);
       
       // amnesia-aqv Phase 2B: Proactive spatial eviction when entering high zoom.
       // At high zoom (16x+), tiles are large and memory-hungry. Proactively evict
@@ -757,8 +735,7 @@ export class RenderCoordinator {
         // If cache is >50% full, evict distant tiles (current page unknown, use 1)
         // The null focalTile uses center-of-page heuristic
         if (cacheUtilization > 0.5) {
-          const evicted = cacheManager.evictByDistanceAndRecency(1, null, Math.floor(stats.l2Count * 0.25));
-          console.log(`[RenderCoordinator] Proactive eviction on zoom-in: evicted ${evicted} tiles (utilization was ${(cacheUtilization * 100).toFixed(0)}%)`);
+          cacheManager.evictByDistanceAndRecency(1, null, Math.floor(stats.l2Count * 0.25));
         }
       }
     }
@@ -809,10 +786,6 @@ export class RenderCoordinator {
     const effectiveLimit = Math.min(this.currentPolicy.maxTilesPerPage, zoomLimit);
     
     // Debug log to verify fix is working
-    if (this.currentZoom >= 8) {
-      console.log(`[getMaxTilesPerPage] zoom=${this.currentZoom.toFixed(2)}, policyLimit=${this.currentPolicy.maxTilesPerPage}, zoomLimit=${zoomLimit}, effective=${effectiveLimit}`);
-    }
-    
     return effectiveLimit;
   }
 
@@ -842,7 +815,6 @@ export class RenderCoordinator {
       const oldestKey = this.retryQueue.keys().next().value;
       if (oldestKey) {
         this.retryQueue.delete(oldestKey);
-        console.log(`[RetryQueue] Queue full, evicted oldest: ${oldestKey}`);
       }
     }
     
@@ -855,8 +827,6 @@ export class RenderCoordinator {
       // Boost priority for retries (but don't go above 'high' to avoid starving critical)
       priority: priority === 'low' ? 'medium' : priority === 'medium' ? 'high' : priority,
     });
-    
-    console.log(`[RetryQueue] Added ${key} (attempt ${attempts}/${RenderCoordinator.MAX_RETRY_ATTEMPTS}), queue size: ${this.retryQueue.size}`);
   }
   
   /**
@@ -890,9 +860,6 @@ export class RenderCoordinator {
     const maxSaturation = duringGesture ? 0.8 : 0.5;
     const queueSaturation = this.semaphore.waiting / this.currentPolicy.maxQueueSize;
     if (queueSaturation >= maxSaturation) {
-      if (!duringGesture) {
-        console.log(`[RetryQueue] Skipping - queue ${(queueSaturation * 100).toFixed(0)}% saturated`);
-      }
       return 0;
     }
     
@@ -905,7 +872,6 @@ export class RenderCoordinator {
       // SAFEGUARD 3: TTL expiry (prevent stale entries from accumulating)
       if (now - entry.lastDropTime > RenderCoordinator.RETRY_ENTRY_TTL_MS) {
         this.retryQueue.delete(key);
-        console.log(`[RetryQueue] Entry expired: ${key}`);
         continue;
       }
       
@@ -930,22 +896,16 @@ export class RenderCoordinator {
     for (const { key, tile, priority } of toRetry.slice(0, BATCH_SIZE)) {
       this.retryQueue.delete(key); // Remove from retry queue before re-requesting
       
-      console.log(`[RetryQueue] Retrying ${key} at priority ${priority}`);
-      
       // Don't await - fire and forget to avoid blocking
       this.requestRender({
         type: 'tile',
         tile,
         priority,
-      }).catch(err => {
-        console.warn(`[RetryQueue] Retry failed for ${key}:`, err);
+      }).catch(() => {
+        // Retry failed - tile will be re-added to queue if dropped again
       });
       
       retriedCount++;
-    }
-    
-    if (retriedCount > 0) {
-      console.log(`[RetryQueue] Queued ${retriedCount} retries, ${this.retryQueue.size} remaining`);
     }
     
     return retriedCount;
@@ -956,11 +916,7 @@ export class RenderCoordinator {
    * Call this on major view changes (zoom, page jump) to avoid retrying stale tiles.
    */
   clearRetryQueue(): void {
-    const count = this.retryQueue.size;
     this.retryQueue.clear();
-    if (count > 0) {
-      console.log(`[RetryQueue] Cleared ${count} entries`);
-    }
   }
   
   /**
@@ -1000,10 +956,7 @@ export class RenderCoordinator {
     }
 
     // Clear the semaphore queue (resolves all waiters immediately)
-    const cleared = this.semaphore.clearQueue();
-    if (cleared > 0) {
-      console.log(`[RenderCoordinator] Cleared ${cleared} pending requests from queue`);
-    }
+    this.semaphore.clearQueue();
     
     // amnesia-e4i: Also clear retry queue on major view changes
     this.clearRetryQueue();
@@ -1061,10 +1014,6 @@ export class RenderCoordinator {
     // The in-flight abort logic above (lines 354-370) is sufficient - it selectively aborts
     // only stale sessions. Queued requests from the current session will proceed normally.
 
-    if (abortedCount > 0) {
-      console.log(`[RenderCoordinator] Aborted ${abortedCount} stale in-flight requests (age > ${keepRecent})`);
-    }
-
     return abortedCount;
   }
 
@@ -1108,8 +1057,6 @@ export class RenderCoordinator {
     // This is aggressive but necessary - queued tiles are likely stale-scale too
     if (abortedCount > 0) {
       const queuedCount = this.semaphore.clearQueue();
-      console.log(`[amnesia-rwe] Scale change ${oldScale?.toFixed(0) ?? '?'} → ${newScale.toFixed(0)}: ` +
-        `aborted ${abortedCount} in-flight, cleared ${queuedCount} queued`);
       abortedCount += queuedCount;
     }
 
@@ -1254,8 +1201,6 @@ export class RenderCoordinator {
     }
 
     if (cancelledCount > 0) {
-      console.log(`[amnesia-aqv] Cancelled ${cancelledCount} off-viewport/distant tiles (queue ${(queueSaturation * 100).toFixed(0)}% saturated)`);
-      
       // Record for diagnostic overlay
       try {
         for (let i = 0; i < cancelledCount; i++) {
@@ -1672,6 +1617,7 @@ export class RenderCoordinator {
       // First try exact scale match
       const cached = await getTileCacheManager().get(request.tile);
       if (cached) {
+
         // Track cache hit for T2HR measurement
         // Exact cache match means tile.scale === requested scale (highest-res)
         const t2hrTracker = getT2HRTracker();
@@ -1711,6 +1657,12 @@ export class RenderCoordinator {
       // a permanently blank tile. The background render will upgrade quality.
       // Note: request.type === 'tile' is guaranteed by parent if-block (line 744)
       const isHighZoom = request.tile.scale >= 16;
+      
+      // amnesia-aqv: Respect forceFreshRender flag.
+      // When forceFreshRender is set, skip the fallback path entirely.
+      // This is used for the critical batch to ensure we get high-res tiles
+      // immediately instead of blurry fallbacks that need later upgrade.
+      const forceFresh = request.forceFreshRender === true;
 
       // MEMORY PROTECTION: Adaptive queue limits based on tile scale.
       // Higher scales = larger tiles = more memory pressure.
@@ -1721,7 +1673,8 @@ export class RenderCoordinator {
       const scale = request.tile.scale;
       const maxQueueByScale = scale >= 24 ? 4 : scale >= 16 ? 6 : 10;
       const queueIsSaturated = this.semaphore.waiting > maxQueueByScale;
-      const useFallbackPath = request.priority !== 'critical' || isHighZoom || queueIsSaturated;
+      // Skip fallback if forceFreshRender is set
+      const useFallbackPath = !forceFresh && (request.priority !== 'critical' || isHighZoom || queueIsSaturated);
 
       if (useFallbackPath) {
         const fallback = await getTileCacheManager().getBestAvailableBitmap(request.tile);
@@ -2156,7 +2109,6 @@ export class RenderCoordinator {
       };
       const debugBlob = await generateDebugTileSvg(request.tile, tileSize, request.tile.scale, debugInfo);
       const bitmap = await createImageBitmap(debugBlob);
-      console.log(`[DEBUG-TILE-FAST] page=${request.tile.page}, (${request.tile.tileX},${request.tile.tileY}), scale=${request.tile.scale}, zoom=${debugInfo.zoom?.toFixed(1)}, epoch=${debugInfo.epoch}`);
       return { success: true, data: bitmap, fromCache: false };
     }
 
@@ -2183,6 +2135,11 @@ export class RenderCoordinator {
     if (!acquired) {
       RenderCoordinator.droppedFromQueue++;
       this.logAbortStats('dropped from queue');
+      
+      // amnesia-aqv: Log dropped tile for debugging high-zoom render failures
+      if (request.type === 'tile') {
+        console.warn(`[TILE-DROPPED] page=${request.tile.page} (${request.tile.tileX},${request.tile.tileY}) scale=${request.tile.scale} priority=${request.priority} queueWait=${queueWaitTime.toFixed(0)}ms`);
+      }
       
       // amnesia-e4i: Add to retry queue for later processing
       // BUT NOT when queue is saturated - that creates an infinite loop!
@@ -2323,13 +2280,6 @@ export class RenderCoordinator {
                 );
                 getTelemetry().trackCustomMetric('vectorOptimization_count', 1);
                 getTelemetry().trackCustomMetric('vectorOptimization_memorySaved', memorySaved);
-
-                console.log(
-                  `[RenderCoordinator] Vector optimization for page ${pageNum}: ` +
-                  `scale ${request.tile.scale} → ${vectorOptimization.actualScale}, ` +
-                  `CSS ${vectorOptimization.cssScaleFactor.toFixed(2)}x, ` +
-                  `saved ${(memorySaved / 1024 / 1024).toFixed(2)}MB`
-                );
               }
             }
           }
@@ -2349,7 +2299,6 @@ export class RenderCoordinator {
             const debugBlob = await generateDebugTileSvg(tileToRender, tileSize, request.tile.scale);
             blob = debugBlob;
             cachedData = { format: 'png', blob, width: tileSize, height: tileSize };
-            console.log(`[DEBUG-TILE] Generated debug tile: page=${tileToRender.page}, (${tileToRender.tileX},${tileToRender.tileY}), scale=${tileToRender.scale}, targetScale=${request.tile.scale}`);
           } else {
             const result = await this.renderTileCallback(tileToRender, this.documentId);
 
@@ -2496,7 +2445,6 @@ export class RenderCoordinator {
         const cachedFullPage = await cacheManager.getFullPage(request.page, request.scale);
         if (cachedFullPage) {
           // Cache hit - return the ImageBitmap directly
-          console.log(`[RenderCoordinator] Full-page cache HIT for page ${request.page} at scale ${request.scale}`);
           getTelemetry().trackCustomMetric('fullPageCacheHit', 1);
           const duration = performance.now() - startTime;
           getTelemetry().trackRenderTime(duration, 'page');
@@ -2531,11 +2479,6 @@ export class RenderCoordinator {
               getTelemetry().trackCustomMetric('jpegExtraction_count', 1);
               getTelemetry().trackCustomMetric('jpegExtraction_time', jpegDuration);
               getTelemetry().trackCustomMetric('fullPageJpegExtraction', 1);
-              
-              console.log(
-                `[RenderCoordinator] Full-page JPEG extraction for page ${request.page}: ` +
-                `${jpegDuration.toFixed(1)}ms (est. ${timeSaved.toFixed(0)}ms saved)`
-              );
             } catch (error) {
               // Fall back to standard rendering
               console.warn(
@@ -2551,7 +2494,6 @@ export class RenderCoordinator {
 
         // Standard rendering path (if JPEG extraction not used or failed)
         if (!usedJpegExtraction) {
-          console.log(`[RenderCoordinator] Full-page render for page ${request.page} at scale ${request.scale}`);
           blob = await this.renderPageCallback(
             request.page,
             request.scale,
@@ -2569,7 +2511,6 @@ export class RenderCoordinator {
           };
           const tier = request.priority === 'critical' ? 'L1' : 'L2';
           await cacheManager.setFullPage(request.page, request.scale, fullPageCacheData, tier);
-          console.log(`[RenderCoordinator] Full-page cached at ${tier} for page ${request.page}${usedJpegExtraction ? ' (JPEG extracted)' : ''}`);
         }
       }
 
@@ -2581,16 +2522,20 @@ export class RenderCoordinator {
       );
 
       // Return data - prefer ImageBitmap for raw RGBA, otherwise Blob
-      // VECTOR OPTIMIZATION FIX (amnesia-e4i): Include actualScale and cssStretch in result
-      // when vector optimization was applied. This allows compositing to use correct
-      // positioning even when tiles were rendered at a different scale than requested.
+      // amnesia-aqv FIX: ALWAYS include actualScale for tiles so compositing knows the scale.
+      // Previously only included when vectorOptimization was used, leaving it undefined
+      // for normal renders. This caused the scale diagnostic to show empty: scales=[]
       const baseResult: Partial<RenderResult> = {
         success: true,
         fromCache: false,
-        // Include vector optimization info if applicable
-        ...(vectorOptimization?.wasOptimized && request.type === 'tile' ? {
-          actualScale: vectorOptimization.actualScale,
-          cssStretch: vectorOptimization.cssScaleFactor,
+        // Include actualScale for all tile renders
+        ...(request.type === 'tile' ? {
+          actualScale: vectorOptimization?.wasOptimized 
+            ? vectorOptimization.actualScale 
+            : request.tile.scale,
+          cssStretch: vectorOptimization?.wasOptimized 
+            ? vectorOptimization.cssScaleFactor 
+            : 1.0,
         } : {}),
       };
 
@@ -2713,7 +2658,6 @@ export function getRenderCoordinator(): RenderCoordinator {
   if (!coordinatorInstance) {
     // amnesia-e4i Phase 4: Use device-detected concurrency
     const permits = getEffectiveConcurrency();
-    console.log(`[RenderCoordinator] Initializing with ${permits} permits`);
     coordinatorInstance = new RenderCoordinator({ maxConcurrent: permits });
     
     // amnesia-xlc.3: Set JPEG cache memory budget based on device memory
@@ -2829,7 +2773,6 @@ export function detectDeviceConcurrency(): number {
     permits = 2;
   }
   
-  console.log(`[DEVICE-CONCURRENCY] Detected: cores=${cores}, memory=${memoryGB}GB → permits=${permits}`);
   deviceConcurrency = permits;
   return permits;
 }
@@ -2858,7 +2801,6 @@ export function setConcurrencyOverride(permits: number | null): void {
     permits = Math.max(2, Math.min(12, permits)); // Clamp between 2-12
   }
   userConcurrencyOverride = permits;
-  console.log(`[CONCURRENCY] Override set to: ${permits ?? 'device-detected'}`);
   
   // Note: Existing coordinator will continue using old value.
   // User needs to reload PDF for change to take effect.
@@ -2903,13 +2845,15 @@ if (typeof window !== 'undefined') {
     clearOverride: () => setConcurrencyOverride(null),
     
     /**
-     * Log current configuration info to console.
+     * Get current configuration info.
      */
     info: () => {
       const config = getConcurrencyConfig();
-      console.log('[CONCURRENCY] Current config:', config);
-      console.log('[CONCURRENCY] Device-detected:', detectDeviceConcurrency());
-      console.log('[CONCURRENCY] User override:', userConcurrencyOverride);
+      return {
+        config,
+        deviceDetected: detectDeviceConcurrency(),
+        userOverride: userConcurrencyOverride,
+      };
     },
   };
 }

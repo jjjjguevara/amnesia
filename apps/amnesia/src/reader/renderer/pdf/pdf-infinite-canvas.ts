@@ -3065,22 +3065,55 @@ export class PdfInfiniteCanvas {
     const cacheManager = getTileCacheManager();
     const tileScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
     
-    // amnesia-tdu FIX: Use spatial index to find ALL cached tiles for this page
-    // that overlap with ANY part of the page (not just current viewport).
-    //
-    // PROBLEM: Previous approach calculated tiles based on CURRENT viewport, but tiles
-    // were rendered for a PREVIOUS viewport. If user panned during render, the tile
-    // coordinates don't match and lookup fails.
-    //
-    // FIX: Query spatial index for all cached tiles at this scale for the entire page.
-    // The spatial index returns tiles that actually EXIST, not tiles we WISH existed.
-    // We then composite whatever high-res tiles are available.
+    // MEMORY FIX (amnesia-aqv): Query only VIEWPORT region, not full page.
+    // At 32x zoom, querying the full page returns thousands of tiles causing GPU crash.
+    // We query viewport + buffer to handle slight camera drift during async operations.
     const pageDims = this.tileEngine.getPageDimensions(page);
     if (!pageDims) return;
     
-    // Query spatial index for all tiles covering the full page at target scale
-    const fullPageRegion = { x: 0, y: 0, width: pageDims.width, height: pageDims.height };
-    const spatialResults = cacheManager.getBestAvailableSpatial(page, fullPageRegion, tileScale);
+    // FIX (amnesia-aqv): Calculate viewport region correctly in PDF-local coordinates.
+    // Previous code used screenRect.left/zoom which is always 0, giving wrong coordinates.
+    //
+    // Correct approach:
+    // 1. Get viewport bounds in CONTENT/WORLD coordinates using camera
+    // 2. Calculate intersection with page layout rectangle
+    // 3. Convert intersection to PDF-local coordinates (relative to page origin)
+    
+    // Step 1: Get viewport in content coordinates
+    const worldViewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
+    
+    // Step 2: Calculate intersection between viewport and page layout
+    const intersectLeft = Math.max(worldViewport.x, layout.x);
+    const intersectTop = Math.max(worldViewport.y, layout.y);
+    const intersectRight = Math.min(worldViewport.x + worldViewport.width, layout.x + layout.width);
+    const intersectBottom = Math.min(worldViewport.y + worldViewport.height, layout.y + layout.height);
+    
+    // Check if there's any intersection
+    if (intersectRight <= intersectLeft || intersectBottom <= intersectTop) {
+      // Page is not visible in viewport - no tiles to composite
+      return;
+    }
+    
+    // Step 3: Convert to PDF-local coordinates (subtract page layout origin)
+    const viewportPdfX = intersectLeft - layout.x;
+    const viewportPdfY = intersectTop - layout.y;
+    const viewportPdfWidth = intersectRight - intersectLeft;
+    const viewportPdfHeight = intersectBottom - intersectTop;
+    
+    // Add 50% buffer for camera drift during async operations
+    const bufferX = viewportPdfWidth * 0.5;
+    const bufferY = viewportPdfHeight * 0.5;
+    
+    const queryRegion = {
+      x: Math.max(0, viewportPdfX - bufferX),
+      y: Math.max(0, viewportPdfY - bufferY),
+      width: Math.min(pageDims.width - Math.max(0, viewportPdfX - bufferX), viewportPdfWidth + bufferX * 2),
+      height: Math.min(pageDims.height - Math.max(0, viewportPdfY - bufferY), viewportPdfHeight + bufferY * 2),
+    };
+    
+    const spatialResults = cacheManager.getBestAvailableSpatial(page, queryRegion, tileScale);
+    
+    console.log(`[compositeCachedTiles] page=${page} scale=${tileScale} queryRegion=(${queryRegion.x.toFixed(0)},${queryRegion.y.toFixed(0)} ${queryRegion.width.toFixed(0)}x${queryRegion.height.toFixed(0)}) results=${spatialResults.length}`);
     
     // Filter to only tiles at acceptable quality (cssStretch <= 2.0)
     // and create bitmaps for them
@@ -3089,21 +3122,53 @@ export class PdfInfiniteCanvas {
       bitmap: ImageBitmap;
     }> = [];
     
+    // MEMORY FIX (amnesia-aqv): Limit how many tiles we composite at once
+    // Creating too many ImageBitmaps simultaneously causes GPU memory exhaustion
+    const MAX_TILES_TO_COMPOSITE = 100;
+    let processedCount = 0;
+    
+    // amnesia-aqv DIAGNOSTIC: Track why tiles are filtered
+    let skippedCssStretch = 0;
+    let skippedNoData = 0;
+    let skippedBitmapFail = 0;
+    
     for (const result of spatialResults) {
+      if (processedCount >= MAX_TILES_TO_COMPOSITE) break;
+      
       // Only accept high-quality tiles (within 2x stretch)
-      if (result.cssStretch > 2.0) continue;
+      if (result.cssStretch > 2.0) {
+        skippedCssStretch++;
+        continue;
+      }
       
       try {
-        const bitmap = await cacheManager.createBitmapFromData(result.data);
+        // MEMORY FIX (amnesia-aqv): Look up data from cache using cacheKey
+        // The spatial index no longer stores data directly to avoid memory duplication
+        const data = cacheManager.getCachedDataByKey(result.cacheKey);
+        if (!data) {
+          skippedNoData++;
+          continue; // Data may have been evicted from cache
+        }
+        
+        const bitmap = await cacheManager.createBitmapFromData(data);
         if (bitmap) {
           cachedTileImages.push({
             tile: result.tile,
             bitmap,
           });
+          processedCount++;
+        } else {
+          skippedBitmapFail++;
         }
       } catch (err) {
+        skippedBitmapFail++;
         console.warn(`[compositeCachedTilesForPage] Failed to create bitmap for tile:`, err);
       }
+    }
+    
+    // Log filter stats if significant filtering occurred
+    if (skippedCssStretch > 0 || skippedNoData > 0 || skippedBitmapFail > 0) {
+      console.log(`[compositeCachedTiles] page=${page}: filtered ${skippedCssStretch} cssStretch, ${skippedNoData} noData, ${skippedBitmapFail} bitmapFail, kept ${cachedTileImages.length}/${spatialResults.length}`);
     }
     
     if (cachedTileImages.length === 0) {
@@ -4137,12 +4202,22 @@ export class PdfInfiniteCanvas {
           }
         }
         
-        console.log(`[STREAMING-RENDER] page=${page}: Critical batch ${criticalTileImages.length}/${CRITICAL_BATCH_SIZE} tiles in ${criticalTime.toFixed(0)}ms, ${backgroundTiles.length} rendering in background`);
+        // amnesia-aqv DIAGNOSTIC: Check if tiles are at correct scale
+        const scaleDistribution = new Map<number, number>();
+        for (const result of criticalResults) {
+          if (result.success && result.actualScale !== undefined) {
+            scaleDistribution.set(result.actualScale, (scaleDistribution.get(result.actualScale) ?? 0) + 1);
+          }
+        }
+        const scaleInfo = [...scaleDistribution.entries()].map(([s, c]) => `${s}:${c}`).join(', ');
+        console.log(`[STREAMING-RENDER] page=${page}: Critical batch ${criticalTileImages.length}/${CRITICAL_BATCH_SIZE} tiles in ${criticalTime.toFixed(0)}ms, scales=[${scaleInfo}], ${backgroundTiles.length} rendering in background`);
         
         // Step 4: If we have critical tiles, render them (establishes render state)
         if (criticalTileImages.length > 0) {
           // Get PDF dimensions for renderTiles
           const pdfDims = this.tileEngine!.pageDimensions.get(page);
+          
+          console.log(`[STREAMING-RENDER] page=${page}: Calling renderTiles with ${criticalTileImages.length} tiles, pdfDims=${pdfDims?.width}x${pdfDims?.height}`);
           
           // Use the normal tile rendering path for critical batch
           await element.renderTiles(
@@ -4154,6 +4229,8 @@ export class PdfInfiniteCanvas {
             scaleSnapshot.epoch, // currentEpoch
             false // forceFullPage
           );
+          
+          console.log(`[STREAMING-RENDER] page=${page}: renderTiles completed for ${criticalTileImages.length} tiles`);
           element.hideLoading();
         } else {
           // No critical tiles succeeded - fall through to blocking mode
