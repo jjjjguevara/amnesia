@@ -5291,6 +5291,48 @@ export class PdfInfiniteCanvas {
         }
       }
 
+      // amnesia-aqv FIX: Render cached fallback IMMEDIATELY before async queue.
+      // When zooming out, the canvas may be cleared (aspect ratio mismatch) before
+      // the async render completes, causing a blank flash. By rendering any cached
+      // fallback content NOW, we ensure users see something during the transition.
+      const cacheManager = getTileCacheManager();
+      for (const pageNum of pagesToRerender) {
+        const element = this.pageElements.get(pageNum);
+        if (!element) continue;
+        
+        const layout = this.pageLayouts.get(pageNum);
+        if (!layout) continue;
+        
+        // Check if we have any cached full-page content
+        const FALLBACK_SCALE = 4;
+        const hasCachedFallback = cacheManager.hasFullPage(pageNum, FALLBACK_SCALE) ||
+                                   cacheManager.hasFullPage(pageNum, 2) ||
+                                   cacheManager.hasFullPage(pageNum, 1);
+        
+        if (hasCachedFallback) {
+          // Render cached fallback immediately (synchronous-ish)
+          const pdfDims = this.tileEngine?.pageDimensions.get(pageNum);
+          if (pdfDims) {
+            element.renderTiles(
+              [], // No tiles - just base layer from cache
+              undefined,
+              this.camera.z,
+              pdfDims,
+              {
+                containerWidth: element.getCurrentWidth(),
+                containerHeight: element.getCurrentHeight(),
+                pdfToElementScale: element.getCurrentWidth() / pdfDims.width,
+                epoch: this.scaleVersion,
+              },
+              this.scaleVersion,
+              false
+            ).catch(err => {
+              console.warn(`[renderZoomPhase] Fallback render for page ${pageNum} failed:`, err);
+            });
+          }
+        }
+      }
+
       // Queue for re-render
       this.queueRender(pagesToRerender);
     }
@@ -5734,6 +5776,42 @@ export class PdfInfiniteCanvas {
           const element = this.pageElements.get(page);
           if (element) {
             element.clearRendered();
+          }
+        }
+
+        // amnesia-aqv FIX: Render cached fallback immediately for scroll.
+        // Same pattern as renderZoomPhase - ensures visible content during async render.
+        const cacheManager = getTileCacheManager();
+        for (const page of pagesToRerender) {
+          const element = this.pageElements.get(page);
+          if (!element) continue;
+          
+          // Check if we have any cached full-page content
+          const FALLBACK_SCALE = 4;
+          const hasCachedFallback = cacheManager.hasFullPage(page, FALLBACK_SCALE) ||
+                                     cacheManager.hasFullPage(page, 2) ||
+                                     cacheManager.hasFullPage(page, 1);
+          
+          if (hasCachedFallback) {
+            const pdfDims = this.tileEngine?.pageDimensions.get(page);
+            if (pdfDims) {
+              element.renderTiles(
+                [], // No tiles - just base layer from cache
+                undefined,
+                snapshot.camera.z,
+                pdfDims,
+                {
+                  containerWidth: element.getCurrentWidth(),
+                  containerHeight: element.getCurrentHeight(),
+                  pdfToElementScale: element.getCurrentWidth() / pdfDims.width,
+                  epoch: this.scaleVersion,
+                },
+                this.scaleVersion,
+                false
+              ).catch(err => {
+                console.warn(`[scheduleScrollRerender] Fallback render for page ${page} failed:`, err);
+              });
+            }
           }
         }
 
