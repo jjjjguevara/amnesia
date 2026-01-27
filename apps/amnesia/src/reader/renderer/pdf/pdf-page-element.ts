@@ -588,32 +588,17 @@ export class PdfPageElement {
     this.canvas.style.transform = 'translateZ(0)'; // GPU layer, no offset
     this.canvas.style.transformOrigin = '0 0';
 
-    // If aspect mismatch > 5%, consider clearing the buffer to prevent stretch corruption.
-    // NOTE: This can cause blank flash if no backdrop is available.
-    // 
-    // amnesia-aqv FIX: Be more conservative about clearing:
-    // - Mild mismatch (5-30%): Keep the stretched content - it's better than blank
-    // - Severe mismatch (>30%): Clear to avoid visual corruption
-    // 
-    // The new fallback rendering in renderZoomPhase() will replace this content
-    // with cached fallback if available.
-    const SEVERE_MISMATCH_THRESHOLD = 0.30; // 30% aspect ratio difference
-    
-    if (aspectMismatch > SEVERE_MISMATCH_THRESHOLD) {
+    // If aspect mismatch > 5%, clear the buffer to prevent stretch corruption.
+    // NOTE: This causes blank flash, but prepareForFullPageRender() now uses
+    // cached full-page backdrop to prevent visual discontinuity (amnesia-aqv Phase 2A).
+    if (aspectMismatch > 0.05) {
       console.warn(`[ZOOM-CSS-RESET] page=${this.config.pageNumber}: ` +
-        `SEVERE aspect mismatch - clearing buffer. ` +
+        `Aspect mismatch - clearing buffer (backdrop will cover). ` +
         `buffer=${prevBuffer.width}x${prevBuffer.height} (aspect=${bufferAspect.toFixed(3)}), ` +
         `target=${this.currentWidth}x${this.currentHeight} (aspect=${targetAspect.toFixed(3)}), ` +
         `mismatch=${(aspectMismatch * 100).toFixed(1)}%`);
-      // Clear the canvas - severe mismatch would cause unacceptable visual corruption
+      // Clear the canvas - backdrop from full-page cache will be shown instead
       this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    } else if (aspectMismatch > 0.05) {
-      // Mild mismatch - keep content but log warning
-      console.log(`[ZOOM-CSS-RESET] page=${this.config.pageNumber}: ` +
-        `Mild aspect mismatch - keeping stretched content to avoid blank flash. ` +
-        `buffer=${prevBuffer.width}x${prevBuffer.height} (aspect=${bufferAspect.toFixed(3)}), ` +
-        `target=${this.currentWidth}x${this.currentHeight} (aspect=${targetAspect.toFixed(3)}), ` +
-        `mismatch=${(aspectMismatch * 100).toFixed(1)}%`);
     }
 
     // Track reset time for race condition detection
