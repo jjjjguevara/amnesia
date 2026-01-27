@@ -242,6 +242,13 @@ export interface TileRenderRequest {
    * instead of blurry fallbacks that require later upgrade.
    */
   forceFreshRender?: boolean;
+  /**
+   * amnesia-aqv: Gesture ID for tile lifecycle correlation.
+   * Used by the hybrid guard to:
+   * 1. Reject tiles from previous gestures (stale content)
+   * 2. Enforce monotonicity within the same gesture (scale can only go UP)
+   */
+  gestureId?: string;
 }
 
 /** Page render request */
@@ -285,6 +292,11 @@ export interface RenderResult {
    * If undefined, the original request tile coordinates should be used.
    */
   fallbackTile?: import('./tile-render-engine').TileCoordinate;
+  /**
+   * amnesia-aqv: Gesture ID from the request that initiated this render.
+   * Passed through for tile lifecycle correlation at compositing time.
+   */
+  gestureId?: string;
 }
 
 /** Render mode */
@@ -1639,7 +1651,7 @@ export class RenderCoordinator {
           wasSharp: true, // Exact cache hit is always at requested scale
         });
         
-        return { success: true, data: cached, fromCache: true };
+        return { success: true, data: cached, fromCache: true, gestureId: request.gestureId };
       }
 
       // PERF FIX: Try fallback at different scale
@@ -1713,6 +1725,7 @@ export class RenderCoordinator {
             actualScale: fallback.actualScale,
             cssStretch: fallback.cssStretch,
             fallbackTile: fallback.fallbackTile,
+            gestureId: request.gestureId,
           };
         }
       }
@@ -2089,6 +2102,7 @@ export class RenderCoordinator {
             actualScale: fallback.actualScale,
             cssStretch: fallback.cssStretch,
             fallbackTile: fallback.fallbackTile,
+            gestureId: request.gestureId,
           };
         }
       }
@@ -2109,7 +2123,7 @@ export class RenderCoordinator {
       };
       const debugBlob = await generateDebugTileSvg(request.tile, tileSize, request.tile.scale, debugInfo);
       const bitmap = await createImageBitmap(debugBlob);
-      return { success: true, data: bitmap, fromCache: false };
+      return { success: true, data: bitmap, fromCache: false, gestureId: request.gestureId };
     }
 
     // Wait for a permit (non-blocking, priority-driven)
@@ -2191,6 +2205,7 @@ export class RenderCoordinator {
               actualScale: fallback.actualScale,
               cssStretch: fallback.cssStretch,
               fallbackTile: fallback.fallbackTile,
+              gestureId: request.gestureId,
             };
           }
         }
@@ -2528,6 +2543,8 @@ export class RenderCoordinator {
       const baseResult: Partial<RenderResult> = {
         success: true,
         fromCache: false,
+        // amnesia-aqv: Pass through gestureId for tile lifecycle correlation
+        gestureId: request.type === 'tile' ? request.gestureId : undefined,
         // Include actualScale for all tile renders
         ...(request.type === 'tile' ? {
           actualScale: vectorOptimization?.wasOptimized 

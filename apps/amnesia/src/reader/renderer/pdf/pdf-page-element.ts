@@ -30,6 +30,7 @@ import {
   diagnoseSnapshotDrift,
   isDiagnosticsEnabled,
 } from './tile-corruption-diagnostics';
+import { getTileLifecycleTracer } from './tile-lifecycle-tracer';
 
 export type ReadingMode = 'device' | 'light' | 'sepia' | 'dark' | 'night';
 export type RenderMode = 'page' | 'reflow';
@@ -208,6 +209,11 @@ export class PdfPageElement {
   // When scale changes, old content at the wrong scale must NOT be preserved,
   // even if the viewport area is similar. Mixed-scale content causes corruption.
   private lastTileScale = 0;
+
+  // amnesia-aqv: Gesture ID when the last render completed.
+  // Used by the hybrid guard to allow scale changes when a new gesture starts,
+  // while preventing scale regression within the same gesture.
+  private gestureIdWhenLastRendered: string | null = null;
 
   // amnesia-xc0: Complete canvas render state for epoch-gated additive compositing.
   // Stored after successful renderTiles() to enable adding cached tiles without
@@ -986,19 +992,84 @@ export class PdfPageElement {
      * When forceFullPage=true (set during mode transition), we skip the isViewportOnly
      * check and always use full-page dimensions, preventing blank areas.
      */
-    forceFullPage?: boolean
+    forceFullPage?: boolean,
+    /**
+     * amnesia-aqv: Gesture ID for tile lifecycle correlation.
+     *
+     * The Hybrid Guard uses this to:
+     * 1. Accept tiles from new gestures (gestureId !== gestureIdWhenLastRendered)
+     *    - Allows scale changes during zoom-out (new gesture = new scale baseline)
+     * 2. Reject scale regression within the same gesture
+     *    - Prevents low-res fallbacks from overwriting high-res tiles
+     */
+    gestureId?: string
   ): Promise<void> {
     const startTime = performance.now();
     const telemetry = getTelemetry();
 
     // amnesia-aqv DIAGNOSTIC: Log entry to renderTiles with tile count
-    console.log(`[PdfPageElement.renderTiles] page=${this.config.pageNumber}: ENTRY with ${tiles.length} tiles, zoom=${zoom.toFixed(2)}`);
+    console.log(`[PdfPageElement.renderTiles] page=${this.config.pageNumber}: ENTRY with ${tiles.length} tiles, zoom=${zoom.toFixed(2)}, gestureId=${gestureId?.slice(0, 12) ?? 'none'}`);
 
     // === TILE-RECEIVE-DEBUG === Log what tiles renderTiles actually receives
     const renderSeq = ++PdfPageElement.renderSequence;
     // CONCURRENT RENDER FIX: Track this as the latest render for this page instance.
     // Any older render that hasn't completed yet will be discarded before canvas write.
     this.latestRenderSeq = renderSeq;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYBRID GUARD (amnesia-aqv): Gesture Correlation + Scoped Monotonicity
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // This guard solves the scale regression bug where scale-4 fallback tiles
+    // overwrote scale-32 high-res content during zoom-out transitions.
+    //
+    // Two-step validation:
+    // 1. CHECK GESTURE: If gestureId !== gestureIdWhenLastRendered, this is a new
+    //    gesture and scale changes are ALLOWED (zoom-out creates new gesture with
+    //    lower target scale - this is expected behavior).
+    //
+    // 2. CHECK MONOTONICITY (within same gesture): If same gesture AND incoming
+    //    scale < current displayed scale, REJECT. This prevents low-res fallbacks
+    //    from overwriting high-res tiles during render queue processing.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (gestureId && tiles.length > 0) {
+      const incomingScale = tiles[0].tile.scale;
+      const isNewGesture = gestureId !== this.gestureIdWhenLastRendered;
+      const wouldRegress = !isNewGesture && 
+                           this.lastTileScale > 0 && 
+                           incomingScale < this.lastTileScale;
+
+      if (wouldRegress) {
+        // REJECT: Scale regression within same gesture
+        getTileLifecycleTracer().emit({
+          type: 'scale.regression',
+          gestureId,
+          page: this.config.pageNumber,
+          scale: incomingScale,
+          oldScale: this.lastTileScale,
+          reason: 'monotonicity_violation',
+          metadata: { tilesCount: tiles.length, zoom },
+        });
+        console.warn(
+          `[HYBRID-GUARD] page=${this.config.pageNumber}: REJECTED scale regression ` +
+          `(${incomingScale} < ${this.lastTileScale}) within gesture ${gestureId.slice(0, 12)}`
+        );
+        // Close bitmaps to prevent memory leak
+        for (const t of tiles) {
+          t.bitmap.close();
+        }
+        return; // Discard tiles
+      }
+
+      if (isNewGesture) {
+        // New gesture - reset scale baseline and log
+        console.log(
+          `[HYBRID-GUARD] page=${this.config.pageNumber}: New gesture ${gestureId.slice(0, 12)} ` +
+          `(was ${this.gestureIdWhenLastRendered?.slice(0, 12) ?? 'none'}), ` +
+          `scale ${this.lastTileScale} → ${incomingScale} ALLOWED`
+        );
+      }
+    }
 
     if (zoom >= 4 && tiles.length > 0) {
       // Track unique scales for diagnostic purposes
@@ -1130,7 +1201,11 @@ export class PdfPageElement {
           canvasHeight,
           epoch: currentEpoch ?? 0,
         };
-        this.lastTileScale = tileScale;
+        // amnesia-aqv FIX: Use ACTUAL fallback scale, not requested scale!
+        // Using requested scale (44) would reject subsequent scale-32 tiles
+        // because 32 < 44 violates monotonicity. But fallbacks are placeholders
+        // that should be upgradeable by higher-res tiles.
+        this.lastTileScale = fallback.actualScale;
         this.currentZoom = zoom;
         
         return; // Successfully rendered fallback
@@ -1787,6 +1862,10 @@ export class PdfPageElement {
     this.lastTileBoundsHeight = tileBoundsHeight;
     // SCALE CHANGE FIX: Track tile scale to detect zoom changes
     this.lastTileScale = tileScale;
+    // amnesia-aqv: Track gesture for hybrid guard monotonicity check
+    if (gestureId) {
+      this.gestureIdWhenLastRendered = gestureId;
+    }
 
     // amnesia-xc0: Store complete render state for epoch-gated additive compositing.
     // This enables adding cached tiles to existing canvas content when background
@@ -2088,6 +2167,17 @@ export class PdfPageElement {
         tileKey,
         actualScale: tile.scale,
       });
+
+      // amnesia-aqv: Emit tile.composited event for lifecycle tracing
+      if (gestureId) {
+        getTileLifecycleTracer().emit({
+          type: 'tile.composited',
+          gestureId,
+          page: this.config.pageNumber,
+          tileCoord: { x: tile.tileX, y: tile.tileY },
+          scale: tile.scale,
+        });
+      }
 
       // Close bitmap to free memory - we own it (created fresh from cache)
       bitmap.close();

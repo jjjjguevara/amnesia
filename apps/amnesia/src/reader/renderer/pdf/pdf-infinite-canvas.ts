@@ -66,6 +66,8 @@ import { getT2HRTracker, type TileRequestSource } from './t2hr-tracker';
 import { getFocalPointTracker } from './focal-point-tracker';
 // Tile corruption diagnostics (amnesia-26v)
 import { diagnoseModeTransition, isDiagnosticsEnabled } from './tile-corruption-diagnostics';
+// amnesia-aqv: Gesture correlation for tile lifecycle tracing
+import { getTileLifecycleTracer, generateGestureId } from './tile-lifecycle-tracer';
 
 export interface PageLayout {
   /** Page number (1-indexed) */
@@ -266,6 +268,23 @@ export class PdfInfiniteCanvas {
     cellHeight: number;
     padding: number;
   } | null = null;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GESTURE CORRELATION (amnesia-aqv)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Tracks the current gesture ID for correlating tile requests with arrivals.
+  // Used to implement the "Hybrid Guard" pattern:
+  // 1. Tiles from a previous gesture are discarded (prevents stale overwrites)
+  // 2. Within the same gesture, monotonicity is enforced (scale can only go UP)
+  //
+  // This solves the scale regression bug where scale-4 fallback tiles overwrote
+  // scale-32 high-res content during zoom-out transitions.
+  //
+  // A new gestureId is generated when:
+  // - A scroll gesture starts (first scroll event after idle)
+  // - A zoom gesture starts (idle -> active transition in ZoomScaleService)
+  private currentGestureId: string = generateGestureId();
 
 
 
@@ -546,11 +565,28 @@ export class PdfInfiniteCanvas {
 
     // Wire ZoomScaleService callbacks - this is now the ONLY state machine
     this.zoomScaleService.onGestureStart = () => {
+      // amnesia-aqv: Generate new gestureId for zoom gestures
+      const oldGestureId = this.currentGestureId;
+      this.currentGestureId = generateGestureId();
+      getTileLifecycleTracer().emit({
+        type: 'gesture.started',
+        gestureId: this.currentGestureId,
+        metadata: { trigger: 'zoom', previousGestureId: oldGestureId },
+      });
+      console.log(`[GESTURE] New zoom gesture: ${this.currentGestureId.slice(0, 12)} (was ${oldGestureId.slice(0, 12)})`);
+
       getTelemetry().trackGestureStart(this.camera);
     };
 
     this.zoomScaleService.onGestureEnd = () => {
       const cameraBefore = { ...this.camera };
+
+      // amnesia-aqv: Log gesture end (gestureId stays the same until next gesture starts)
+      getTileLifecycleTracer().emit({
+        type: 'gesture.ended',
+        gestureId: this.currentGestureId,
+        metadata: { trigger: 'zoom', zoom: this.camera.z },
+      });
 
       // Clear focal point after gesture ends
       this.zoomScaleService.setFocalPoint(null, 'idle');
@@ -2519,6 +2555,8 @@ export class PdfInfiniteCanvas {
         // Debug info
         zoom: zoom,
         requestedScale: tileScale,
+        // amnesia-aqv: Gesture correlation for hybrid guard
+        gestureId: this.currentGestureId,
       }).catch(() => {
         // Ignore render failures
       });
@@ -2557,6 +2595,8 @@ export class PdfInfiniteCanvas {
           // Debug info
           zoom: zoom,
           requestedScale: tileScale,
+          // amnesia-aqv: Gesture correlation for hybrid guard
+          gestureId: this.currentGestureId,
         }).catch(() => {
           // Ignore prefetch failures
         });
@@ -2682,6 +2722,8 @@ export class PdfInfiniteCanvas {
           scaleEpoch: epoch,
           zoom: targetZoom,
           requestedScale: targetScale,
+          // amnesia-aqv: Gesture correlation for hybrid guard
+          gestureId: this.currentGestureId,
         }).catch(() => {
           // Ignore prefetch failures
         });
@@ -4083,7 +4125,8 @@ export class PdfInfiniteCanvas {
               pdfDims,
               transformSnapshot,
               scaleSnapshot.epoch,
-              false
+              false,
+              this.currentGestureId // amnesia-aqv: pass gestureId
             );
             element.hideLoading();
             console.log(`[FALLBACK-IMMEDIATE] page=${page}: Placeholder rendered from cache, now starting tile rendering`);
@@ -4124,7 +4167,8 @@ export class PdfInfiniteCanvas {
                 pdfDims,
                 transformSnapshot,
                 scaleSnapshot.epoch,
-                false
+                false,
+                this.currentGestureId // amnesia-aqv: pass gestureId
               );
               element.hideLoading();
               console.log(`[FALLBACK-PRERENDER] page=${page}: Placeholder rendered, now starting tile rendering`);
@@ -4157,6 +4201,8 @@ export class PdfInfiniteCanvas {
             scaleEpoch: scaleSnapshot.epoch,
             renderParamsId: scaleSnapshot.snapshotId,
             forceFreshRender: true, // Skip fallback - wait for actual high-res renders
+            // amnesia-aqv: Gesture correlation for hybrid guard
+            gestureId: this.currentGestureId,
           })
         );
         
@@ -4171,6 +4217,8 @@ export class PdfInfiniteCanvas {
             sessionId: this.pendingSessionId,
             scaleEpoch: scaleSnapshot.epoch,
             renderParamsId: scaleSnapshot.snapshotId,
+            // amnesia-aqv: Gesture correlation for hybrid guard
+            gestureId: this.currentGestureId,
           }).catch(() => {
             // Silently handle errors - streaming compositing will fill gaps
           });
@@ -4227,7 +4275,8 @@ export class PdfInfiniteCanvas {
             pdfDims, // pdfDimensions
             transformSnapshot,
             scaleSnapshot.epoch, // currentEpoch
-            false // forceFullPage
+            false, // forceFullPage
+            this.currentGestureId // amnesia-aqv: pass gestureId
           );
           
           console.log(`[STREAMING-RENDER] page=${page}: renderTiles completed for ${criticalTileImages.length} tiles`);
@@ -4254,6 +4303,8 @@ export class PdfInfiniteCanvas {
           // INV-6: Attach epoch for display-time validation
           scaleEpoch: scaleSnapshot.epoch,
           renderParamsId: scaleSnapshot.snapshotId,
+          // amnesia-aqv: Gesture correlation for hybrid guard
+          gestureId: this.currentGestureId,
         })
       );
 
@@ -4515,7 +4566,8 @@ export class PdfInfiniteCanvas {
       // renderTiles will fall back to current dimensions instead of stale snapshot.
       // FORCE FULL PAGE FIX: Pass forceFullPageTiles to prevent incorrect viewport-only
       // canvas sizing when some tiles are aborted during continuous zoom.
-      await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions, transformSnapshot, this.zoomScaleService.getEpoch(), forceFullPageTiles);
+      // amnesia-aqv: Pass gestureId for hybrid guard tile lifecycle correlation
+      await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions, transformSnapshot, this.zoomScaleService.getEpoch(), forceFullPageTiles, this.currentGestureId);
       element.hideLoading();
 
       // STUCK TILE FIX: Track that this page was rendered with tiles
@@ -4728,6 +4780,8 @@ export class PdfInfiniteCanvas {
           // INV-6: Attach epoch for display-time validation
           scaleEpoch: scaleSnapshot.epoch,
           renderParamsId: scaleSnapshot.snapshotId,
+          // amnesia-aqv: Gesture correlation for hybrid guard
+          gestureId: this.currentGestureId,
         })
       );
 
@@ -5546,6 +5600,20 @@ export class PdfInfiniteCanvas {
    * this fires after ~2 frames (32ms) to render tiles continuously during scroll.
    */
   private scheduleScrollRerender(): void {
+    // amnesia-aqv: Detect new scroll gesture start
+    // If no pending timeout, this is the FIRST scroll event in a new gesture
+    const isNewGesture = this.scrollRerenderTimeout === null;
+    if (isNewGesture) {
+      const oldGestureId = this.currentGestureId;
+      this.currentGestureId = generateGestureId();
+      getTileLifecycleTracer().emit({
+        type: 'gesture.started',
+        gestureId: this.currentGestureId,
+        metadata: { trigger: 'scroll', previousGestureId: oldGestureId },
+      });
+      console.log(`[GESTURE] New scroll gesture: ${this.currentGestureId.slice(0, 12)} (was ${oldGestureId.slice(0, 12)})`);
+    }
+
     // Clear existing timeout
     if (this.scrollRerenderTimeout) {
       clearTimeout(this.scrollRerenderTimeout);
@@ -6768,6 +6836,18 @@ export class PdfInfiniteCanvas {
    */
   getCamera(): Camera {
     return { ...this.camera };
+  }
+
+  /**
+   * Get current gesture ID for tile correlation (amnesia-aqv)
+   *
+   * Used by the render pipeline to tag tile requests with the gesture that
+   * initiated them. When tiles arrive, the hybrid guard checks:
+   * 1. gestureId match (reject stale tiles from previous gestures)
+   * 2. monotonicity within same gesture (scale can only go UP)
+   */
+  getCurrentGestureId(): string {
+    return this.currentGestureId;
   }
 
   /**
