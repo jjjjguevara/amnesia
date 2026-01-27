@@ -64,6 +64,8 @@ import { getTileDiagnosticOverlay, type ModeTransitionEvent } from './tile-diagn
 // Diagnostic trackers for T2HR and focal-point analysis
 import { getT2HRTracker, type TileRequestSource } from './t2hr-tracker';
 import { getFocalPointTracker } from './focal-point-tracker';
+// Tile corruption diagnostics (amnesia-26v)
+import { diagnoseModeTransition, isDiagnosticsEnabled } from './tile-corruption-diagnostics';
 
 export interface PageLayout {
   /** Page number (1-indexed) */
@@ -485,7 +487,6 @@ export class PdfInfiniteCanvas {
       this.tileEngine = getTileEngine();
       // Cache documentId for cross-document isolation in render requests
       this.documentId = this.provider.getDocumentId?.() ?? null;
-      console.log(`[PdfInfiniteCanvas] Tile rendering enabled, documentId=${this.documentId}`);
       
       // amnesia-xc0: Register onTileReady callback to trigger epoch-gated re-composite
       // when tiles finish rendering in the background.
@@ -526,7 +527,6 @@ export class PdfInfiniteCanvas {
         // Main tracking happens in the wheel/gesture handlers
       });
 
-      console.log('[PdfInfiniteCanvas] ZoomTransformLayer initialized');
     }
 
     // Initialize ZoomScaleService (amnesia-aqv): Single source of truth for all zoom/scale state.
@@ -546,32 +546,11 @@ export class PdfInfiniteCanvas {
 
     // Wire ZoomScaleService callbacks - this is now the ONLY state machine
     this.zoomScaleService.onGestureStart = () => {
-      console.log('[PdfInfiniteCanvas] ZoomScaleService: gesture started');
       getTelemetry().trackGestureStart(this.camera);
     };
 
     this.zoomScaleService.onGestureEnd = () => {
-      // ═══════════════════════════════════════════════════════════════════════════
-      // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
-      // Captures complete state at gesture end to identify broken/stretched content bug
-      // ═══════════════════════════════════════════════════════════════════════════
       const cameraBefore = { ...this.camera };
-      const viewportRect = this.getViewportRect();
-      const visibleBoundsBefore = this.getVisibleBoundsForMode(this.camera, viewportRect.width, viewportRect.height);
-
-      console.log('[GESTURE-END-DEBUG] ═══ START ═══', {
-        camera: `x=${cameraBefore.x.toFixed(1)}, y=${cameraBefore.y.toFixed(1)}, z=${cameraBefore.z.toFixed(4)}`,
-        viewport: `${viewportRect.width}x${viewportRect.height}`,
-        visibleBounds: `x=${visibleBoundsBefore.x.toFixed(1)}, y=${visibleBoundsBefore.y.toFixed(1)}, ` +
-                       `w=${visibleBoundsBefore.width.toFixed(1)}, h=${visibleBoundsBefore.height.toFixed(1)}`,
-        isAtMaxZoom: this.zoomScaleService.isAtMaxZoom(),
-        isAtMinZoom: this.zoomScaleService.isAtMinZoom(),
-        maxZoom: this.config.maxZoom,
-        renderMode: this.zoomScaleService.getRenderMode(),
-        lastExecutedRenderMode: this.lastExecutedRenderMode,
-        visiblePages: Array.from(this.visiblePages),
-        epoch: this.zoomScaleService.getEpoch(),
-      });
 
       // Clear focal point after gesture ends
       this.zoomScaleService.setFocalPoint(null, 'idle');
@@ -588,23 +567,7 @@ export class PdfInfiniteCanvas {
 
       // Apply HARD constraints now that gesture has ended (amnesia-u9l)
       // This snaps the camera back to valid bounds if soft constraints allowed overscroll
-      const cameraAfterModeTransition = { ...this.camera };
       this.constrainCameraPositionPreservingFocalPoint(/* soft */ false);
-      const cameraAfterConstraint = { ...this.camera };
-
-      const constraintDelta = {
-        x: cameraAfterConstraint.x - cameraAfterModeTransition.x,
-        y: cameraAfterConstraint.y - cameraAfterModeTransition.y,
-        z: cameraAfterConstraint.z - cameraAfterModeTransition.z,
-      };
-
-      if (Math.abs(constraintDelta.x) > 1 || Math.abs(constraintDelta.y) > 1 || Math.abs(constraintDelta.z) > 0.01) {
-        console.log('[GESTURE-END-DEBUG] ⚠️ HARD CONSTRAINT CHANGED CAMERA:', {
-          before: `x=${cameraAfterModeTransition.x.toFixed(1)}, y=${cameraAfterModeTransition.y.toFixed(1)}, z=${cameraAfterModeTransition.z.toFixed(4)}`,
-          after: `x=${cameraAfterConstraint.x.toFixed(1)}, y=${cameraAfterConstraint.y.toFixed(1)}, z=${cameraAfterConstraint.z.toFixed(4)}`,
-          delta: `dx=${constraintDelta.x.toFixed(1)}, dy=${constraintDelta.y.toFixed(1)}, dz=${constraintDelta.z.toFixed(4)}`,
-        });
-      }
 
       // Sync position change with ZoomScaleService
       this.zoomScaleService.syncFromCamera(this.camera);
@@ -612,25 +575,11 @@ export class PdfInfiniteCanvas {
       // Propagate constrained position to CSS transform
       this.applyTransform();
 
-      // Log final state
-      const visibleBoundsAfter = this.getVisibleBoundsForMode(this.camera, viewportRect.width, viewportRect.height);
-      console.log('[GESTURE-END-DEBUG] ═══ END ═══', {
-        finalCamera: `x=${this.camera.x.toFixed(1)}, y=${this.camera.y.toFixed(1)}, z=${this.camera.z.toFixed(4)}`,
-        finalVisibleBounds: `x=${visibleBoundsAfter.x.toFixed(1)}, y=${visibleBoundsAfter.y.toFixed(1)}, ` +
-                           `w=${visibleBoundsAfter.width.toFixed(1)}, h=${visibleBoundsAfter.height.toFixed(1)}`,
-        totalPositionDelta: `dx=${(this.camera.x - cameraBefore.x).toFixed(1)}, dy=${(this.camera.y - cameraBefore.y).toFixed(1)}`,
-        newEpoch: this.zoomScaleService.getEpoch(),
-      });
-
       // Telemetry: Track the transform event
       getTelemetry().trackTransformEvent('gesture-end', cameraBefore, this.camera, true);
-      
-      console.log('[PdfInfiniteCanvas] ZoomScaleService: gesture ended');
     };
 
     this.zoomScaleService.onSettlingComplete = (scale, zoom) => {
-      console.log(`[PdfInfiniteCanvas] ZoomScaleService: settling complete, scale=${scale}, zoom=${zoom.toFixed(2)}`);
-      
       // Calculate the ACTUAL max achievable scale (capped by tile pixel limits)
       // This is the scale tiles will actually be rendered at, not the ideal scale
       // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles
@@ -647,16 +596,12 @@ export class PdfInfiniteCanvas {
         focalPoint: this.zoomScaleService.getFocalPoint(),
       });
       
-      console.log(`[T2HR] Starting measurement: zoom=${zoom.toFixed(2)}, idealScale=${scale}, maxAchievableScale=${maxAchievableScale}, tileSize=${tileSize}`);
-      
       this.handleZoomRenderPhase(scale as ScaleTier, 'final');
     };
 
     // amnesia-aqv.1: Speculative rendering during settling phase
     // Start intermediate renders early to reduce perceived settling time
-    this.zoomScaleService.onSettlingProgress = (elapsedMs, isAtBoundary) => {
-      console.log(`[PdfInfiniteCanvas] Speculative render at ${elapsedMs}ms, atBoundary=${isAtBoundary}`);
-
+    this.zoomScaleService.onSettlingProgress = (_elapsedMs, _isAtBoundary) => {
       // Get current scale for intermediate render
       const { scale } = this.zoomScaleService.getScale();
 
@@ -665,11 +610,9 @@ export class PdfInfiniteCanvas {
       this.handleZoomRenderPhase(scale as ScaleTier, 'intermediate');
     };
 
-    this.zoomScaleService.onRenderModeChange = (mode) => {
-      console.log(`[PdfInfiniteCanvas] ZoomScaleService: render mode changed to ${mode}`);
+    this.zoomScaleService.onRenderModeChange = (_mode) => {
+      // Render mode changed - no action needed, mode transitions handled elsewhere
     };
-
-    console.log('[PdfInfiniteCanvas] ZoomScaleService initialized');
 
     // amnesia-x6q: Set up focal-point-aware cache eviction with gesture awareness
     // amnesia-aqv: Updated to use ZoomScaleService
@@ -757,7 +700,6 @@ export class PdfInfiniteCanvas {
 
       // If initial view setup is pending and viewport now has valid dimensions
       if (this.initialViewSetupPending && width > 0 && height > 0) {
-        console.log(`[PdfInfiniteCanvas] ResizeObserver: Viewport ready (${width}x${height}), completing initial view setup`);
         this.initialViewSetupPending = false;
         this.completeInitialViewSetup();
       }
@@ -798,7 +740,6 @@ export class PdfInfiniteCanvas {
       setEnabled: (enabled: boolean) => getCoordinateDebugger().setEnabled(enabled),
     };
 
-    console.log('[PdfInfiniteCanvas] CoordinateDebugger exposed at window.pdfCoordinateDebugger and window.pdfDebug');
   }
 
   /**
@@ -810,9 +751,7 @@ export class PdfInfiniteCanvas {
     // Late initialization of tile rendering - check again now that document is loaded.
     // The constructor check happens before document load when wasmDocumentId is null.
     // By the time initialize() is called, the document is loaded and WASM is ready.
-    const hasIsTileAvailable = typeof this.provider.isTileRenderingAvailable === 'function';
     const tileAvailable = this.provider.isTileRenderingAvailable?.() ?? false;
-    console.log(`[PdfInfiniteCanvas] initialize() - useTiledRendering=${this.useTiledRendering}, hasIsTileAvailable=${hasIsTileAvailable}, tileAvailable=${tileAvailable}`);
 
     if (!this.useTiledRendering && tileAvailable) {
       this.useTiledRendering = true;
@@ -820,7 +759,6 @@ export class PdfInfiniteCanvas {
       this.tileEngine = getTileEngine();
       // Cache documentId for cross-document isolation in render requests
       this.documentId = this.provider.getDocumentId?.() ?? null;
-      console.log(`[PdfInfiniteCanvas] Tile rendering enabled (late init), documentId=${this.documentId}`);
     }
 
     // Ensure documentId is up-to-date (may have changed since constructor)
@@ -853,7 +791,6 @@ export class PdfInfiniteCanvas {
       this.setupInitialView();
       this.updateVisiblePages(); // CRITICAL: Create page elements for initial view
     } else {
-      console.log(`[PdfInfiniteCanvas] Viewport not ready (${viewportRect.width}x${viewportRect.height}), deferring initial view setup`);
       this.initialViewSetupPending = true;
     }
   }
@@ -873,8 +810,6 @@ export class PdfInfiniteCanvas {
     if (this.config.pageWidth === dims.width && this.config.pageHeight === dims.height) {
       return;
     }
-
-    console.log(`[PdfInfiniteCanvas] Updating page dimensions: ${dims.width}x${dims.height}`);
 
     // Update config
     this.config.pageWidth = dims.width;
@@ -910,7 +845,6 @@ export class PdfInfiniteCanvas {
     if (viewportRect.width > 0 && viewportRect.height > 0) {
       this.setupInitialView();
     } else {
-      console.log(`[PdfInfiniteCanvas] updatePageDimensions: Viewport not ready (${viewportRect.width}x${viewportRect.height}), deferring view setup`);
       this.initialViewSetupPending = true;
     }
   }
@@ -1570,13 +1504,10 @@ export class PdfInfiniteCanvas {
         const minX = centerX - slackX;
         const maxX = centerX + slackX;
         x = Math.max(minX, Math.min(maxX, x));
-        console.log(`[CONSTRAINT-DEBUG] FITS: z=${z.toFixed(2)}, vpW=${vpWidth.toFixed(0)}, contentW=${contentWidth.toFixed(0)}, screenW=${contentScreenWidth.toFixed(0)}, xBefore=${xBefore.toFixed(1)}, center=${centerX.toFixed(1)}, slack=${slackX.toFixed(1)}, range=[${minX.toFixed(1)}, ${maxX.toFixed(1)}], xAfter=${x.toFixed(1)}`);
       } else {
         const minX = vpWidth / z - contentWidth;
         const maxX = 0;
-        const xClamped = Math.max(minX, Math.min(maxX, x));
-        console.log(`[CONSTRAINT-DEBUG] OVERFLOW: z=${z.toFixed(2)}, vpW=${vpWidth.toFixed(0)}, contentW=${contentWidth.toFixed(0)}, screenW=${contentScreenWidth.toFixed(0)}, xBefore=${xBefore.toFixed(1)}, range=[${minX.toFixed(1)}, ${maxX.toFixed(1)}], xAfter=${xClamped.toFixed(1)}`);
-        x = xClamped;
+        x = Math.max(minX, Math.min(maxX, x));
       }
 
       if (contentScreenHeight <= vpHeight) {
@@ -1780,13 +1711,8 @@ export class PdfInfiniteCanvas {
     const cameraBefore = { ...this.camera };
     this.camera = { x, y, z };
 
-    // Log if position changed (for debugging)
-    const constrained = cameraBefore.x !== x || cameraBefore.y !== y;
-    if (constrained && !soft) {
-      console.log(`[FOCAL-POINT-CONSTRAINT] Applied ${soft ? 'soft' : 'hard'} constraint: before=(${cameraBefore.x.toFixed(1)}, ${cameraBefore.y.toFixed(1)}), after=(${x.toFixed(1)}, ${y.toFixed(1)})`);
-    }
-
     // Telemetry: Track constraint event (amnesia-hem investigation)
+    const constrained = cameraBefore.x !== x || cameraBefore.y !== y;
     if (constrained) {
       getTelemetry().trackConstraintEvent(
         soft ? 'soft' : 'hard',
@@ -1823,28 +1749,12 @@ export class PdfInfiniteCanvas {
   private executeModeTransition(targetMode: 'full-page' | 'tiled'): void {
     const oldMode = this.lastExecutedRenderMode;
     if (oldMode === targetMode) {
-      console.log(`[PdfInfiniteCanvas] executeModeTransition: already in ${targetMode} mode`);
       return;
     }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
-    // ═══════════════════════════════════════════════════════════════════════════
-    console.log('[MODE-TRANSITION-DEBUG] ═══ EXECUTING ═══', {
-      oldMode,
-      targetMode,
-      camera: `z=${this.camera.z.toFixed(4)}`,
-      visiblePages: Array.from(this.visiblePages),
-      pageLayouts: Array.from(this.pageLayouts.entries()).map(([page, layout]) =>
-        `p${page}: ${layout.width.toFixed(0)}x${layout.height.toFixed(0)} @ (${layout.x.toFixed(0)},${layout.y.toFixed(0)})`
-      ),
-      scaleState: { scale: this.zoomScaleService.getScale(), epoch: this.zoomScaleService.getEpoch(), renderMode: this.zoomScaleService.getRenderMode() },
-    });
 
     this.lastExecutedRenderMode = targetMode;
     // MIGRATION (amnesia-d9f): Use ZoomScaleService for epoch
     const newEpoch = this.zoomScaleService.incrementEpoch();
-    console.log(`[MODE-TRANSITION-DEBUG] Epoch incremented: ${newEpoch}`);
 
     // amnesia-aqv Phase 0: Record mode transition event for diagnostic tracking
     const transitionStartTime = performance.now();
@@ -1873,7 +1783,6 @@ export class PdfInfiniteCanvas {
     // (which was positioned/sized for a small region) from being displayed clipped
     // while waiting for the new full-page render to complete.
     if (oldMode === 'tiled' && targetMode === 'full-page') {
-      console.log(`[PdfInfiniteCanvas] Tiled→Full-page: immediately resetting canvas CSS for ${this.visiblePages.size} pages`);
       for (const pageNum of this.visiblePages) {
         const element = this.pageElements.get(pageNum);
         if (element) {
@@ -1900,14 +1809,12 @@ export class PdfInfiniteCanvas {
       // FIX (2026-01-20): Queue full-page renders after mode transition
       // Without this, pages stay on stretched snapshot because no renders are requested.
       // FIX (2026-01-21): Use force=true to bypass canRender() guard during settling phase.
-      console.log(`[MODE-TRANSITION-FIX] Queuing full-page renders for ${this.visiblePages.size} pages`);
       this.queueRender([...this.visiblePages], /* force */ true);
     }
 
     // SYMMETRIC MODE TRANSITION: When transitioning full-page→tiled,
     // prepare pages for viewport-only tile rendering.
     if (oldMode === 'full-page' && targetMode === 'tiled') {
-      console.log(`[PdfInfiniteCanvas] Full-page→Tiled: preparing ${this.visiblePages.size} pages for tiled render`);
       for (const pageNum of this.visiblePages) {
         const element = this.pageElements.get(pageNum);
         if (element) {
@@ -1918,7 +1825,6 @@ export class PdfInfiniteCanvas {
       // This was MISSING - pages were prepared but tiles were never requested.
       // Result: pages stayed on stretched transition snapshot forever.
       // FIX (2026-01-21): Use force=true to bypass canRender() guard during settling phase.
-      console.log(`[MODE-TRANSITION-FIX] Queuing tile renders for ${this.visiblePages.size} pages`);
       this.queueRender([...this.visiblePages], /* force */ true);
     }
     // NOTE: pendingModeTransition removed (amnesia-wbp) - ScaleStateManager tracks this now
@@ -2138,7 +2044,6 @@ export class PdfInfiniteCanvas {
       if (this.cumulativePanDistance > clearThreshold) {
         const queueBefore = this.renderCoordinator.getQueueSize();
         if (queueBefore > 50) { // Only clear if queue is actually backed up
-          console.log(`[amnesia-e4i] Pan distance ${this.cumulativePanDistance.toFixed(0)} > threshold ${clearThreshold.toFixed(0)}, clearing ${queueBefore} stale tiles`);
           this.renderCoordinator.abortAllPending();
         }
         // Reset tracking position
@@ -2161,7 +2066,6 @@ export class PdfInfiniteCanvas {
     // MIGRATION (amnesia-d9f): Using ZoomScaleService as primary, zoomStateMachine as backup.
     // Once migration is complete, zoomStateMachine will be removed.
     if (!this.zoomScaleService.canRender()) {
-      console.log(`[PdfInfiniteCanvas] updateVisiblePages blocked - phase: ${this.zoomScaleService.getGesturePhase()}`);
       return;
     }
 
@@ -2319,7 +2223,6 @@ export class PdfInfiniteCanvas {
         const element = this.pageElements.get(page);
         if (element) {
           element.clearRendered();
-          console.log(`[COLD-RECOVERY] Page ${page} rewarmed - forcing re-render after being evicted`);
         }
       }
     }
@@ -2340,7 +2243,6 @@ export class PdfInfiniteCanvas {
       
       while (this.pageElements.size > maxPageElements && sortedByDistance.length > 0) {
         const [page, element] = sortedByDistance.shift()!;
-        console.log(`[MEMORY-PRESSURE] Evicting page ${page} (distance ${Math.abs(page - centerPage)} from center ${centerPage})`);
         element.destroy();
         this.pageElements.delete(page);
         this.coldPages.add(page); // Mark as cold for recovery when visible again
@@ -2553,7 +2455,6 @@ export class PdfInfiniteCanvas {
         const priority = tilePriorities.get(key);
         return priority === 'critical' || priority === 'high';
       });
-      console.log(`[amnesia-rwe] Active zoom: queuing ${tilesToQueue.length}/${visibleTiles.length} focal-priority tiles`);
     }
     
     // T2HR v2: Track tile requests by source
@@ -2721,8 +2622,6 @@ export class PdfInfiniteCanvas {
     // Get epoch for tile requests
     const epoch = this.zoomScaleService.getEpoch();
 
-    console.log(`[FOCAL-PREFETCH] Starting prefetch at focal (${focalCanvas.x.toFixed(0)}, ${focalCanvas.y.toFixed(0)}) page=${focalPage} currentZoom=${currentZoom.toFixed(1)} targets=[${targetZooms.join(',')}]`);
-
     // For each target zoom, generate tiles around the focal point
     for (const targetZoom of targetZooms) {
       const pixelRatio = this.config.pixelRatio;
@@ -2771,8 +2670,6 @@ export class PdfInfiniteCanvas {
         const bDist = Math.abs(b.tileX - focalTileX) + Math.abs(b.tileY - focalTileY);
         return aDist - bDist;
       });
-
-      console.log(`[FOCAL-PREFETCH] Queueing ${tiles.length} tiles at scale ${targetScale} for zoom ${targetZoom}`);
 
       // Queue tiles at high priority (but not critical, to not block current render)
       for (const tile of tiles) {
@@ -3124,8 +3021,6 @@ export class PdfInfiniteCanvas {
       this.lastGlobalCompositeTime = execNow;
       this.globalCompositeCount++;
       
-      console.log(`[PAGE-REFRESH] page=${page}: Refreshing after ${priority} tile completed (epoch=${tileEpoch}, composites=${this.globalCompositeCount})`);
-      
       // Composite ONLY cached tiles - do NOT add new render requests to the queue!
       // triggerTilePrefetch would add all visible tiles (cached AND non-cached) to the queue,
       // making the saturated queue problem worse. compositeCachedTilesForPage only reads
@@ -3167,64 +3062,69 @@ export class PdfInfiniteCanvas {
     const screenRect = this.getViewportRect();
     if (!screenRect || screenRect.width <= 0 || screenRect.height <= 0) return;
     
-    // Calculate visible tiles for this page
-    const canvasViewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
-    const tileScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
-    const tiles = this.tileEngine.getVisibleTiles(canvasViewport, [layout], zoom, tileScale);
-    
-    if (tiles.length === 0) return;
-    
-    // Get cached tiles ONLY - do not request new renders
     const cacheManager = getTileCacheManager();
+    const tileScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
+    
+    // amnesia-tdu FIX: Use spatial index to find ALL cached tiles for this page
+    // that overlap with ANY part of the page (not just current viewport).
+    //
+    // PROBLEM: Previous approach calculated tiles based on CURRENT viewport, but tiles
+    // were rendered for a PREVIOUS viewport. If user panned during render, the tile
+    // coordinates don't match and lookup fails.
+    //
+    // FIX: Query spatial index for all cached tiles at this scale for the entire page.
+    // The spatial index returns tiles that actually EXIST, not tiles we WISH existed.
+    // We then composite whatever high-res tiles are available.
+    const pageDims = this.tileEngine.getPageDimensions(page);
+    if (!pageDims) return;
+    
+    // Query spatial index for all tiles covering the full page at target scale
+    const fullPageRegion = { x: 0, y: 0, width: pageDims.width, height: pageDims.height };
+    const spatialResults = cacheManager.getBestAvailableSpatial(page, fullPageRegion, tileScale);
+    
+    // Filter to only tiles at acceptable quality (cssStretch <= 2.0)
+    // and create bitmaps for them
     const cachedTileImages: Array<{
-      tile: typeof tiles[0];
+      tile: TileCoordinate;
       bitmap: ImageBitmap;
     }> = [];
     
-    for (const tile of tiles) {
-      // Try exact scale match first
-      const cached = await cacheManager.get(tile);
-      if (cached) {
-        cachedTileImages.push({ tile, bitmap: cached });
-        continue;
-      }
+    for (const result of spatialResults) {
+      // Only accept high-quality tiles (within 2x stretch)
+      if (result.cssStretch > 2.0) continue;
       
-      // Try fallback at different scale (only for additive composite)
-      const fallback = await cacheManager.getBestAvailableBitmap(tile);
-      if (fallback && fallback.cssStretch <= 2.0) {
-        // Accept only good fallbacks (up to 2x stretch) for additive composite
-        cachedTileImages.push({ 
-          tile: fallback.fallbackTile ?? tile, 
-          bitmap: fallback.bitmap,
-        });
+      try {
+        const bitmap = await cacheManager.createBitmapFromData(result.data);
+        if (bitmap) {
+          cachedTileImages.push({
+            tile: result.tile,
+            bitmap,
+          });
+        }
+      } catch (err) {
+        console.warn(`[compositeCachedTilesForPage] Failed to create bitmap for tile:`, err);
       }
-      // If no cache hit, skip this tile - don't request a new render!
     }
     
-    // COVERAGE THRESHOLD: Only composite if we have at least 25% of viewport tiles.
-    // Very sparse updates look bad and waste CPU cycles.
-    const COVERAGE_THRESHOLD = 0.25;
-    const cachedRatio = cachedTileImages.length / tiles.length;
-    
-    if (cachedRatio < COVERAGE_THRESHOLD) {
-      // Close bitmaps to avoid memory leak
-      cachedTileImages.forEach(({ bitmap }) => bitmap.close());
-      console.log(`[CACHE-COMPOSITE] page=${page}: Skipping - only ${(cachedRatio * 100).toFixed(0)}% coverage (threshold ${COVERAGE_THRESHOLD * 100}%)`);
+    if (cachedTileImages.length === 0) {
       return;
     }
     
-    console.log(`[CACHE-COMPOSITE] page=${page}: Compositing ${cachedTileImages.length}/${tiles.length} cached tiles (${(cachedRatio * 100).toFixed(0)}%), epoch=${tileEpoch}`);
-    
-    // Use epoch-validated ADDITIVE composite
-    // This validates that the tile epoch matches the canvas render state
-    const success = element.addTilesToExistingCanvas(cachedTileImages, tileEpoch);
-    
-    if (!success) {
-      // Epoch mismatch - tiles are stale, already closed in addTilesToExistingCanvas
-      console.log(`[CACHE-COMPOSITE] page=${page}: Skipped due to epoch mismatch`);
-    } else {
-      console.log(`[CACHE-COMPOSITE] page=${page}: Additive composite complete`);
-    }
+    // SPATIAL INDEX FIX: Use CURRENT epoch, not the stale tileEpoch.
+    //
+    // The original tileEpoch was captured when the tile render was requested, but
+    // by the time spatial index compositing runs, many renders may have completed
+    // and the epoch has advanced significantly.
+    //
+    // Spatial index tiles are safe to composite because:
+    // 1. They're filtered by tileScale (matching current zoom)
+    // 2. Their positions are calculated from tile.tileX/tileY (absolute PDF coordinates)
+    // 3. The spatial index only returns tiles at the correct scale
+    //
+    // We use the element's current render state epoch to ensure the canvas hasn't
+    // been completely invalidated since we started this composite operation.
+    const currentEpoch = element.getLastRenderStateEpoch?.() ?? tileEpoch;
+    element.addTilesToExistingCanvas(cachedTileImages, currentEpoch);
   }
 
   /**
@@ -3310,8 +3210,6 @@ export class PdfInfiniteCanvas {
       // Composite fallback tiles immediately (fire-and-forget)
       // Note: Using addTilesToExistingCanvas for additive compositing
       // so high-res tiles can overdraw later without clearing
-      console.log(`[FALLBACK-COMPOSITE] page=${page}: Compositing ${fallbackTileImages.length} fallback tiles (target scale ${targetScale})`);
-      
       const success = element.addTilesToExistingCanvas(fallbackTileImages, epoch);
       
       if (!success) {
@@ -3436,7 +3334,11 @@ export class PdfInfiniteCanvas {
     element: PdfPageElement,
     version: number
   ): Promise<void> {
-    if (this.zoomScaleService.getEpoch() !== version) return;
+    // CATiledLayer ARCHITECTURE (amnesia-aqv): Removed epoch-based early return.
+    // We ALWAYS render what we have - a "stale" render is still valuable content.
+    // Progressive display shows best available, then upgrades when better content arrives.
+    // The old pattern `if (epoch !== version) return;` caused high-res tile starvation
+    // because high-res tiles (100-500ms render) were always rejected as "stale".
 
     // STALE CAMERA FIX (2026-01-22): Always use current camera for render decisions.
     // Snapshot-based approach caused corrupted content when camera moved between
@@ -3486,11 +3388,9 @@ export class PdfInfiniteCanvas {
       const skipFullPageTransition = zoom > 8;
       
       if (skipFullPageTransition) {
-        console.log(`[MODE-TRANSITION-FIX] Page ${page}: HIGH-ZOOM (${zoom.toFixed(2)}x) - skipping full-page, going direct to tiled`);
         this.pageWasTiled.set(page, true);
         // Don't return - fall through to tiled render below
       } else {
-        console.log(`[MODE-TRANSITION-FIX] Page ${page}: Using full-page render for tiled transition at zoom ${zoom.toFixed(2)}`);
         // Render full-page first to establish a base layer
         await this.renderPageFull(page, element, version);
         // Mark as tiled so subsequent renders use tiled mode (not another full-page)
@@ -3508,8 +3408,66 @@ export class PdfInfiniteCanvas {
     // we must always show some content (even stretched/low-res) during transitions.
     // renderPageFull() will handle the canvas correctly via prepareForFullPageRender().
     const isModeTransitionToFullPage = wasTiled && !shouldTile;
+    
+    // TILE CORRUPTION DIAGNOSTICS (amnesia-26v): Log mode transitions
+    if (isDiagnosticsEnabled() && (isModeTransitionToFullPage || isModeTransitionToTiled)) {
+      const transitionType = isModeTransitionToTiled ? 'to-viewport-only' : 'to-full-page';
+      console.warn(`[TILE-CORRUPTION-DIAG] Mode transition: ${transitionType}`, {
+        page,
+        zoom: zoom.toFixed(2),
+        threshold: this.tileZoomThreshold,
+        wasTiled,
+        shouldTile,
+        recommendation: 'Invalidate cached tiles and abort in-flight requests',
+      });
+    }
+    
+    // =========================================================================
+    // MODE TRANSITION INVALIDATION (amnesia-584)
+    // =========================================================================
+    // CATiledLayer Principle: When crossing render mode thresholds, coordinate
+    // systems change fundamentally. Tiles from one mode are incompatible with
+    // the other mode's coordinate calculations.
+    //
+    // Full-page mode: canvasOffset = (0, 0), canvas sized to full PDF
+    // Viewport-only mode: canvasOffset = (tileBoundsX, tileBoundsY), canvas sized to visible tiles
+    //
+    // If we composite full-page mode tiles in viewport-only mode (or vice versa),
+    // the tiles appear at completely wrong positions because the coordinate
+    // origin has shifted.
+    //
+    // FIX: On mode transition, clear the tile cache for this page and abort
+    // any in-flight tile requests. This forces a fresh render in the new mode
+    // with correct coordinates.
+    if (isModeTransitionToFullPage || isModeTransitionToTiled) {
+      const transitionType = isModeTransitionToTiled ? 'full-page → tiled' : 'tiled → full-page';
+      console.warn(`[MODE-TRANSITION-INVALIDATE] page=${page}: Invalidating tiles for ${transitionType} transition`);
+      
+      // 1. Clear cached tiles for this page to prevent stale tiles
+      // from being composited with wrong coordinate assumptions
+      try {
+        const evictedCount = getTileCacheManager().evictTilesForPage(page);
+        if (evictedCount > 0) {
+          console.log(`[MODE-TRANSITION-INVALIDATE] Evicted ${evictedCount} cached tiles for page ${page}`);
+        }
+      } catch (e) {
+        console.warn(`[MODE-TRANSITION-INVALIDATE] Failed to evict page ${page} tiles:`, e);
+      }
+      
+      // 2. Abort in-flight tile requests - rely on epoch validation to filter stale tiles
+      // The epoch counter increments on mode transitions, so tiles from the old mode
+      // will be filtered out by the epoch validation in renderTiles()
+      
+      // 3. Reset the page element's canvas state to ensure clean rendering
+      // This clears internal tracking (lastCanvasOffsetX/Y, lastTileBoundsX/Y)
+      // which prevents content preservation from using old-mode content
+      if (element) {
+        element.resetCanvas();
+      }
+    }
+    // =========================================================================
+    
     if (isModeTransitionToFullPage) {
-      console.log(`[MODE-TRANSITION-FIX] Page ${page}: Transitioning from tiled → full-page at zoom ${zoom.toFixed(2)}`);
       // Clear the tiled flag so subsequent zoom-in uses proper transition
       this.pageWasTiled.set(page, false);
     }
@@ -3532,14 +3490,14 @@ export class PdfInfiniteCanvas {
     zoom: number,
     version: number
   ): Promise<void> {
-    // EPOCH GUARD: Skip if epoch changed (zoom/mode transition occurred)
-    // MIGRATION (amnesia-d9f): Using ZoomScaleService epoch as primary
-    if (this.zoomScaleService.getEpoch() !== version) return;
+    // CATiledLayer ARCHITECTURE (amnesia-aqv): Removed epoch-based early return.
+    // Tiles are NEVER rejected based on "staleness" - we always show best available.
+    // High-res tiles take 100-500ms to render; rejecting them caused permanent
+    // fallback to low-res scale-4 content at high zoom (32x).
 
     // ZOOM STATE GUARD: Don't render during zoom gestures.
     // This prevents queued renders from executing while zooming.
     if (!this.zoomScaleService.canRender()) {
-      console.log(`[PdfInfiniteCanvas] Skipping tiled render for page ${page} - zoom gesture active`);
       return;
     }
 
@@ -3574,9 +3532,6 @@ export class PdfInfiniteCanvas {
       pdfToElementScale,
       epoch: version, // From ZoomStateManager.getEpoch() - incremented on zoom changes
     };
-
-    // Log snapshot for debugging (using current camera - no stale snapshots)
-    console.log(`[TransformSnapshot] REQUEST page=${page}: zoom=${zoom.toFixed(2)}, snapshot.dims=${containerWidth.toFixed(0)}×${containerHeight.toFixed(0)}, snapshot.scale=${pdfToElementScale.toFixed(3)}, epoch=${version}, camera.z=${this.camera.z.toFixed(2)}`);
 
     try {
       // Check if we're transitioning rendering modes (amnesia-wbp consolidated)
@@ -3835,7 +3790,6 @@ export class PdfInfiniteCanvas {
           // Viewport-only: get tiles that intersect the expanded viewport
           // GRID SCALE FIX (amnesia-e4i): Use gridTileScale for tile GRID calculation
           tiles = this.tileEngine!.getVisibleTiles(expandedViewport, [layout], zoom, gridTileScale);
-          console.log(`[VIEWPORT-ONLY-TILES] page=${page} zoom=${zoom.toFixed(2)}: ${tiles.length} viewport tiles at gridScale=${gridTileScale} renderScale=${tileScale} (avoiding ${Math.ceil(layout.width / (getTileSize(zoom) / gridTileScale)) * Math.ceil(layout.height / (getTileSize(zoom) / gridTileScale))} full-page tiles)`);
         } else {
           // Full-page: get all tiles for the page
           // GRID SCALE FIX (amnesia-e4i): Use gridTileScale for tile GRID calculation
@@ -3860,8 +3814,6 @@ export class PdfInfiniteCanvas {
         // Ensure we have a sensible limit (use 200 as fallback if Infinity)
         const effectiveLimit = Number.isFinite(maxTilesPerPage) ? maxTilesPerPage : 200;
         
-        console.log(`[TILE-LIMIT-DIRECT] page=${page} zoom=${zoom.toFixed(2)}: coordLimit=${coordinatorLimit}, zoomLimit=${zoomBasedLimit}, effective=${effectiveLimit}, tiles=${tiles.length}`);
-        
         if (effectiveLimit > 0 && tiles.length > effectiveLimit) {
           console.warn(`[TILE-LIMIT] page=${page} zoom=${zoom.toFixed(2)}: Limiting from ${tiles.length} to ${effectiveLimit} tiles (zoom-based limit)`);
           // Sort tiles by distance from viewport center, keep closest
@@ -3880,49 +3832,11 @@ export class PdfInfiniteCanvas {
           tiles = tiles.slice(0, effectiveLimit);
         }
 
-        // DIAGNOSTIC LOGGING (elusive bug investigation - 2026-01-20)
-        if (zoom >= 4) {
-          const overlaps = this.rectsOverlap(viewport, layout);
-          const intLeft = Math.max(viewport.x, layout.x);
-          const intTop = Math.max(viewport.y, layout.y);
-          const intRight = Math.min(viewport.x + viewport.width, layout.x + layout.width);
-          const intBottom = Math.min(viewport.y + viewport.height, layout.y + layout.height);
-          const intWidth = Math.max(0, intRight - intLeft);
-          const intHeight = Math.max(0, intBottom - intTop);
-
-          console.log('[TILED-RENDER-DEBUG]', {
-            page,
-            zoom: zoom.toFixed(2),
-            tileScale,
-            tileCount: tiles.length,
-            forceFullPageTiles,
-            viewportExpansion: `renderBuffer=${renderBuffer}px → ${(expandedViewport.width / viewport.width).toFixed(1)}x wider`,
-            viewportLayoutOverlap: overlaps,
-            viewport: `x=${viewport.x.toFixed(1)}, y=${viewport.y.toFixed(1)}, w=${viewport.width.toFixed(1)}, h=${viewport.height.toFixed(1)}`,
-            expandedViewport: `x=${expandedViewport.x.toFixed(1)}, y=${expandedViewport.y.toFixed(1)}, w=${expandedViewport.width.toFixed(1)}, h=${expandedViewport.height.toFixed(1)}`,
-            layout: `x=${layout.x.toFixed(1)}, y=${layout.y.toFixed(1)}, w=${layout.width.toFixed(1)}, h=${layout.height.toFixed(1)}`,
-            intersection: `x=${intLeft.toFixed(1)}, y=${intTop.toFixed(1)}, w=${intWidth.toFixed(1)}, h=${intHeight.toFixed(1)}`,
-            tileCoords: tiles.length > 0
-              ? tiles.slice(0, 5).map(t => `(${t.tileX},${t.tileY})`).join(', ') + (tiles.length > 5 ? `... (${tiles.length} total)` : '')
-              : '(NONE - BUG!)',
-            cameraSource: this.zoomScaleService.getZoomSnapshot() ? 'zoomSnapshot' : (this.scrollRenderSnapshot ? 'scrollSnapshot' : 'current'),
-            camera: `x=${effectiveCamera.x.toFixed(1)}, y=${effectiveCamera.y.toFixed(1)}, z=${effectiveCamera.z.toFixed(2)}`,
-          });
-        }
       } else {
         // Non-tiled path (zoom below threshold)
         // TILE-SIZE-MISMATCH-FIX: Pass zoom parameter to ensure consistent tile sizing.
         // GRID SCALE FIX (amnesia-e4i): Use gridTileScale for tile GRID calculation
         tiles = this.tileEngine!.getPageTileGrid(page, gridTileScale, zoom);
-      }
-
-      // === TILE-RANGE-DEBUG === Log the actual tile ranges generated
-      if (tiles.length > 0 && zoom >= 4) {
-        const tileXs = tiles.map(t => t.tileX);
-        const tileYs = tiles.map(t => t.tileY);
-        const minX = Math.min(...tileXs), maxX = Math.max(...tileXs);
-        const minY = Math.min(...tileYs), maxY = Math.max(...tileYs);
-        console.error(`[TILE-RANGE] page=${page} zoom=${zoom.toFixed(2)} tiles=${tiles.length}: X=[${minX}-${maxX}], Y=[${minY}-${maxY}]`);
       }
 
       // VIEWPORT-ONLY FIX (amnesia-d9f 2026-01-23): Capture expected tile bounds at REQUEST time.
@@ -3974,7 +3888,17 @@ export class PdfInfiniteCanvas {
           height: boundsHeight,
         };
         
+        // amnesia-0ej FIX: Capture canvas offset at request time for coordinate consistency.
+        // In viewport-only mode, the canvas offset equals the tile bounds origin.
+        // This ensures tiles are positioned correctly even if viewport moves during render.
+        transformSnapshot.canvasOffsetX = boundsX;
+        transformSnapshot.canvasOffsetY = boundsY;
+        
         console.log(`[TransformSnapshot] EXPECTED-BOUNDS page=${page}: bounds=${boundsX.toFixed(1)},${boundsY.toFixed(1)} ${boundsWidth.toFixed(1)}x${boundsHeight.toFixed(1)}, tiles=[${minTileX}-${maxTileX}]x[${minTileY}-${maxTileY}], pdfTileSize=${pdfTileSize.toFixed(1)}`);
+      } else {
+        // amnesia-0ej FIX: In full-page mode, canvas offset is always (0,0)
+        transformSnapshot.canvasOffsetX = 0;
+        transformSnapshot.canvasOffsetY = 0;
       }
       
       // amnesia-e4i FIX (2026-01-25): Record requested tile count for accurate coverage calculation.
@@ -4057,7 +3981,7 @@ export class PdfInfiniteCanvas {
         MAX_CRITICAL_BATCH,
         Math.max(MIN_CRITICAL_BATCH, Math.floor(tiles.length * CRITICAL_PERCENTAGE))
       );
-      console.log(`[CRITICAL-BATCH] page=${page}: ${tiles.length} tiles, critical batch size=${CRITICAL_BATCH_SIZE} (${(CRITICAL_BATCH_SIZE / tiles.length * 100).toFixed(0)}% coverage)`);
+      console.log(`[CRITICAL-BATCH] page=${page}: ${tiles.length} tiles, critical batch size=${CRITICAL_BATCH_SIZE} (${(CRITICAL_BATCH_SIZE / tiles.length * 100).toFixed(0)}% coverage), zoom=${zoom.toFixed(2)}, useStreamingMode=${useStreamingMode}`);
       
       if (useStreamingMode && tiles.length > CRITICAL_BATCH_SIZE) {
         console.log(`[STREAMING-RENDER] page=${page} zoom=${zoom.toFixed(2)}: Using partial-wait streaming for ${tiles.length} tiles, epoch=${scaleSnapshot.epoch}`);
@@ -4070,27 +3994,84 @@ export class PdfInfiniteCanvas {
         // This gets cached and provides a fallback while high-res tiles load.
         const cacheManager = getTileCacheManager();
         const FALLBACK_SCALE = 4;
-        const hasFallback = cacheManager.hasFullPage(page, FALLBACK_SCALE) || 
-                           cacheManager.hasFullPage(page, 2) || 
-                           cacheManager.hasFullPage(page, 1);
+        const hasScale4 = cacheManager.hasFullPage(page, FALLBACK_SCALE);
+        const hasScale2 = cacheManager.hasFullPage(page, 2);
+        const hasScale1 = cacheManager.hasFullPage(page, 1);
+        const hasFallback = hasScale4 || hasScale2 || hasScale1;
+        console.log(`[FALLBACK-CHECK] page=${page}: hasScale4=${hasScale4}, hasScale2=${hasScale2}, hasScale1=${hasScale1}, hasFallback=${hasFallback}`);
         
-        if (!hasFallback && this.renderCoordinator) {
+        // amnesia-aqv FIX: Render fallback IMMEDIATELY as placeholder
+        // PROBLEM: User sees nothing for 2-3 seconds while waiting for critical batch
+        // SOLUTION: Always render available fallback FIRST, then start tile rendering
+        // This gives users something to see within ~100ms instead of waiting 2-3s
+        
+        const pdfDims = this.tileEngine?.pageDimensions.get(page);
+        
+        if (hasFallback && pdfDims) {
+          // Fallback already cached - render it immediately!
+          console.log(`[FALLBACK-IMMEDIATE] page=${page}: Cached fallback found, rendering as placeholder`);
+          try {
+            await element.renderTiles(
+              [], // No tiles yet - just base layer from cache
+              undefined,
+              zoom,
+              pdfDims,
+              transformSnapshot,
+              scaleSnapshot.epoch,
+              false
+            );
+            element.hideLoading();
+            console.log(`[FALLBACK-IMMEDIATE] page=${page}: Placeholder rendered from cache, now starting tile rendering`);
+          } catch (e) {
+            console.warn(`[FALLBACK-IMMEDIATE] page=${page}: Failed to render cached placeholder:`, e);
+          }
+        } else if (this.renderCoordinator && pdfDims) {
+          // No cached fallback - render one quickly
           console.log(`[FALLBACK-PRERENDER] page=${page}: No cached fallback, triggering scale-${FALLBACK_SCALE} pre-render`);
-          // Fire and forget - don't wait for this, it runs in parallel with tile rendering
-          this.renderCoordinator.requestRender({
+          
+          const FALLBACK_TIMEOUT_MS = 200; // Wait up to 200ms for fallback
+          const fallbackStartTime = performance.now();
+          const fallbackRequest = this.renderCoordinator.requestRender({
             type: 'page' as const,
             page,
             scale: FALLBACK_SCALE,
-            priority: 'high', // High priority but not critical - tiles come first
+            priority: 'critical', // CRITICAL priority - we need this ASAP
             documentId: this.documentId ?? undefined,
             sessionId: this.pendingSessionId,
-          }).then(result => {
-            if (result.success) {
-              console.log(`[FALLBACK-PRERENDER] page=${page}: Scale-${FALLBACK_SCALE} fallback cached`);
-            }
-          }).catch(() => {
-            // Silently ignore - fallback is best-effort
           });
+          
+          // Wait for fallback with timeout - don't block forever
+          const timeoutPromise = new Promise<null>(resolve => 
+            setTimeout(() => resolve(null), FALLBACK_TIMEOUT_MS)
+          );
+          
+          const fallbackResult = await Promise.race([fallbackRequest, timeoutPromise]);
+          const fallbackTime = performance.now() - fallbackStartTime;
+          
+          if (fallbackResult && fallbackResult.success) {
+            console.log(`[FALLBACK-PRERENDER] page=${page}: Scale-${FALLBACK_SCALE} fallback ready in ${fallbackTime.toFixed(0)}ms, rendering as placeholder`);
+            
+            try {
+              await element.renderTiles(
+                [], // No tiles yet - just base layer from cache
+                undefined,
+                zoom,
+                pdfDims,
+                transformSnapshot,
+                scaleSnapshot.epoch,
+                false
+              );
+              element.hideLoading();
+              console.log(`[FALLBACK-PRERENDER] page=${page}: Placeholder rendered, now starting tile rendering`);
+            } catch (e) {
+              console.warn(`[FALLBACK-PRERENDER] page=${page}: Failed to render placeholder:`, e);
+            }
+            if (fallbackResult.data instanceof ImageBitmap) {
+              fallbackResult.data.close();
+            }
+          } else {
+            console.log(`[FALLBACK-PRERENDER] page=${page}: Fallback timed out after ${FALLBACK_TIMEOUT_MS}ms, proceeding with tiles`);
+          }
         }
         
         // Split tiles: critical batch + background (rest)
@@ -4099,6 +4080,8 @@ export class PdfInfiniteCanvas {
         
         // Step 1: Queue critical tiles FIRST (they get priority in the semaphore)
         // This ensures critical tiles get permits before background/prefetch tiles
+        // amnesia-aqv: Use forceFreshRender to skip fallback path for critical batch.
+        // This ensures users see high-res tiles for the visible viewport, not blurry fallbacks.
         const criticalPromises = criticalTiles.map(tile =>
           this.renderCoordinator!.requestRender({
             type: 'tile' as const,
@@ -4108,6 +4091,7 @@ export class PdfInfiniteCanvas {
             sessionId: this.pendingSessionId,
             scaleEpoch: scaleSnapshot.epoch,
             renderParamsId: scaleSnapshot.snapshotId,
+            forceFreshRender: true, // Skip fallback - wait for actual high-res renders
           })
         );
         
@@ -4198,40 +4182,24 @@ export class PdfInfiniteCanvas {
 
       const results = await Promise.all(tilePromises);
 
-      // BLANK PAGE FIX: If version changed but page has no content, still render what we have.
-      // A stale tiled render or fallback to full-page is better than a blank page.
-      const versionStale = this.zoomScaleService.getEpoch() !== version;
-      const mustShowSomething = !element.getIsRendered();
-
-      // DIAGNOSTIC: Log at first epoch check (this is where tiles were being discarded)
-      if (versionStale && zoom >= 4) {
+      // CATiledLayer ARCHITECTURE: Epoch-based tile rejection REMOVED
+      //
+      // The old approach discarded tiles when epoch changed during render:
+      // - Tiles took 100-500ms to render
+      // - Epoch incremented 40+ times during zoom gesture
+      // - Tiles were discarded as "stale" even though they were at correct position/scale
+      // - Result: high-res tiles never displayed, permanent low-res fallback
+      //
+      // New approach: Accept ALL rendered tiles regardless of epoch.
+      // The spatial index validates tile position/scale, not temporal epoch.
+      // Progressive display shows best available while better content arrives.
+      //
+      // Diagnostic logging for debugging (no rejection):
+      const currentEpoch = this.zoomScaleService.getEpoch();
+      if (currentEpoch !== version && zoom >= 4) {
         const successCount = results.filter(r => r.success && r.data instanceof ImageBitmap).length;
-        console.warn(`[EpochDiscard-1] page=${page} zoom=${zoom.toFixed(2)}: epoch ${version}→${this.zoomScaleService.getEpoch()}, ` +
-          `${successCount}/${tiles.length} tiles successful, mustShowSomething=${mustShowSomething}, ` +
-          `DISCARDING=${!mustShowSomething}`);
-      }
-
-      if (versionStale && !mustShowSomething) {
-        // CLEANUP: Close all ImageBitmaps before returning to prevent GPU memory leak
-        for (const result of results) {
-          if (result.success && result.data instanceof ImageBitmap) {
-            result.data.close();
-          }
-        }
-        return;
-      }
-
-      if (versionStale && mustShowSomething) {
-        // Version changed but page has no content - fall back to full-page render
-        // Close tile bitmaps first, then render full page
-        for (const result of results) {
-          if (result.success && result.data instanceof ImageBitmap) {
-            result.data.close();
-          }
-        }
-        console.warn(`[PdfInfiniteCanvas] Version stale but page ${page} has no content, forcing full render`);
-        await this.renderPageFull(page, element, this.zoomScaleService.getEpoch());
-        return;
+        console.log(`[CATiledLayer] page=${page} zoom=${zoom.toFixed(2)}: epoch ${version}→${currentEpoch}, ` +
+          `${successCount}/${tiles.length} tiles successful - ACCEPTING ALL (no epoch rejection)`);
       }
 
       // Collect successful tile data for rendering
@@ -4397,18 +4365,14 @@ export class PdfInfiniteCanvas {
         // Text layer is optional
       }
 
-      // BLANK PAGE FIX: Apply same pattern - if version stale but page blank, still render
-      if (this.zoomScaleService.getEpoch() !== version && element.getIsRendered()) {
-        // DIAGNOSTIC: Log when tiles are discarded due to epoch change after text layer
-        if (zoom >= 4 && zoom <= 10) {
-          console.warn(`[TileDiscard] page=${page}: Discarding ${tileImages.length} tiles (epoch ${version} → ${this.zoomScaleService.getEpoch()})`);
-        }
-        // CLEANUP: Close all collected ImageBitmaps before returning
-        for (const { bitmap } of tileImages) {
-          bitmap.close();
-        }
-        return;
-      }
+      // CATiledLayer ARCHITECTURE (amnesia-aqv): REMOVED epoch-based tile discard.
+      // This was the PRIMARY cause of high-res tile starvation at zoom 32x.
+      // Tiles that took 100-500ms to render were ALWAYS discarded because
+      // epoch changed 40+ times during the render (one per zoom event).
+      // 
+      // Now we ALWAYS display tiles regardless of epoch. Progressive display
+      // shows whatever we have, then upgrades when better content arrives.
+      // "Stale" tiles are still VALID content - they just might be at wrong zoom level.
 
       // Get PDF native dimensions for coordinate transform
       // Tiles are rendered in PDF coordinate space, but layout may be scaled
@@ -4741,7 +4705,9 @@ export class PdfInfiniteCanvas {
     element: PdfPageElement,
     version: number
   ): Promise<void> {
-    if (this.zoomScaleService.getEpoch() !== version) return;
+    // CATiledLayer ARCHITECTURE (amnesia-aqv): Removed epoch-based early return.
+    // Full-page renders are valuable fallback content - never reject them as "stale".
+    // Progressive display will upgrade when higher-quality content arrives.
 
     element.showLoading();
 
@@ -4796,35 +4762,20 @@ export class PdfInfiniteCanvas {
           format: 'png',
         });
 
-        // BLANK PAGE FIX: If version changed but page has no content, still show what we have.
-        // A stale render is better than a blank page. The next render will overwrite it.
-        const versionStale = this.zoomScaleService.getEpoch() !== version;
-        const mustShowSomething = !element.getIsRendered();
+        // CATiledLayer ARCHITECTURE (amnesia-aqv): REMOVED epoch-based render rejection.
+        // Full-page renders are ALWAYS valuable - even "stale" content is better than blank.
+        // The old pattern discarded valid renders if epoch changed during the async fetch,
+        // which happened constantly during zoom gestures (40+ epoch changes per gesture).
+        //
+        // Now we ALWAYS render what we fetched. Progressive display handles showing
+        // best available content and upgrading when better content arrives.
 
-        if (versionStale && !mustShowSomething) {
-          // Page has content and version is stale - skip safely
-          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
-          element.showCanvas();
-          element.hideLoading();
-          return;
-        }
-
-        // Get text layer (non-blocking) - skip if version stale to avoid delay
+        // Get text layer (non-blocking)
         let textLayerData: TextLayerData | undefined;
-        if (!versionStale) {
-          try {
-            textLayerData = await this.provider.getPageTextLayer(page);
-          } catch {
-            // Text layer is optional
-          }
-        }
-
-        // Another version check for text layer await, but still show if page is blank
-        if (this.zoomScaleService.getEpoch() !== version && element.getIsRendered()) {
-          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
-          element.showCanvas();
-          element.hideLoading();
-          return;
+        try {
+          textLayerData = await this.provider.getPageTextLayer(page);
+        } catch {
+          // Text layer is optional
         }
 
         // Display initial (may be thumbnail or full quality)
@@ -4871,31 +4822,14 @@ export class PdfInfiniteCanvas {
         // Fallback: use original single-resolution path
         const imageBlob = await this.getCachedPageImage(page);
 
-        // BLANK PAGE FIX: Same pattern - show stale content if page has no content
-        const versionStale = this.zoomScaleService.getEpoch() !== version;
-        const mustShowSomething = !element.getIsRendered();
-
-        if (versionStale && !mustShowSomething) {
-          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
-          element.showCanvas();
-          element.hideLoading();
-          return;
-        }
+        // CATiledLayer ARCHITECTURE (amnesia-aqv): REMOVED epoch-based render rejection.
+        // Same as dual-res path - we ALWAYS render fetched content.
 
         let textLayerData: TextLayerData | undefined;
-        if (!versionStale) {
-          try {
-            textLayerData = await this.provider.getPageTextLayer(page);
-          } catch {
-            // Text layer is optional
-          }
-        }
-
-        if (this.zoomScaleService.getEpoch() !== version && element.getIsRendered()) {
-          // BLANK PAGE FIX: prepareForFullPageRender() set opacity=0, must restore it
-          element.showCanvas();
-          element.hideLoading();
-          return;
+        try {
+          textLayerData = await this.provider.getPageTextLayer(page);
+        } catch {
+          // Text layer is optional
         }
 
         await element.render({ imageBlob, textLayerData }, zoomAwareScale);

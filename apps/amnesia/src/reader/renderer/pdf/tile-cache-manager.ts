@@ -39,6 +39,7 @@ import { SCALE_TIERS, getScaleTiers, getDynamicMaxScaleTier, roundScaleForCache,
 import { getTypedArrayPool } from './typed-array-pool';
 import { isFeatureEnabled } from './feature-flags';
 import { getTileSize } from './tile-render-engine';
+import { SpatialTileIndex, createSpatialTileIndex, type PdfRegion, type SpatialQueryResult, type PageDimensions } from './spatial-tile-index';
 
 // ============================================================================
 // TILE COMPLIANCE VALIDATOR (amnesia-e4i)
@@ -625,8 +626,29 @@ export class TileCacheManager {
   /**
    * Index of cached tile scale tiers by page.
    * Used for O(1) lookup during fallback tile search.
+   * @deprecated Use spatialIndex for multi-resolution lookup instead
    */
   private scaleTierIndex: Map<number, Map<number, Set<number>>> = new Map();
+
+  // ============================================================================
+  // SPATIAL TILE INDEX (CATiledLayer-style architecture)
+  // ============================================================================
+  // QuadTree-based spatial index for O(log n) multi-resolution tile lookup.
+  // Replaces epoch-based validation with spatial "best available" semantics.
+  // Tiles are never rejected based on "staleness" - best available is always shown.
+  // ============================================================================
+
+  /**
+   * Spatial index for fast multi-resolution tile lookup.
+   * Implements CATiledLayer-style "best available" semantics.
+   */
+  private spatialIndex: SpatialTileIndex;
+
+  /**
+   * Page dimensions cache for spatial index coordinate calculations.
+   * Key: page number, Value: { width, height } in PDF units
+   */
+  private pageDimensionsCache: Map<number, PageDimensions> = new Map();
 
   constructor(options?: {
     l1MaxSize?: number;
@@ -657,6 +679,46 @@ export class TileCacheManager {
 
     // L3: Unbounded metadata cache
     this.l3Cache = new Map();
+
+    // Initialize spatial index with default configuration
+    // System detection will update config via updateSpatialIndexConfig()
+    this.spatialIndex = createSpatialTileIndex();
+  }
+
+  /**
+   * Update spatial index configuration based on system capabilities.
+   * Should be called after system detection completes.
+   */
+  updateSpatialIndexConfig(systemProfile: { tier: 'high' | 'mid' | 'low' }): void {
+    // Create a new spatial index with the appropriate config
+    // Transfer page dimensions from old index
+    const oldDimensions = this.pageDimensionsCache;
+    this.spatialIndex = createSpatialTileIndex(systemProfile);
+    
+    // Restore page dimensions
+    for (const [page, dims] of oldDimensions) {
+      this.spatialIndex.setPageDimensions(page, dims);
+    }
+    
+    console.log(`[TileCacheManager] Spatial index configured for ${systemProfile.tier} tier device`);
+  }
+
+  /**
+   * Set page dimensions for spatial indexing.
+   * Must be called before caching tiles for a page.
+   */
+  setPageDimensions(page: number, width: number, height: number): void {
+    const dims: PageDimensions = { width, height };
+    this.pageDimensionsCache.set(page, dims);
+    this.spatialIndex.setPageDimensions(page, dims);
+  }
+
+  /**
+   * Get the spatial index for direct queries.
+   * Used by progressive rendering to get best available tiles.
+   */
+  getSpatialIndex(): SpatialTileIndex {
+    return this.spatialIndex;
   }
 
   /**
@@ -839,6 +901,23 @@ export class TileCacheManager {
       return createImageBitmap(data.blob);
     }
     throw new Error('Invalid cached tile data: missing rgba or blob');
+  }
+
+  /**
+   * Create an ImageBitmap from CachedTileData.
+   * Public wrapper around createBitmapFromCachedData for use with spatial index results.
+   * The caller owns the returned ImageBitmap and should close() it after use.
+   * 
+   * @param data Cached tile data (from SpatialQueryResult or direct cache access)
+   * @returns Fresh ImageBitmap or null if data is invalid
+   */
+  async createBitmapFromData(data: CachedTileData): Promise<ImageBitmap | null> {
+    try {
+      return await this.createBitmapFromCachedData(data);
+    } catch (error) {
+      console.warn('[TileCacheManager] createBitmapFromData failed:', error);
+      return null;
+    }
   }
 
   /**
@@ -1055,6 +1134,10 @@ export class TileCacheManager {
     // amnesia-aqv Phase 2A: Update scale-tier index for fast fallback lookup
     this.indexTile(tile);
 
+    // CATiledLayer architecture: Also insert into spatial index
+    // This enables O(log n) multi-resolution lookup without epoch validation
+    this.spatialIndex.insert(tile, cacheData);
+
     // Reset consecutive misses since we just cached something
     this.consecutiveMisses = 0;
   }
@@ -1062,6 +1145,7 @@ export class TileCacheManager {
   /**
    * Index a tile in the scale-tier index for O(1) fallback lookup.
    * @internal
+   * @deprecated Spatial index now handles multi-resolution lookup
    */
   private indexTile(tile: TileCoordinate): void {
     const page = tile.page;
@@ -1108,6 +1192,58 @@ export class TileCacheManager {
     if (!pageIndex) return [];
 
     return Array.from(pageIndex.keys()).sort((a, b) => b - a);
+  }
+
+  /**
+   * Find ANY cached tile at the given page/scale/tileSize.
+   * Used when the exact tile isn't cached but we know tiles exist at this scale.
+   * Returns the first matching tile found in the cache.
+   * @internal
+   */
+  /**
+   * Find ANY cached tile at the given page/scale/tileSize.
+   * 
+   * NOTE: This method is currently UNUSED because returning a tile at arbitrary
+   * coordinates doesn't help - the tile must cover the visible viewport region.
+   * Keeping for potential future use with proper coordinate mapping.
+   * @internal
+   */
+  private findAnyCachedTileAtScale(
+    page: number, 
+    scale: number, 
+    tileSize: number
+  ): { tile: TileCoordinate; data: CachedTileData } | null {
+    const cacheScale = getScaleForCacheKey(scale);
+    const keyPrefix = `${this.documentId}-p${page}-t`;
+    const keySuffix = `-s${cacheScale}-ts${tileSize}`;
+    
+    // Search L1 cache first (smaller, faster)
+    for (const [key, entry] of this.l1Cache.entries()) {
+      if (key.startsWith(keyPrefix) && key.endsWith(keySuffix)) {
+        const match = key.match(/-t(\d+)x(\d+)-/);
+        if (match) {
+          return { 
+            tile: { page, tileX: parseInt(match[1], 10), tileY: parseInt(match[2], 10), scale, tileSize },
+            data: entry.value 
+          };
+        }
+      }
+    }
+    
+    // Search L2 cache
+    for (const [key, entry] of this.l2Cache.entries()) {
+      if (key.startsWith(keyPrefix) && key.endsWith(keySuffix)) {
+        const match = key.match(/-t(\d+)x(\d+)-/);
+        if (match) {
+          return { 
+            tile: { page, tileX: parseInt(match[1], 10), tileY: parseInt(match[2], 10), scale, tileSize },
+            data: entry.value 
+          };
+        }
+      }
+    }
+    
+    return null;
   }
 
   /**
@@ -1555,6 +1691,49 @@ export class TileCacheManager {
     // FIX: Try all possible tileSizes for each scale tier.
     const POSSIBLE_TILE_SIZES = [512, 256, 128]; // Prefer larger tiles (better quality)
 
+    // amnesia-aqv CRITICAL FIX: Try the SAME scale with ALL tileSizes.
+    // The scale tier loops below skip the requested scale (scale 32 skips 32).
+    // But the exact match may have failed because:
+    // 1. The tile was stored with a different tileSize
+    // 2. The specific tile hasn't been rendered yet (but others at same scale HAVE)
+    //
+    // FIX: Try ALL tileSizes at the SAME scale, including the current one.
+    // For the current tileSize, we try NEARBY tiles (not the exact match which already failed).
+    for (const altTileSize of POSSIBLE_TILE_SIZES) {
+      // Check if any tiles exist at this scale+tileSize (O(1) via index)
+      if (!this.hasAnyTilesAtScale(tile.page, tile.scale, altTileSize)) {
+        continue;
+      }
+      
+      // Calculate tile coordinates for this tileSize
+      const altPdfTileSize = altTileSize / tile.scale;
+      const altTileX = Math.floor(pdfX / altPdfTileSize);
+      const altTileY = Math.floor(pdfY / altPdfTileSize);
+      
+      const altTile: TileCoordinate = {
+        page: tile.page,
+        tileX: altTileX,
+        tileY: altTileY,
+        scale: tile.scale,
+        tileSize: altTileSize,
+      };
+      
+      // For same tileSize, skip exact match (already tried above)
+      if (altTileSize === effectiveTileSize && 
+          altTileX === tile.tileX && altTileY === tile.tileY) {
+        // This is the exact same tile we already tried - skip it
+        // DON'T use findAnyCachedTileAtScale here - it returns a tile at wrong coordinates
+        // that won't cover the visible region. Let it fall through to lower-scale fallback.
+        continue;
+      }
+      
+      const altData = this.getCachedData(altTile);
+      if (altData) {
+        // Found same scale with different tileSize - cssStretch is 1 (same scale)
+        return { data: altData, actualScale: tile.scale, cssStretch: 1, fallbackTile: altTile };
+      }
+    }
+
     // Helper: find cached tile at given scale+tileSize that covers the same PDF position
     // amnesia-aqv Phase 2A: Uses scale-tier index for O(1) skip of empty tiers
     const findCachedTileForPdfPosition = (
@@ -1818,6 +1997,117 @@ export class TileCacheManager {
       }
     }
     return 0;
+  }
+
+  // ============================================================================
+  // SPATIAL INDEX METHODS (CATiledLayer-style architecture)
+  // ============================================================================
+  // These methods use the quadtree-based spatial index for O(log n) lookups.
+  // Unlike epoch-based validation, tiles are NEVER rejected based on "staleness".
+  // The best available content is always returned, enabling progressive display.
+  // ============================================================================
+
+  /**
+   * Get best available tiles for a PDF region using spatial index.
+   * 
+   * This is the core CATiledLayer-style query: returns the best content
+   * available for a region, regardless of when it was rendered.
+   * 
+   * Unlike getBestAvailable(), this method:
+   * - Uses O(log n) quadtree lookup instead of O(scale_tiers)
+   * - Never rejects tiles based on epoch/staleness
+   * - Returns multiple tiles at different scales for progressive display
+   * 
+   * @param page Page number
+   * @param region PDF region to query (in PDF coordinate units)
+   * @param targetScale Desired scale (will return lower if unavailable)
+   * @returns Array of tiles covering the region, best quality first
+   */
+  getBestAvailableSpatial(
+    page: number,
+    region: PdfRegion,
+    targetScale: number
+  ): SpatialQueryResult[] {
+    return this.spatialIndex.getBestAvailable(page, region, targetScale);
+  }
+
+  /**
+   * Get best available tile for a specific tile coordinate using spatial index.
+   * 
+   * Convenience wrapper that converts tile coordinate to PDF region.
+   * 
+   * @param tile Tile coordinate with desired scale
+   * @returns Best available tile or null
+   */
+  getBestAvailableForTileSpatial(tile: TileCoordinate): SpatialQueryResult | null {
+    return this.spatialIndex.getBestAvailableForTile(tile);
+  }
+
+  /**
+   * Get eviction candidates based on spatial distance from viewport.
+   * 
+   * This is the CATiledLayer-style eviction strategy:
+   * - Tiles farthest from viewport are evicted first
+   * - Fallback tiles (low-scale coverage) are protected
+   * - No epoch consideration - purely geometric
+   * 
+   * @param viewportCenter Center of the current viewport { page, x, y }
+   * @param count Number of candidates to return
+   * @returns Tiles to evict, sorted by priority (evict first = index 0)
+   */
+  getEvictionCandidatesSpatial(
+    viewportCenter: { page: number; x: number; y: number },
+    count: number
+  ): { page: number; tile: TileCoordinate }[] {
+    return this.spatialIndex.getEvictionCandidates(viewportCenter, count);
+  }
+
+  /**
+   * Evict tiles using spatial distance from viewport.
+   * 
+   * CATiledLayer-style eviction: removes tiles farthest from viewport
+   * while protecting fallback coverage.
+   * 
+   * @param viewportCenter Center of current viewport { page, x, y }
+   * @param count Number of tiles to evict
+   * @returns Number of tiles actually evicted
+   */
+  evictBySpatialDistance(
+    viewportCenter: { page: number; x: number; y: number },
+    count: number
+  ): number {
+    const candidates = this.getEvictionCandidatesSpatial(viewportCenter, count);
+    let evicted = 0;
+
+    for (const { tile } of candidates) {
+      // Check if this is the only coverage for its region
+      if (this.spatialIndex.isOnlyCoverageForRegion(tile)) {
+        continue; // Protect fallback coverage
+      }
+
+      // Evict from both LRU caches and spatial index
+      const key = this.getTileKey(tile);
+      this.l1Cache.delete(key);
+      this.l2Cache.delete(key);
+      this.spatialIndex.remove(tile);
+      
+      evicted++;
+      if (evicted >= count) break;
+    }
+
+    return evicted;
+  }
+
+  /**
+   * Get spatial index statistics for debugging.
+   */
+  getSpatialIndexStats(): {
+    pageCount: number;
+    totalTiles: number;
+    totalNodes: number;
+    perPage: Map<number, { nodeCount: number; tileCount: number; depth: number }>;
+  } {
+    return this.spatialIndex.getStats();
   }
 
   /**

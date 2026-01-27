@@ -23,6 +23,13 @@ import { getTileCacheManager, validateTileBatchCompliance } from './tile-cache-m
 import { getTileDiagnosticOverlay } from './tile-diagnostic-overlay';
 import { getT2HRTracker } from './t2hr-tracker';
 import { getDevicePixelRatio } from './dpr-utils';
+import {
+  diagnoseScaleMixing,
+  diagnoseEpochMismatch,
+  diagnoseModeTransition,
+  diagnoseSnapshotDrift,
+  isDiagnosticsEnabled,
+} from './tile-corruption-diagnostics';
 
 export type ReadingMode = 'device' | 'light' | 'sepia' | 'dark' | 'night';
 export type RenderMode = 'page' | 'reflow';
@@ -118,6 +125,20 @@ export interface TransformSnapshot {
    * needs to know this limit to avoid false positives.
    */
   requestedTileCount?: number;
+  
+  /**
+   * Canvas offset in PDF coordinates at request time (amnesia-0ej).
+   * 
+   * CRITICAL FOR COORDINATE CONSISTENCY: When tiles are requested, the canvas
+   * offset determines where PDF coordinate (0,0) maps to canvas coordinate (0,0).
+   * Using current offset at display time when tiles were rendered for a different
+   * offset causes tiles to appear at wrong canvas positions.
+   * 
+   * In full-page mode: canvasOffsetX/Y = (0, 0)
+   * In viewport-only mode: canvasOffsetX/Y = (expectedTileBounds.x, expectedTileBounds.y)
+   */
+  canvasOffsetX?: number;
+  canvasOffsetY?: number;
 }
 
 /**
@@ -578,11 +599,6 @@ export class PdfPageElement {
         `mismatch=${(aspectMismatch * 100).toFixed(1)}%`);
       // Clear the canvas - backdrop from full-page cache will be shown instead
       this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    } else {
-      console.log(`[ZOOM-CSS-RESET] page=${this.config.pageNumber}: ` +
-        `Reset CSS from ${prevCss.width}x${prevCss.height} (transform="${prevCss.transform}") ` +
-        `to ${this.currentWidth}x${this.currentHeight} (full container), ` +
-        `aspect mismatch=${(aspectMismatch * 100).toFixed(1)}% (OK)`);
     }
 
     // Track reset time for race condition detection
@@ -627,8 +643,6 @@ export class PdfPageElement {
 
     // Mark as needing re-render
     this.isRendered = false;
-
-    console.log(`[RESET-CANVAS] page=${this.config.pageNumber}: Cleared viewport state for mode transition`);
   }
 
   /**
@@ -736,8 +750,6 @@ export class PdfPageElement {
     if (!this.isRendered) {
       this.showPlaceholder();
     }
-
-    console.log(`[PdfPageElement] setFinalDimensions: page=${this.config.pageNumber}, finalSize=${finalWidth.toFixed(0)}x${finalHeight.toFixed(0)}, buffer=${bufferWidth}x${bufferHeight}, zoom=${zoom.toFixed(2)}`);
   }
 
   /**
@@ -868,8 +880,6 @@ export class PdfPageElement {
     const useOverlay = this.isRenderingToOverlay();
     
     if (useOverlay) {
-      console.log(`[RENDER-OVERLAY] page=${this.config.pageNumber}: Rendering to overlay canvas for atomic swap`);
-      
       // Render to overlay canvas
       await this.renderCanvasToTarget(data.imageBlob, this.overlayCanvas!, this.overlayCtx!);
       
@@ -889,7 +899,6 @@ export class PdfPageElement {
       // Apply reading mode styles
       this.applyReadingModeStyles();
       
-      console.log(`[RENDER-OVERLAY] page=${this.config.pageNumber}: Complete in ${renderTime.toFixed(0)}ms`);
       return;
     }
     
@@ -987,20 +996,11 @@ export class PdfPageElement {
     // CONCURRENT RENDER FIX: Track this as the latest render for this page instance.
     // Any older render that hasn't completed yet will be discarded before canvas write.
     this.latestRenderSeq = renderSeq;
-    console.log(`[RENDER-SEQ] page=${this.config.pageNumber} seq=${renderSeq} STARTED (latestRenderSeq=${this.latestRenderSeq})`);
-    if (zoom >= 4 && tiles.length > 0) {
-      const tileXs = tiles.map(t => t.tile.tileX);
-      const tileYs = tiles.map(t => t.tile.tileY);
-      const minX = Math.min(...tileXs), maxX = Math.max(...tileXs);
-      const minY = Math.min(...tileYs), maxY = Math.max(...tileYs);
-      // MULTI-SCALE DIAGNOSTIC (amnesia-hfc update): Track if tiles have different scales
-      // Now allows mixed scales when cssStretch compensates for per-tile quality variation
-      const uniqueScales = [...new Set(tiles.map(t => t.tile.scale))];
-      const scaleInfo = uniqueScales.length > 1
-        ? `MULTI-SCALE=[${uniqueScales.join(',')}]`
-        : `scale=${uniqueScales[0]}`;
-      console.error(`[TILE-RECEIVE] seq=${renderSeq} page=${this.config.pageNumber} zoom=${zoom.toFixed(2)} tiles=${tiles.length}: X=[${minX}-${maxX}], Y=[${minY}-${maxY}], ${scaleInfo}, forceFullPage=${forceFullPage}`);
 
+    if (zoom >= 4 && tiles.length > 0) {
+      // Track unique scales for diagnostic purposes
+      const uniqueScales = [...new Set(tiles.map(t => t.tile.scale))];
+      
       // INV-6a (amnesia-hfc): Scale × cssStretch = consistent visual scale
       // Mixed scales are allowed when using per-tile quality variation.
       // Verify: each tile's visualScale (scale × cssStretch) should be consistent.
@@ -1009,9 +1009,7 @@ export class PdfPageElement {
         // The tile drawing loop uses consistent tileScale for positioning and stretches
         // individual tiles to fill the correct visual area. This allows tiles at different
         // render scales to composite correctly.
-        //
-        // Log for diagnostic purposes but this is no longer a bug condition.
-        console.log(`[MULTI-SCALE-INFO] page=${this.config.pageNumber}: Compositing tiles at scales [${uniqueScales.join(', ')}] → target tileScale (handled via stretch compensation)`);
+        // Multi-scale compositing is now handled correctly via stretch compensation.
       }
 
       // TILE COMPLIANCE VALIDATION (amnesia-e4i): Check tiles at compositing time
@@ -1046,44 +1044,20 @@ export class PdfPageElement {
         }
       }
 
-      // SCALE EPOCH VALIDATION (INV-6: Scale/Layout Atomicity)
-      // Check if tiles have stale scaleEpoch values
-      // amnesia-aqv: Use currentEpoch passed from caller (from ZoomScaleService)
-      if (currentEpoch !== undefined) {
-        const staleTiles = tiles.filter(t => {
-          // scaleEpoch is passed through from RenderResult (attached at request time)
-          const tileEpoch = (t as { scaleEpoch?: number }).scaleEpoch;
-          return tileEpoch !== undefined && tileEpoch !== currentEpoch;
-        });
-
-        if (staleTiles.length > 0) {
-          const staleEpochs = [...new Set(staleTiles.map(t => (t as { scaleEpoch?: number }).scaleEpoch))];
-          console.warn(`[SCALE-EPOCH-STALE] page=${this.config.pageNumber}: ${staleTiles.length}/${tiles.length} tiles have stale epochs [${staleEpochs.join(',')}], current=${currentEpoch}`);
-          
-          // Record epoch mismatches for diagnostic overlay (amnesia-e4i debugging)
-          for (const epoch of staleEpochs) {
-            if (epoch !== undefined) {
-              try {
-                getTileDiagnosticOverlay().recordEpochMismatch(epoch);
-              } catch { /* overlay may not be initialized */ }
-            }
-          }
-
-          // INV-6 ENFORCEMENT: Filter out stale tiles to prevent mixed-scale corruption
-          // Stale tiles were rendered at a different scale than current - displaying them
-          // would cause dimension mismatches (the 11.380 vs 11.381 bug)
-          const filteredTiles = tiles.filter(t => {
-            const tileEpoch = (t as { scaleEpoch?: number }).scaleEpoch;
-            return tileEpoch === undefined || tileEpoch === currentEpoch;
-          });
-
-          if (filteredTiles.length < tiles.length) {
-            console.warn(`[SCALE-EPOCH-FILTER] page=${this.config.pageNumber}: Filtered ${tiles.length - filteredTiles.length} stale tiles, ${filteredTiles.length} remaining`);
-            // Replace tiles array with filtered version
-            tiles = filteredTiles;
-          }
-        }
-      }
+      // CATiledLayer ARCHITECTURE: Epoch validation REMOVED
+      // 
+      // The old epoch-based filtering caused high-res tile starvation:
+      // - Epochs incremented on every zoom event (40+ during a gesture)
+      // - High-res tiles take 100-500ms to render
+      // - By completion, epoch had changed 40+ times
+      // - Tiles were rejected as "stale" even though they were correct
+      // - System permanently fell back to low-res content
+      //
+      // New approach: Accept all tiles regardless of epoch.
+      // The spatial index ensures tiles are at the correct position/scale.
+      // Progressive display shows best available while better content arrives.
+      //
+      // See: spatial-tile-index.ts for the CATiledLayer implementation.
     }
 
     // DRIFT FIX: Use snapshot values (captured at request time) for CSS calculations.
@@ -1091,73 +1065,262 @@ export class PdfPageElement {
     // Using current dimensions would cause position/size mismatch → visual drift.
     const usedSnapshot = transformSnapshot !== undefined;
 
-    // EPOCH VALIDATION: Check if zoom has changed since tile request
-    // If snapshot.epoch !== currentEpoch, the zoom level has changed during the
-    // 100-300ms render window. In this case, the snapshot dimensions are stale
-    // and we should fall back to current dimensions to prevent coordinate drift.
-    const snapshotEpoch = transformSnapshot?.epoch ?? -1;
-    const epochValid = currentEpoch === undefined ||
-                       snapshotEpoch === -1 ||
-                       snapshotEpoch === currentEpoch;
-
-    // Use snapshot dimensions only if epoch is valid (no zoom change since request)
-    // Fall back to current dimensions if epoch mismatch detected
+    // CATiledLayer: Always accept tiles, use snapshot dimensions when available
+    // The spatial index validates tile position/scale, not epoch
     let effectiveWidth: number;
     let effectiveHeight: number;
 
-    if (usedSnapshot && epochValid) {
-      // Epoch matches - safe to use snapshot dimensions
+    if (usedSnapshot) {
+      // Use snapshot dimensions for consistent positioning
       effectiveWidth = transformSnapshot!.containerWidth;
       effectiveHeight = transformSnapshot!.containerHeight;
-    } else if (usedSnapshot && !epochValid) {
-      // EPOCH MISMATCH FIX (2026-01-21): Previously used "graceful degradation" which kept
-      // old canvas content visible when stale tiles arrived. This caused severe corruption:
-      // - Old tiled content had transforms for OLD zoom/position
-      // - New CSS was set for CURRENT zoom/position
-      // - Result: content at wrong scale/position → mixed-resolution corruption
-      //
-      // NEW BEHAVIOR: Discard stale tiles entirely. Let the render system handle it:
-      // 1. Close bitmaps to free memory
-      // 2. Reset canvas CSS to match container (prevents overflow)
-      // 3. Return early - canvas will be refreshed by subsequent render
-      //
-      // The brief blank is better than corrupted content.
-      console.log(`[PDFPageElement] Discarding stale tiles (epoch mismatch): snapshot.epoch=${snapshotEpoch}, currentEpoch=${currentEpoch}`);
-      // Close all bitmaps to prevent memory leak
-      for (const { bitmap } of tiles) {
-        bitmap.close();
-      }
-
-      // OVERFLOW FIX (2026-01-22): Reset canvas CSS to match container dimensions.
-      // During rapid zoom-out, tiles rendered at high zoom arrive late with stale epoch.
-      // The canvas retains its old CSS dimensions (sized for high-zoom tile bounds),
-      // while the container has already been resized for the new lower zoom.
-      // Result: canvas overflows container → content escapes page bounds.
-      //
-      // Fix: Reset canvas CSS to 100% of container, clear positioning transform.
-      // This ensures the existing canvas content scales to fit the container while
-      // waiting for fresh tiles at the current zoom level.
-      this.canvas.style.width = `${this.currentWidth}px`;
-      this.canvas.style.height = `${this.currentHeight}px`;
-      this.canvas.style.transform = 'translateZ(0)'; // Reset to initial (GPU layer promotion only)
-      this.canvas.style.transformOrigin = '0 0';
-      console.log(`[OVERFLOW-FIX] page=${this.config.pageNumber}: Reset canvas CSS to container size ${this.currentWidth}x${this.currentHeight}`);
-
-      return;
     } else {
       // No snapshot provided - use current dimensions
       effectiveWidth = this.currentWidth;
       effectiveHeight = this.currentHeight;
     }
 
-    const dimMismatch = usedSnapshot && Math.abs(transformSnapshot!.containerWidth - this.currentWidth) > 1;
-    console.log(`[TransformSnapshot] DISPLAY page=${this.config.pageNumber}: zoom=${zoom.toFixed(2)}, snapshot=${usedSnapshot ? `${transformSnapshot!.containerWidth.toFixed(0)}x${transformSnapshot!.containerHeight.toFixed(0)}, epoch=${snapshotEpoch}` : 'none'}, current=${this.currentWidth.toFixed(0)}x${this.currentHeight.toFixed(0)}, epochValid=${epochValid}, MISMATCH=${dimMismatch}`);
-
-    // Guard: Return early if no tiles (prevents -Infinity in bounding box calculation)
+    // Guard: If no tiles, try to render cached full-page fallback instead
     if (tiles.length === 0) {
-      console.warn(`[PdfPageElement] renderTiles called with 0 tiles, skipping render`);
+      // amnesia-tdu FIX: When tiles=0, render cached full-page fallback as placeholder.
+      // This fixes the bug where streaming render shows nothing while waiting for tiles.
+      const cacheManager = getTileCacheManager();
+      // Calculate target scale based on zoom and pixel ratio
+      const pixelRatio = this.config.pixelRatio ?? window.devicePixelRatio;
+      const tileScale = Math.ceil(zoom * pixelRatio);
+      
+      const fallback = await cacheManager.getBestAvailableFullPageBitmap(
+        this.config.pageNumber,
+        tileScale
+      );
+      
+      // Get PDF dimensions from parameter or stored config
+      const pdfWidth = pdfDimensions?.width ?? this.storedPdfDimensions?.width ?? this.currentWidth;
+      const pdfHeight = pdfDimensions?.height ?? this.storedPdfDimensions?.height ?? this.currentHeight;
+      
+      if (fallback && pdfWidth > 0 && pdfHeight > 0) {
+        console.log(`[PdfPageElement] renderTiles with 0 tiles: rendering full-page fallback at scale ${fallback.actualScale} (requested ${tileScale})`);
+        
+        // Calculate canvas size for full-page render
+        const canvasWidth = Math.round(pdfWidth * tileScale);
+        const canvasHeight = Math.round(pdfHeight * tileScale);
+        
+        // Ensure canvas is sized correctly
+        if (this.canvas.width !== canvasWidth || this.canvas.height !== canvasHeight) {
+          this.canvas.width = canvasWidth;
+          this.canvas.height = canvasHeight;
+        }
+        
+        // Draw fallback to canvas
+        this.ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+        this.ctx.drawImage(fallback.bitmap, 0, 0, canvasWidth, canvasHeight);
+        fallback.bitmap.close();
+        
+        // Update render state for subsequent additive composites
+        this.lastRenderState = {
+          canvasOffsetX: 0,
+          canvasOffsetY: 0,
+          tileScale,
+          pdfWidth,
+          pdfHeight,
+          canvasWidth,
+          canvasHeight,
+          epoch: currentEpoch ?? 0,
+        };
+        this.lastTileScale = tileScale;
+        this.currentZoom = zoom;
+        
+        return; // Successfully rendered fallback
+      }
+      
+      console.warn(`[PdfPageElement] renderTiles called with 0 tiles and no fallback available, skipping render`);
       return;
     }
+
+    // =========================================================================
+    // TILE CORRUPTION DIAGNOSTICS (amnesia-26v)
+    // =========================================================================
+    // Run diagnostics BEFORE any modifications to help identify root causes
+    // of visual corruption. Results are logged and accessible via window.tileDiagnostics.
+    if (isDiagnosticsEnabled() && tiles.length > 0) {
+      const { tier: expectedScale } = getTargetScaleTier(
+        zoom,
+        this.config.pixelRatio ?? window.devicePixelRatio,
+        this.config.maxZoom ?? 32
+      );
+
+      // 1. Diagnose multi-scale tile mixing
+      const scaleDiag = diagnoseScaleMixing(
+        tiles,
+        expectedScale,
+        this.config.pageNumber,
+        zoom
+      );
+      if (scaleDiag.hasMixing) {
+        // Log warning - this is a primary corruption source
+        console.warn(`[TILE-CORRUPTION-DIAG] Multi-scale mixing detected:`, scaleDiag);
+      }
+
+      // 2. Diagnose epoch mismatch
+      const epochDiag = diagnoseEpochMismatch(
+        tiles,
+        currentEpoch,
+        this.config.pageNumber,
+        zoom
+      );
+      if (epochDiag.hasMismatch) {
+        console.warn(`[TILE-CORRUPTION-DIAG] Epoch mismatch detected:`, epochDiag);
+      }
+
+      // 3. Diagnose snapshot drift
+      if (transformSnapshot) {
+        // amnesia-0ej: Use explicit canvasOffsetX/Y from snapshot when available
+        const snapshotOffsetX = transformSnapshot.canvasOffsetX ?? transformSnapshot.expectedTileBounds?.x ?? 0;
+        const snapshotOffsetY = transformSnapshot.canvasOffsetY ?? transformSnapshot.expectedTileBounds?.y ?? 0;
+        const snapshotDiag = diagnoseSnapshotDrift(
+          {
+            containerWidth: transformSnapshot.containerWidth,
+            containerHeight: transformSnapshot.containerHeight,
+            epoch: transformSnapshot.epoch,
+            canvasOffsetX: snapshotOffsetX,
+            canvasOffsetY: snapshotOffsetY,
+          },
+          {
+            containerWidth: this.currentWidth,
+            containerHeight: this.currentHeight,
+            epoch: currentEpoch,
+            canvasOffsetX: this.lastCanvasOffsetX,
+            canvasOffsetY: this.lastCanvasOffsetY,
+          },
+          this.config.pageNumber,
+          zoom
+        );
+        if (snapshotDiag.hasDrift) {
+          console.warn(`[TILE-CORRUPTION-DIAG] Snapshot drift detected:`, snapshotDiag);
+        }
+      }
+
+      // 4. Diagnose mode transition (detect viewport-only vs full-page change)
+      const isHighZoom = zoom >= 16;
+      const wasHighZoom = this.lastTileScale > 0 && (this.currentZoom ?? 1) >= 16;
+      const modeDiag = diagnoseModeTransition(
+        this.config.pageNumber,
+        zoom,
+        this.currentZoom,
+        isHighZoom,
+        wasHighZoom,
+        { x: this.lastCanvasOffsetX, y: this.lastCanvasOffsetY },
+        { x: this.lastCanvasOffsetX, y: this.lastCanvasOffsetY } // Previous is same as current for now
+      );
+      if (modeDiag.hasTransition) {
+        console.warn(`[TILE-CORRUPTION-DIAG] Mode transition detected:`, modeDiag);
+      }
+    }
+    // =========================================================================
+
+    // =========================================================================
+    // SINGLE-SCALE COMPOSITING ENFORCEMENT (amnesia-yp6)
+    // =========================================================================
+    // CATiledLayer Principle: All tiles in a render MUST be at the same scale.
+    // Mixing tiles at different scales causes coordinate grid misalignment because
+    // tile indices (tileX, tileY) map to different PDF positions at each scale.
+    //
+    // Example of corruption from scale mixing:
+    // - Scale 6: tile (5,3) covers PDF position (213, 128) with 42.6pt tiles
+    // - Scale 16: tile (5,3) covers PDF position (80, 48) with 16pt tiles
+    // When composited together, tiles appear at completely wrong positions.
+    //
+    // FIX: Filter tiles to only the target scale. Better to have fewer tiles at
+    // correct positions than more tiles at wrong positions.
+    {
+      const { tier: targetScale } = getTargetScaleTier(
+        zoom,
+        this.config.pixelRatio ?? window.devicePixelRatio,
+        this.config.maxZoom ?? 32
+      );
+      
+      const scaleDistribution = new Map<number, number>();
+      for (const { tile } of tiles) {
+        scaleDistribution.set(tile.scale, (scaleDistribution.get(tile.scale) ?? 0) + 1);
+      }
+      
+      const uniqueScales = [...scaleDistribution.keys()];
+      const hasScaleMixing = uniqueScales.length > 1;
+      
+      if (hasScaleMixing) {
+        const originalCount = tiles.length;
+        
+        // Strategy: Keep tiles at the target scale. If none at target scale,
+        // keep tiles at the scale with the most tiles (best coverage).
+        const hasTargetScaleTiles = scaleDistribution.has(targetScale);
+        const scaleToKeep = hasTargetScaleTiles 
+          ? targetScale 
+          : uniqueScales.reduce((best, s) => 
+              (scaleDistribution.get(s) ?? 0) > (scaleDistribution.get(best) ?? 0) ? s : best,
+              uniqueScales[0]
+            );
+        
+        tiles = tiles.filter(({ tile }) => tile.scale === scaleToKeep);
+        
+        const filteredCount = originalCount - tiles.length;
+        if (filteredCount > 0) {
+          console.warn(
+            `[SINGLE-SCALE-ENFORCE] page=${this.config.pageNumber}: ` +
+            `Filtered ${filteredCount}/${originalCount} tiles to enforce single scale ${scaleToKeep} ` +
+            `(target=${targetScale}, had scales: ${uniqueScales.join(', ')})`
+          );
+        }
+      }
+    }
+    // =========================================================================
+
+    // =========================================================================
+    // EPOCH VALIDATION WITH TOLERANCE (amnesia-co4)
+    // =========================================================================
+    // CATiledLayer Principle: Tiles from significantly different viewport states
+    // should not be composited together. When viewport moves (pan/zoom), tiles
+    // requested for the old viewport are at wrong positions for the new viewport.
+    //
+    // The epoch counter increments on zoom/pan/mode changes. Tiles carry their
+    // request epoch (scaleEpoch). We filter out tiles with epoch drift > tolerance.
+    //
+    // TOLERANCE RATIONALE (10 epochs):
+    // - Epochs increment every 32ms during scroll/zoom (~31 epochs/second)
+    // - High-res tiles take 100-500ms to render
+    // - 10 epochs = ~320ms tolerance = allows most tiles to complete
+    // - Too strict (0-3): Causes high-res tile starvation (permanent blurry)
+    // - Too loose (>20): Allows tiles from completely different viewports
+    //
+    // Previously epoch validation was REMOVED entirely, causing stale tiles to
+    // be drawn at wrong positions. This restores it with a balanced tolerance.
+    if (currentEpoch !== undefined && tiles.length > 0) {
+      const EPOCH_TOLERANCE = 10;
+      const tilesWithEpoch = tiles.filter(t => t.scaleEpoch !== undefined);
+      
+      if (tilesWithEpoch.length > 0) {
+        const staleTiles = tilesWithEpoch.filter(
+          t => Math.abs(currentEpoch - t.scaleEpoch!) > EPOCH_TOLERANCE
+        );
+        
+        if (staleTiles.length > 0) {
+          const originalCount = tiles.length;
+          tiles = tiles.filter(t => {
+            if (t.scaleEpoch === undefined) return true; // Keep tiles without epoch
+            return Math.abs(currentEpoch - t.scaleEpoch) <= EPOCH_TOLERANCE;
+          });
+          
+          const filteredCount = originalCount - tiles.length;
+          if (filteredCount > 0) {
+            console.warn(
+              `[EPOCH-VALIDATION] page=${this.config.pageNumber}: ` +
+              `Filtered ${filteredCount}/${originalCount} stale tiles with epoch drift > ${EPOCH_TOLERANCE} ` +
+              `(currentEpoch=${currentEpoch})`
+            );
+          }
+        }
+      }
+    }
+    // =========================================================================
 
     // Clear CSS placeholder before drawing actual content
     this.clearPlaceholder();
@@ -1308,9 +1471,7 @@ export class PdfPageElement {
     const isHighZoom = zoom >= HIGH_ZOOM_THRESHOLD;
     const isViewportOnly = isHighZoom && tilesNotCoveringFullPage && !forceFullPage;
 
-    if (forceFullPage && tilesNotCoveringFullPage) {
-      console.log(`[PdfPageElement] forceFullPage=true but only got partial tiles (${tiles.length}), using full-page canvas sizing`);
-    }
+    // Note: forceFullPage with partial tiles uses full-page canvas sizing
 
     // VIEWPORT-ONLY FIX (amnesia-d9f 2026-01-23): Use SNAPSHOT bounds when available.
     //
@@ -1339,14 +1500,11 @@ export class PdfPageElement {
       effectiveBoundsWidth = snapBounds.width;
       effectiveBoundsHeight = snapBounds.height;
       
-      // Log when snapshot differs from tile-derived bounds (indicates pan during render)
+      // Note: When snapshot differs from tile-derived bounds, pan occurred during render
       const boundsDrift = Math.abs(snapBounds.x - adjustedTileBoundsX) > 1 ||
                           Math.abs(snapBounds.y - adjustedTileBoundsY) > 1;
       if (boundsDrift) {
-        console.log(`[SNAPSHOT-BOUNDS] page=${this.config.pageNumber}: using snapshot bounds ` +
-          `(${snapBounds.x.toFixed(1)},${snapBounds.y.toFixed(1)} ${snapBounds.width.toFixed(1)}x${snapBounds.height.toFixed(1)}) ` +
-          `instead of tile-derived (${adjustedTileBoundsX.toFixed(1)},${adjustedTileBoundsY.toFixed(1)} ` +
-          `${adjustedTileBoundsWidth.toFixed(1)}x${adjustedTileBoundsHeight.toFixed(1)}) - PAN DETECTED`);
+        // Snapshot bounds used instead of tile-derived due to pan during render
         
         // amnesia-rwe: Filter out tiles that are completely outside the snapshot bounds.
         // When viewport moved significantly since tiles were requested (PAN DETECTED),
@@ -1390,21 +1548,35 @@ export class PdfPageElement {
     let canvasWidth: number, canvasHeight: number;
     let canvasOffsetX = 0, canvasOffsetY = 0;
 
+    // =========================================================================
+    // SNAPSHOT COORDINATE CONSISTENCY (amnesia-0ej)
+    // =========================================================================
+    // Use snapshot canvas offset when available to ensure coordinate consistency.
+    // Tiles are rendered with PDF coordinates relative to canvasOffset at REQUEST time.
+    // If we use current canvasOffset at DISPLAY time, tiles appear at wrong positions.
+    //
+    // Priority:
+    // 1. transformSnapshot.canvasOffsetX/Y (explicit snapshot values)
+    // 2. effectiveBoundsX/Y (derived from expectedTileBounds)
+    // 3. (0, 0) for full-page mode
+    const snapshotCanvasOffsetX = transformSnapshot?.canvasOffsetX;
+    const snapshotCanvasOffsetY = transformSnapshot?.canvasOffsetY;
+
     if (isViewportOnly && tiles.length > 0 && effectiveBoundsWidth > 0 && effectiveBoundsHeight > 0) {
       // Viewport-only: canvas sized to EFFECTIVE bounds (snapshot if available, else tile-derived)
       // ASPECT RATIO FIX (2026-01-23): Derive height from width to preserve exact aspect ratio
       const boundsAspect = effectiveBoundsWidth / effectiveBoundsHeight;
       canvasWidth = Math.ceil(effectiveBoundsWidth * tileScale);
       canvasHeight = Math.round(canvasWidth / boundsAspect);
-      canvasOffsetX = effectiveBoundsX;  // PDF coordinate offset
-      canvasOffsetY = effectiveBoundsY;
-      // ASPECT RATIO DIAGNOSTIC: Track buffer vs PDF bounds aspect ratio
-      const bufferAspect = canvasWidth / canvasHeight;
-      const pdfPageAspect = pdfWidth / pdfHeight;
-      console.log(`[PdfPageElement] Viewport-only render: effectiveBounds=${effectiveBoundsX.toFixed(1)},${effectiveBoundsY.toFixed(1)} ${effectiveBoundsWidth.toFixed(1)}x${effectiveBoundsHeight.toFixed(1)}, canvas=${canvasWidth}x${canvasHeight}, bufferAspect=${bufferAspect.toFixed(4)}, boundsAspect=${boundsAspect.toFixed(4)}, pdfAspect=${pdfPageAspect.toFixed(4)}, usingSnapshot=${hasSnapshotBounds}`);
+      // amnesia-0ej: Use snapshot offset when available, otherwise use effective bounds
+      canvasOffsetX = snapshotCanvasOffsetX ?? effectiveBoundsX;
+      canvasOffsetY = snapshotCanvasOffsetY ?? effectiveBoundsY;
     } else {
       // Full page: canvas sized to full PDF dimensions
       // ASPECT RATIO FIX (2026-01-23): Derive height from width to preserve exact aspect ratio.
+      // amnesia-0ej: Use snapshot offset when available (should be 0,0 for full-page mode)
+      canvasOffsetX = snapshotCanvasOffsetX ?? 0;
+      canvasOffsetY = snapshotCanvasOffsetY ?? 0;
       // Previously, Math.ceil() was applied independently to width and height, causing
       // aspect ratio drift (e.g., 0.6622 vs 0.6624). This caused right-side text clipping
       // during mode transitions when source and destination had mismatched aspects.
@@ -1544,39 +1716,12 @@ export class PdfPageElement {
     const COVERAGE_THRESHOLD = 0.95;
     const hasIncompleteCoverage = actualTileCount < expectedTileCount * COVERAGE_THRESHOLD;
 
-    // Always log coverage calculation at mid-zoom for debugging
-    if (zoom >= 4) {
-      let tileRangeInfo: string;
-      if (isViewportOnlyMode && tiles.length > 0) {
-        if (transformSnapshot?.requestedTileCount !== undefined) {
-          tileRangeInfo = `requestedCount=${transformSnapshot.requestedTileCount}`;
-        } else if (transformSnapshot?.expectedTileBounds) {
-          const vp = transformSnapshot.expectedTileBounds;
-          tileRangeInfo = `viewportPdf=${vp.width.toFixed(0)}x${vp.height.toFixed(0)}`;
-        } else {
-          tileRangeInfo = `noSnapshot(tiles=${tiles.length})`;
-        }
-      } else {
-        tileRangeInfo = `canvas=${canvasWidth}x${canvasHeight}`;
-      }
-      console.log(`[COVERAGE-CALC] page=${this.config.pageNumber}: ${tileRangeInfo}, pdfTileSize=${pdfTileSize.toFixed(1)}, expected=${expectedTileCount}, actual=${actualTileCount}, coverage=${coveragePercent.toFixed(1)}%, incomplete=${hasIncompleteCoverage}, viewportOnly=${isViewportOnlyMode}`);
-    }
 
-    if (hasIncompleteCoverage && zoom >= 4) {
-      console.warn(`[INCOMPLETE-COVERAGE] page=${this.config.pageNumber}: only ${actualTileCount}/${expectedTileCount} tiles (${coveragePercent.toFixed(0)}%), clearing canvas`);
-    }
 
     // Don't preserve content if offset, size, tile bounds, scale changed, OR coverage is incomplete
     const shouldPreserveContent = !offsetChanged && !sizeChanged && !tileBoundsChanged && !scaleChanged && !hasIncompleteCoverage;
 
-    if (offsetChanged || sizeChanged || tileBoundsChanged || scaleChanged || hasIncompleteCoverage) {
-      console.log(`[VIEWPORT-CHANGE] page=${this.config.pageNumber}: ` +
-        `offset: (${this.lastCanvasOffsetX.toFixed(0)},${this.lastCanvasOffsetY.toFixed(0)}) → (${canvasOffsetX.toFixed(0)},${canvasOffsetY.toFixed(0)}) [changed=${offsetChanged}], ` +
-        `size: ${this.canvas.width}x${this.canvas.height} → ${canvasWidth}x${canvasHeight} [changed=${sizeChanged}], ` +
-        `tileBounds: (${this.lastTileBoundsX.toFixed(0)},${this.lastTileBoundsY.toFixed(0)} ${this.lastTileBoundsWidth.toFixed(0)}x${this.lastTileBoundsHeight.toFixed(0)}) → (${tileBoundsX.toFixed(0)},${tileBoundsY.toFixed(0)} ${tileBoundsWidth.toFixed(0)}x${tileBoundsHeight.toFixed(0)}) [changed=${tileBoundsChanged}], ` +
-        `scale: ${this.lastTileScale} → ${tileScale} [changed=${scaleChanged}], ` +
-        `coverage: ${actualTileCount}/${expectedTileCount} [incomplete=${hasIncompleteCoverage}] - clearing canvas`);
-    }
+
 
     // PROGRESSIVE RENDERING: Copy existing content to preserve base layer
     // With local offscreen canvas (CONCURRENT RENDER FIX), we always start fresh.
@@ -1615,16 +1760,11 @@ export class PdfPageElement {
     // CRITICAL: Scale must also match - preserving content at wrong scale causes stretching
     const preserveAsLastResort = hasIncompleteCoverage && hasRealCanvasContent && viewportPositionUnchanged && !scaleChanged;
 
-    console.log(`[PRESERVE-CHECK] page=${this.config.pageNumber}: shouldPreserve=${shouldPreserveContent}, preserveAsLastResort=${preserveAsLastResort}, hasIncompleteCoverage=${hasIncompleteCoverage}, isRendered=${this.isRendered}, canvas=${this.canvas.width}x${this.canvas.height}, hasRealContent=${hasRealCanvasContent}`);
-
     if ((shouldPreserveContent || preserveAsLastResort) && hasRealCanvasContent) {
       try {
         // Scale old content to fit new canvas dimensions if they differ
         // This creates a blurry base layer, but better than blank
         offCtx.drawImage(this.canvas, 0, 0, this.canvas.width, this.canvas.height, 0, 0, canvasWidth, canvasHeight);
-        if (preserveAsLastResort && !shouldPreserveContent) {
-          console.log(`[LAST-RESORT-FALLBACK] page=${this.config.pageNumber}: preserving old canvas (${this.canvas.width}x${this.canvas.height}) as base for new render (${canvasWidth}x${canvasHeight}) due to incomplete coverage`);
-        }
       } catch {
         // Ignore errors (e.g., if canvas is tainted or empty)
         // Local canvas starts transparent, so tiles will draw on clean slate
@@ -1688,16 +1828,13 @@ export class PdfPageElement {
     // When 61/165 tiles fail, indices still span the full page but there are gaps.
     // hasIncompleteCoverage (< 50% of expected tiles) catches this case.
     const shouldDrawBaseLayer = forceFullPage || (tilesNotCoveringFullPage && !isViewportOnly) || hasIncompleteCoverage;
-    console.log(`[BASE-LAYER-DEBUG] page=${this.config.pageNumber}: shouldDrawBaseLayer=${shouldDrawBaseLayer}, tilesNotCoveringFullPage=${tilesNotCoveringFullPage}, isViewportOnly=${isViewportOnly}, forceFullPage=${forceFullPage}, hasIncompleteCoverage=${hasIncompleteCoverage}`);
     if (shouldDrawBaseLayer) {
       try {
         const cacheManager = getTileCacheManager();
-        console.log(`[BASE-LAYER-DEBUG] page=${this.config.pageNumber}: fetching cached full-page at scale ${tileScale}...`);
         const fallback = await cacheManager.getBestAvailableFullPageBitmap(
           this.config.pageNumber,
           tileScale
         );
-        console.log(`[BASE-LAYER-DEBUG] page=${this.config.pageNumber}: fallback result = ${fallback ? `found at scale ${fallback.actualScale}` : 'null (not cached)'}`);
         if (fallback) {
           // BASE LAYER SCALE MISMATCH FIX (2026-01-21): Reject fallback at wrong scale.
           //
@@ -1739,7 +1876,6 @@ export class PdfPageElement {
             // The fallback might be at a lower scale, so we stretch it to fit
             offCtx.drawImage(fallback.bitmap, 0, 0, canvasWidth, canvasHeight);
             fallback.bitmap.close();
-            console.log(`[BASE-LAYER-FALLBACK] page=${this.config.pageNumber}: using cached full-page at scale ${fallback.actualScale} (requested ${tileScale}), stretch=${fallback.cssStretch.toFixed(2)}x, mode=${hasIncompleteCoverage ? 'incomplete-coverage' : 'normal'}`);
           }
         }
       } catch (e) {
@@ -1767,7 +1903,6 @@ export class PdfPageElement {
       tileBounds: `(${tileBoundsX.toFixed(1)}, ${tileBoundsY.toFixed(1)}) ${tileBoundsWidth.toFixed(1)}x${tileBoundsHeight.toFixed(1)}`,
       hasSnapshotBounds,
     };
-    console.log(`[COMPOSITE-START] page=${this.config.pageNumber}`, compositeParams);
 
     // Update diagnostic overlay with live data
     try {
@@ -1937,23 +2072,6 @@ export class PdfPageElement {
       // drawImage() handles the scaling: we draw the full bitmap into the target area.
       // Browser scales bitmap.width×bitmap.height → drawWidth×drawHeight
 
-      // amnesia-e4i PAN DIAGNOSTIC: Log first 3 tiles per render to diagnose positioning
-      if (tilesDrawn < 3) {
-        console.log(`[TILE-DRAW-DETAIL] page=${this.config.pageNumber} tile#${tilesDrawn}:`, {
-          coord: `(${tile.tileX}, ${tile.tileY})`,
-          tileScale: tile.scale,
-          targetScale: tileScale,
-          tilePdfTileSize: tilePdfTileSize.toFixed(2),
-          targetPdfTileSize: pdfTileSize.toFixed(2),
-          cssStretch: tileStretch.toFixed(2),
-          pdfPos: `(${tilePdfX.toFixed(1)}, ${tilePdfY.toFixed(1)})`,
-          canvasPos: `(${canvasX}, ${canvasY})`,
-          drawSize: `${drawWidth}x${drawHeight}`,
-          bitmapSize: `${bitmap.width}x${bitmap.height}`,
-          canvasOffset: `(${canvasOffsetX.toFixed(1)}, ${canvasOffsetY.toFixed(1)})`,
-        });
-      }
-
       offCtx.drawImage(
         bitmap,
         0, 0, bitmap.width, bitmap.height,  // Source: full bitmap
@@ -1968,29 +2086,9 @@ export class PdfPageElement {
         actualScale: tile.scale,
       });
 
-      // COORDINATE DEBUG: Log first 3 tiles to trace positioning (with scale info)
-      if (tilesDrawn < 3) {
-        const scaleInfo = tile.scale !== tileScale 
-          ? `, tileScale=${tile.scale}→${tileScale} (stretch=${tileStretch.toFixed(2)})`
-          : '';
-        console.log(`[TILE-COORD-DEBUG] page=${this.config.pageNumber}, tile(${tile.tileX},${tile.tileY}): pdfPos=(${tilePdfX.toFixed(0)},${tilePdfY.toFixed(0)}), canvasPos=(${canvasX},${canvasY}), size=${drawWidth}x${drawHeight}, bmpSize=${bitmap.width}x${bitmap.height}${scaleInfo}`);
-      }
-
       // Close bitmap to free memory - we own it (created fresh from cache)
       bitmap.close();
       tilesDrawn++;
-    }
-
-    // DEBUG: Log tiles drawn with render sequence
-    const skipInfo = [
-      tilesSkippedOutOfBounds > 0 ? `${tilesSkippedOutOfBounds} OOB` : '',
-      fallbacksSkipped > 0 ? `${fallbacksSkipped} fallbacks replaced` : '',
-    ].filter(Boolean).join(', ');
-    
-    if (skipInfo) {
-      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn}/${tiles.length} tiles, canvas=${canvasWidth}x${canvasHeight} (${skipInfo}), forceFullPage=${!isViewportOnly}`);
-    } else {
-      console.error(`[TILE-DRAW] seq=${renderSeq} page=${this.config.pageNumber} Drew ${tilesDrawn} tiles, canvas=${canvasWidth}x${canvasHeight}, forceFullPage=${!isViewportOnly}`);
     }
 
     // ALL-TILES-OUT-OF-BOUNDS FIX: If all tiles were skipped, throw an error
@@ -2029,10 +2127,6 @@ export class PdfPageElement {
       this.canvas.width = canvasWidth;
       this.canvas.height = canvasHeight;
 
-      // PAN DIAGNOSTIC: Log buffer resize with previous state
-      console.log(`[PAN-DIAG] seq=${renderSeq} page=${this.config.pageNumber}: BUFFER RESIZE ` +
-        `prev=${prevBuffer.w}x${prevBuffer.h} → new=${canvasWidth}x${canvasHeight}, ` +
-        `prevCss=${prevCss.w}x${prevCss.h}, prevTransform="${prevCss.transform}"`);
     }
 
     // CSS display size and positioning
@@ -2101,8 +2195,6 @@ export class PdfPageElement {
       pendingCssTransformOrigin = '0 0';
       pendingCssOffsetX = elementOffsetX;
       pendingCssOffsetY = elementOffsetY;
-
-      console.log(`[STABILITY-FIX] UNIFIED buffer=${canvasWidth}×${canvasHeight}, css=${elementBoundsWidth.toFixed(1)}×${elementBoundsHeight.toFixed(1)}, offset=${elementOffsetX.toFixed(1)},${elementOffsetY.toFixed(1)} (snapshot: ${usedSnapshot}) (PENDING - after gate)`);
     } else {
       // LEGACY: Direct tile positioning (cssStretch tracking removed - amnesia-c7w)
       const coordDebugger = getCoordinateDebugger();
@@ -2229,37 +2321,12 @@ export class PdfPageElement {
       if (this.lastZoomResetTime > 0 && timeSinceReset < 500) {
         console.warn(`[ZOOM-RESET-OVERWRITE] page=${this.config.pageNumber}: ` +
           `Render overwriting zoom reset! timeSinceReset=${timeSinceReset.toFixed(0)}ms, ` +
-          `newTransform="${pendingCssTransform}" (epoch valid: ${epochValid})`);
+          `newTransform="${pendingCssTransform}"`);
       }
 
       // NOTE: CSS is now applied AFTER the concurrency gate - see below
 
-      // PAN DIAGNOSTIC: Log CSS update with prev state comparison
-      // If prevCss differs significantly from new CSS, this is a viewport change during pan
-      const cssSizeChanged = Math.abs(prevCss.w - layoutBoundsWidth) > 1 || Math.abs(prevCss.h - layoutBoundsHeight) > 1;
-      const cssOffsetChanged = prevCss.transform !== pendingCssTransform;
-      if (cssSizeChanged || cssOffsetChanged) {
-        console.log(`[PAN-DIAG] seq=${renderSeq} page=${this.config.pageNumber}: CSS PENDING ` +
-          `prevCss=${prevCss.w}x${prevCss.h} → new=${layoutBoundsWidth.toFixed(1)}x${layoutBoundsHeight.toFixed(1)}, ` +
-          `buffer=${canvasWidth}x${canvasHeight}, sizeChanged=${cssSizeChanged}, offsetChanged=${cssOffsetChanged}`);
-      }
-
-      console.log(`[STABILITY-FIX] VIEWPORT page=${this.config.pageNumber}: cssSize=${layoutBoundsWidth.toFixed(1)}x${layoutBoundsHeight.toFixed(1)}, offset=${cssOffsetX.toFixed(1)},${cssOffsetY.toFixed(1)}, transform="${pendingCssTransform}" (PENDING - after gate)`);
-
-      // MID-ZOOM BUFFER/CSS DIAGNOSTIC: Track buffer-to-CSS ratio at mid-zoom
-      if (zoom >= 4) {
-        const bufferToCssX = canvasWidth / layoutBoundsWidth;
-        const bufferToCssY = canvasHeight / layoutBoundsHeight;
-        console.warn(`[MID-ZOOM-CSS-DIAG] VIEWPORT page=${this.config.pageNumber}:`, {
-          zoom: zoom.toFixed(2),
-          tileScale,
-          canvasBuffer: `${canvasWidth}x${canvasHeight}`,
-          canvasCss: `${layoutBoundsWidth.toFixed(0)}x${layoutBoundsHeight.toFixed(0)}`,
-          bufferToCss: `${bufferToCssX.toFixed(3)}x${bufferToCssY.toFixed(3)}`,
-          expectedBufCss: (tileScale / zoom).toFixed(3),
-          pdfToElementScale: pdfToElementScale.toFixed(3),
-        });
-      }
+      // NOTE: CSS is now applied AFTER the concurrency gate - see below
     } else {
       // FULL-PAGE: PDF DIMENSION UNIFICATION (2026-01-23)
       //
@@ -2294,31 +2361,6 @@ export class PdfPageElement {
       pendingCssOffsetX = 0;
       pendingCssOffsetY = 0;
 
-      // Verify camera-based architecture is working correctly:
-      // - Canvas CSS = base PDF dimensions (camera scale() handles visual zoom)
-      // - Buffer = PDF dimensions × tileScale (for crisp pixels)
-      // - Buffer/CSS ratio = tileScale (NOT tileScale/zoom, since camera scales CSS)
-      const expectedCssWidth = pdfWidth;  // Base size - camera handles zoom
-      const dimensionMatch = Math.abs(finalWidth - expectedCssWidth) < 1;
-      console.log(`[PDF-CAMERA] FULLPAGE page=${this.config.pageNumber}: ` +
-        `cssSize=${finalWidth.toFixed(1)}x${finalHeight.toFixed(1)}, ` +
-        `buffer=${canvasWidth}x${canvasHeight}, ` +
-        `pdfDims=${pdfWidth.toFixed(1)}x${pdfHeight.toFixed(1)}, ` +
-        `zoom=${zoom.toFixed(2)}, tileScale=${tileScale}, ` +
-        `dimensionMatch=${dimensionMatch}`);
-
-      // Diagnostic: Buffer/CSS ratio should be tileScale (camera handles zoom separately)
-      if (zoom >= 4) {
-        const bufferToCssX = canvasWidth / finalWidth;
-        const expectedRatio = tileScale;  // Camera scales by zoom, so buffer/css = tileScale
-        const ratioMatch = Math.abs(bufferToCssX - expectedRatio) < 0.1;
-        console.log(`[PDF-CAMERA-DIAG] page=${this.config.pageNumber}: ` +
-          `bufferToCss=${bufferToCssX.toFixed(2)}, ` +
-          `expected=${expectedRatio}, ` +
-          `match=${ratioMatch}, ` +
-          `visualScale=${(tileScale * zoom / tileScale).toFixed(2)}x`);
-      }
-
       // NOTE: coordDebugger.recordTransformApply will be called after gate
     }
     } // End of LEGACY else block
@@ -2343,8 +2385,6 @@ export class PdfPageElement {
       // The localOffscreen buffer is garbage collected automatically
       return;
     }
-    console.log(`[RENDER-SEQ] page=${this.config.pageNumber} seq=${renderSeq} COMMITTING to main canvas (latestRenderSeq=${this.latestRenderSeq})`);
-
     // ==========================================================================
     // CONCURRENT RENDER FIX (amnesia-d9f 2026-01-23): Apply CSS AFTER gate passes
     // ==========================================================================
@@ -2380,8 +2420,6 @@ export class PdfPageElement {
         offsetY: pendingCssOffsetY,
       });
 
-      console.log(`[CSS-APPLIED-AFTER-GATE] page=${this.config.pageNumber} seq=${renderSeq}: ` +
-        `size=${pendingCssWidth}x${pendingCssHeight}, transform="${pendingCssTransform}"`);
     }
 
     // Copy offscreen buffer to visible canvas in one operation
@@ -2410,6 +2448,10 @@ export class PdfPageElement {
     // we get incomplete coverage (<95%). Keeping the snapshot visible underneath
     // provides a blurry-but-complete fallback instead of blank regions.
     // The snapshot will be cleared when a subsequent render achieves full coverage.
+    //
+    // NOTE (2026-01-26): Tried always clearing snapshot but exposed tile positioning
+    // corruption. The snapshot is actually hiding rendering bugs. Need to fix root cause
+    // (tile positioning) before removing snapshot safety net.
     const tileEpochs = tiles
       .map(t => t.scaleEpoch)
       .filter((e): e is number => e !== undefined);
@@ -2417,9 +2459,8 @@ export class PdfPageElement {
     
     if (!hasIncompleteCoverage) {
       this.clearTransitionSnapshot(maxTileEpoch);
-    } else {
-      console.log(`[SNAPSHOT-KEPT] page=${this.config.pageNumber}: keeping transition snapshot as fallback (coverage=${coveragePercent.toFixed(1)}% < 95%)`);
     }
+    // Note: When coverage is incomplete, we keep the transition snapshot as fallback
 
     // Track render time and scale
     const renderTime = performance.now() - startTime;
@@ -2450,6 +2491,15 @@ export class PdfPageElement {
    * @param tileEpoch The epoch when these tiles were requested
    * @returns true if tiles were drawn, false if epoch mismatch (tiles incompatible)
    */
+  
+  /**
+   * Get the current render state epoch.
+   * Used by spatial index compositing to pass the current epoch instead of stale epoch.
+   */
+  getLastRenderStateEpoch(): number | null {
+    return this.lastRenderState?.epoch ?? null;
+  }
+  
   addTilesToExistingCanvas(
     tiles: Array<{
       tile: TileCoordinate;
@@ -2461,35 +2511,38 @@ export class PdfPageElement {
     
     // EPOCH VALIDATION: The core of the nudge bug fix.
     // Only draw tiles if their epoch matches the canvas render state epoch.
-    // If epochs differ, the canvas coordinate system has changed (zoom/pan occurred)
-    // and drawing these tiles would put them at wrong positions.
+    // Guard: Need render state for coordinate calculations
     if (!this.lastRenderState) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: No render state, skipping`);
       return false;
     }
     
-    // amnesia-aqv.1 FIX: Relax epoch check for streaming mode.
-    // 
-    // PROBLEM: Tiles queued by triggerTilePrefetch (epoch N) complete after
-    // renderPageTiled sets canvas to epoch N+1. Strict epoch check rejects them all.
+    // amnesia-aqv (2026-01-26): RESTORE epoch validation for ADDITIVE composite.
     //
-    // SOLUTION: Accept tiles from "adjacent" epochs (within 1 of canvas epoch).
-    // This handles the race condition where prefetch tiles complete after streaming
-    // mode increments the epoch. The tiles are still valid because:
-    // 1. They're for the same zoom level (epoch changes once per zoom gesture)
-    // 2. Canvas offset/scale haven't changed significantly within 1 epoch
+    // CRITICAL DISTINCTION:
+    // - Initial renderTiles(): Can accept tiles regardless of epoch (fixes high-res starvation)
+    // - Additive composite: MUST validate epoch (prevents viewport mismatch corruption)
     //
-    // SAFETY: Epoch validation still protects against truly stale tiles (>1 epoch old).
+    // WHY: Additive composite draws tiles onto an EXISTING canvas. The canvas was
+    // rendered at a specific viewport (canvasOffsetX, canvasOffsetY). If tiles from
+    // a DIFFERENT viewport are composited using the current canvas offset, they
+    // appear at wrong positions causing severe visual corruption.
+    //
+    // Example of corruption:
+    // 1. Canvas rendered at offset (100, 100), epoch=5
+    // 2. User pans, new render at offset (200, 200), epoch=6
+    // 3. Cache composite fires with epoch=5 tiles
+    // 4. Tiles positioned using lastRenderState offset (200, 200)
+    // 5. But tile content is from (100, 100) viewport → wrong position!
+    //
+    // The epoch check ensures we only composite tiles from the SAME render session.
+    const EPOCH_TOLERANCE = 3; // Allow small epoch drift for race conditions
     const epochDiff = Math.abs(this.lastRenderState.epoch - tileEpoch);
-    const EPOCH_TOLERANCE = 1; // Accept tiles within 1 epoch
     if (epochDiff > EPOCH_TOLERANCE) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Epoch too stale ` +
-        `(canvas=${this.lastRenderState.epoch}, tiles=${tileEpoch}, diff=${epochDiff} > ${EPOCH_TOLERANCE}), skipping`);
+      // Close bitmaps to prevent memory leak
+      for (const { bitmap } of tiles) {
+        bitmap.close();
+      }
       return false;
-    }
-    if (epochDiff === 1) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Accepting adjacent epoch ` +
-        `(canvas=${this.lastRenderState.epoch}, tiles=${tileEpoch})`);
     }
     
     // Use STORED canvas state for coordinate calculations.
@@ -2498,7 +2551,6 @@ export class PdfPageElement {
     
     // Verify canvas dimensions haven't changed unexpectedly
     if (this.canvas.width !== canvasWidth || this.canvas.height !== canvasHeight) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Canvas size changed, skipping`);
       return false;
     }
     
@@ -2545,10 +2597,6 @@ export class PdfPageElement {
       
       tilesDrawn++;
       bitmap.close();
-    }
-    
-    if (tilesDrawn > 0) {
-      console.log(`[ADDITIVE-COMPOSITE] page=${this.config.pageNumber}: Drew ${tilesDrawn}/${tiles.length} tiles (epoch=${tileEpoch})`);
     }
     
     return true;
@@ -2615,8 +2663,6 @@ export class PdfPageElement {
         this.canvas.style.transform = ''; // NO scale transform - camera handles all zoom
         this.canvas.style.transformOrigin = '0 0';
 
-        console.log(`[DIMENSION-MATCH-FIX] renderCanvas: canvasCss=${cssWidth}x${cssHeight}, containerCss=${this.currentWidth}x${this.currentHeight} (buffer ${result.naturalWidth}x${result.naturalHeight}, aspect=${bufferAspectRatio.toFixed(4)})`);
-
         // Reset transform and draw at native resolution
         this.ctx.setTransform(1, 0, 0, 1, 0, 0);
         this.ctx.imageSmoothingEnabled = true;
@@ -2666,8 +2712,6 @@ export class PdfPageElement {
           this.canvas.style.height = `${cssHeight}px`;
           this.canvas.style.transform = ''; // NO scale transform - camera handles all zoom
           this.canvas.style.transformOrigin = '0 0';
-
-          console.log(`[DIMENSION-MATCH-FIX] renderCanvasFallback: canvasCss=${cssWidth}x${cssHeight}, containerCss=${this.currentWidth}x${this.currentHeight} (buffer ${image.naturalWidth}x${image.naturalHeight}, aspect=${bufferAspectRatio.toFixed(4)})`);
 
           // Reset transform and draw at native resolution
           this.ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2744,9 +2788,6 @@ export class PdfPageElement {
 
         // Close the ImageBitmap to free memory
         result.imageBitmap.close();
-
-        console.log(`[RENDER-TO-TARGET] page=${this.config.pageNumber}: Rendered to overlay, ` +
-          `buffer=${result.naturalWidth}x${result.naturalHeight}, css=${cssWidth}x${cssHeight}`);
         return;
       }
     } catch (error) {
@@ -2779,9 +2820,6 @@ export class PdfPageElement {
           targetCtx.drawImage(image, 0, 0);
 
           URL.revokeObjectURL(imageUrl);
-
-          console.log(`[RENDER-TO-TARGET-FALLBACK] page=${this.config.pageNumber}: Rendered to overlay, ` +
-            `buffer=${image.naturalWidth}x${image.naturalHeight}, css=${cssWidth}x${cssHeight}`);
           resolve();
         } catch (error) {
           URL.revokeObjectURL(imageUrl);
@@ -3408,8 +3446,7 @@ export class PdfPageElement {
     // Proceeding to capture a new snapshot from a hidden canvas = blank frame.
     const alreadyHidden = this.canvas.style.opacity === '0';
     if (alreadyHidden) {
-      console.log(`[SKIP-PREPARE] page=${this.config.pageNumber}: Canvas already hidden (opacity=0), skipping duplicate prepareForFullPageRender`);
-      return;
+      return; // Canvas already hidden, skip duplicate prepare
     }
 
     // EARLY EXIT FOR UNRENDERED PAGES (2026-01-24):
@@ -3420,7 +3457,6 @@ export class PdfPageElement {
     // Without hiding, the 300x150 empty canvas is stretched to page size = visible blank.
     const isUnrenderedCanvas = this.canvas.width === 300 && this.canvas.height === 150;
     if (isUnrenderedCanvas) {
-      console.log(`[SKIP-TRANSITION] page=${this.config.pageNumber}: Canvas never rendered (300x150), hiding canvas for clean loading state`);
       // Hide canvas so the viewport background shows through (no blank flash)
       this.canvas.style.opacity = '0';
       // Ensure loading state is shown - the render will restore opacity when complete
@@ -3463,7 +3499,6 @@ export class PdfPageElement {
       // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
-    console.log('[GOLDEN-FRAME]', goldenFrameLog);
     
     // Warn if H1 mismatch detected (canvas CSS != container CSS)
     if (goldenFrameLog.h1Mismatch) {
@@ -3477,7 +3512,6 @@ export class PdfPageElement {
     // amnesia-aqv: Epoch now passed from caller (from ZoomScaleService)
     if (epoch !== undefined) {
       this.transitionEpoch = epoch;
-      console.log(`[TRANSITION-EPOCH] prepareForFullPageRender: page=${this.config.pageNumber}, transitionEpoch=${this.transitionEpoch}`);
     }
 
     // MODE TRANSITION FIX (amnesia-8jm): Use double-buffering for tiled→full-page transition.
@@ -3560,7 +3594,6 @@ export class PdfPageElement {
         const sourceAspect = this.canvas.width / this.canvas.height;
         const destAspect = drawWidth / drawHeight;
         const cssAspect = tiledWidth / tiledHeight;
-        console.log(`[H3-DIAG] Mode transition: srcBuf=${this.canvas.width}x${this.canvas.height} (aspect=${sourceAspect.toFixed(4)}), dest=${drawWidth.toFixed(0)}x${drawHeight.toFixed(0)} (aspect=${destAspect.toFixed(4)}), css=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} (aspect=${cssAspect.toFixed(4)})`);
 
         // NOTE: Uninitialized canvas check (300x150) is now handled at function entry with early return.
 
@@ -3604,19 +3637,15 @@ export class PdfPageElement {
           this.canvas.style.transformOrigin = '0 0';
           this.isRendered = false;
           this.showLoading();
-          console.log(`[NO-SNAPSHOT-FALLBACK] page=${this.config.pageNumber}: Keeping canvas visible (stretched), no snapshot. cssSize=${this.currentWidth}x${this.currentHeight}`);
           return; // Early return - don't hide canvas
         } else {
           // Draw the tiled content at its original position within the full-page snapshot
           snapshotCtx.drawImage(this.canvas, drawX, drawY, drawWidth, drawHeight);
-          console.log(`[SNAPSHOT-USED] page=${this.config.pageNumber}: coverage=${(minCoverage * 100).toFixed(1)}%, ` +
-            `tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)}, fullPage=${this.currentWidth}x${this.currentHeight}`);
 
           // Insert snapshot into container ONLY if snapshot is usable
           if (!this.transitionSnapshot.parentElement) {
             this.container.appendChild(this.transitionSnapshot);
           }
-          console.log(`[MODE-TRANSITION] Captured snapshot for tiled→full-page transition, page=${this.config.pageNumber}, tiled=${tiledWidth.toFixed(0)}x${tiledHeight.toFixed(0)} at (${offsetX},${offsetY}), fullPage=${this.currentWidth}x${this.currentHeight.toFixed(0)}`);
         }
       }
     }
@@ -3635,8 +3664,6 @@ export class PdfPageElement {
 
     // Show loading indicator (behind snapshot)
     this.showLoading();
-
-    console.log(`[STABILITY-FIX] prepareForFullPageRender: page=${this.config.pageNumber}, cssSize=${this.currentWidth}x${this.currentHeight} (snapshot visible until render completes)`);
   }
 
   /**
@@ -3692,7 +3719,6 @@ export class PdfPageElement {
       // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
-    console.log('[GOLDEN-FRAME]', goldenFrameLog);
     
     // Warn if H1 mismatch detected (canvas CSS != container CSS)
     if (goldenFrameLog.h1Mismatch) {
@@ -3706,7 +3732,6 @@ export class PdfPageElement {
     // amnesia-aqv: Epoch now passed from caller (from ZoomScaleService)
     if (epoch !== undefined) {
       this.transitionEpoch = epoch;
-      console.log(`[TRANSITION-EPOCH] prepareForTiledRender: page=${this.config.pageNumber}, transitionEpoch=${this.transitionEpoch}`);
     }
 
     // DOUBLE-BUFFERING: Capture current canvas content as a snapshot canvas.
@@ -3753,8 +3778,6 @@ export class PdfPageElement {
           this.container.appendChild(this.transitionSnapshot);
         }
 
-        const elapsed = performance.now() - startTime;
-        console.log(`[DOUBLE-BUFFER] Created transition snapshot: page=${this.config.pageNumber}, size=${this.canvas.width}x${this.canvas.height}, time=${elapsed.toFixed(1)}ms`);
       }
     } catch (e) {
       // Snapshot creation failed (e.g., tainted canvas) - fall back to hiding
@@ -3771,8 +3794,6 @@ export class PdfPageElement {
 
     // Note: We don't hide the canvas anymore - the snapshot covers it
     // We also don't show loading indicator since snapshot provides visual continuity
-
-    console.log(`[STABILITY-FIX] prepareForTiledRender: page=${this.config.pageNumber} (snapshot preserves old content)`);
   }
 
   /**
@@ -3797,24 +3818,20 @@ export class PdfPageElement {
     // 4. Clearing snapshot now would cause blank flash
     const canvasHidden = this.canvas.style.opacity === '0';
     if (canvasHidden) {
-      console.log(`[SNAPSHOT-KEEP] page=${this.config.pageNumber}: Canvas still hidden (opacity=0), keeping snapshot visible`);
-      return;
+      return; // Canvas still hidden, keep snapshot visible
     }
 
     // amnesia-2t8 (H8): Gate snapshot clearing on epoch match
     // Only clear if the tile epoch >= the epoch at which transition started
     if (this.transitionEpoch !== null && tileEpoch !== undefined) {
       if (tileEpoch < this.transitionEpoch) {
-        console.log(`[EPOCH-GATE] Keeping snapshot: page=${this.config.pageNumber}, tileEpoch=${tileEpoch} < transitionEpoch=${this.transitionEpoch}`);
         return; // Don't clear - these are stale pre-transition tiles
       }
-      console.log(`[EPOCH-GATE] Clearing snapshot: page=${this.config.pageNumber}, tileEpoch=${tileEpoch} >= transitionEpoch=${this.transitionEpoch}`);
     }
 
     // Clear the snapshot and reset transitionEpoch
     this.transitionSnapshot.remove();
     this.transitionEpoch = null;
-    console.log(`[DOUBLE-BUFFER] Removed transition snapshot: page=${this.config.pageNumber}`);
   }
 
   /**
@@ -3881,9 +3898,6 @@ export class PdfPageElement {
     // Track state
     this.renderingToOverlay = true;
     this.overlayRenderEpoch = epoch ?? null;
-
-    console.log(`[OVERLAY-CREATE] page=${this.config.pageNumber}: Created overlay canvas ` +
-      `${bufferWidth}x${bufferHeight} (css=${this.currentWidth}x${this.currentHeight}), epoch=${epoch}`);
 
     return this.overlayCtx;
   }
@@ -3979,10 +3993,6 @@ export class PdfPageElement {
     // Also clear any transition snapshot since new content is ready
     this.clearTransitionSnapshot(epoch);
 
-    const elapsed = performance.now() - startTime;
-    console.log(`[OVERLAY-COMMIT] page=${this.config.pageNumber}: Atomic swap complete in ${elapsed.toFixed(1)}ms, ` +
-      `buffer=${this.canvas.width}x${this.canvas.height}`);
-
     // Mark as rendered
     this.isRendered = true;
   }
@@ -3992,8 +4002,6 @@ export class PdfPageElement {
    */
   cancelOverlayRender(): void {
     if (!this.overlayCanvas) return;
-
-    console.log(`[OVERLAY-CANCEL] page=${this.config.pageNumber}: Cancelling overlay render`);
 
     // Remove overlay without copying content
     if (this.overlayCanvas.parentElement) {
@@ -4020,7 +4028,6 @@ export class PdfPageElement {
     // EARLY EXIT: If canvas has never been rendered, just return main context
     const isUnrenderedCanvas = this.canvas.width === 300 && this.canvas.height === 150;
     if (isUnrenderedCanvas) {
-      console.log(`[OVERLAY-SKIP] page=${this.config.pageNumber}: Canvas never rendered, using main canvas`);
       this.canvas.style.opacity = '0'; // Hide blank canvas
       return this.ctx;
     }
@@ -4060,7 +4067,6 @@ export class PdfPageElement {
       // With Math.round() on all dimensions, this should never trigger.
       h1Mismatch: Math.abs(heightDelta) > 0.5 || Math.abs(widthDelta) > 0.5,
     };
-    console.log('[GOLDEN-FRAME]', goldenFrameLog);
     
     // Warn if H1 mismatch detected (canvas CSS != container CSS)
     if (goldenFrameLog.h1Mismatch) {
@@ -4086,9 +4092,6 @@ export class PdfPageElement {
     if (epoch !== undefined) {
       this.transitionEpoch = epoch;
     }
-
-    console.log(`[OVERLAY-PREPARE] page=${this.config.pageNumber}: Main canvas kept visible, ` +
-      `rendering to overlay, epoch=${epoch}`);
 
     return overlayCtx;
   }
