@@ -210,6 +210,12 @@ export class PdfInfiniteCanvas {
   private pageElements: Map<number, PdfPageElement> = new Map();
   private canvasBounds = { width: 0, height: 0 };
 
+  // amnesia-aqv FIX: Per-canvas page dimensions map.
+  // The shared TileEngine singleton gets overwritten when multiple documents are open,
+  // causing page elements to receive wrong dimensions from OTHER documents.
+  // This local copy captures the correct dimensions for THIS document at initialization time.
+  private localPageDimensions: Map<number, { width: number; height: number }> = new Map();
+
   // Layout constants for O(1) page visibility calculation
   private layoutBaseWidth = 400;
   private layoutBaseHeight = 518; // Will be recalculated based on aspect ratio
@@ -619,7 +625,7 @@ export class PdfInfiniteCanvas {
       // Calculate the ACTUAL max achievable scale (capped by tile pixel limits)
       // This is the scale tiles will actually be rendered at, not the ideal scale
       // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles
-      const MAX_TILE_PIXELS = 4096;
+      const MAX_TILE_PIXELS = 8192; // amnesia-aqv: Match progressive-tile-renderer.ts
       const tileSize = getTileSize(zoom);
       const maxAchievableScale = Math.min(scale, Math.floor(MAX_TILE_PIXELS / tileSize));
       
@@ -802,6 +808,18 @@ export class PdfInfiniteCanvas {
       this.documentId = this.provider.getDocumentId();
     }
 
+    // amnesia-aqv FIX: Copy page dimensions from TileEngine to local map.
+    // The TileEngine is a singleton shared across all documents. When multiple PDFs
+    // are open, dimensions get overwritten. By copying NOW (at initialization time),
+    // we capture the correct dimensions for THIS document before another document
+    // overwrites the shared TileEngine.
+    if (this.tileEngine && this.tileEngine.pageDimensions.size > 0) {
+      for (const [page, dims] of this.tileEngine.pageDimensions.entries()) {
+        this.localPageDimensions.set(page, { ...dims });
+      }
+      console.log(`[PdfInfiniteCanvas] Copied ${this.localPageDimensions.size} page dimensions to local map for doc ${this.documentId?.slice(0, 15)}`);
+    }
+
     // Initialize layout based on display mode
     this.initializeDisplayMode();
 
@@ -837,9 +855,8 @@ export class PdfInfiniteCanvas {
    * This recalculates layouts to match the actual PDF aspect ratio.
    */
   updatePageDimensions(): void {
-    if (!this.tileEngine) return;
-
-    const dims = this.tileEngine.pageDimensions.get(1);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    const dims = this.localPageDimensions.get(1) ?? this.tileEngine?.pageDimensions.get(1);
     if (!dims) return;
 
     // Skip if dimensions already match
@@ -939,13 +956,12 @@ export class PdfInfiniteCanvas {
     const { gap, padding } = this.config;
 
     // Get actual PDF dimensions from tile engine if available
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
     let { pageWidth, pageHeight } = this.config;
-    if (this.tileEngine) {
-      const dims = this.tileEngine.pageDimensions.get(1);
-      if (dims) {
-        pageWidth = dims.width;
-        pageHeight = dims.height;
-      }
+    const dims = this.localPageDimensions.get(1) ?? this.tileEngine?.pageDimensions.get(1);
+    if (dims) {
+      pageWidth = dims.width;
+      pageHeight = dims.height;
     }
     const aspectRatio = pageWidth / pageHeight;
 
@@ -1126,16 +1142,15 @@ export class PdfInfiniteCanvas {
     const { gap, padding, layoutMode, pagesPerRow } = this.config;
 
     // Get page 1 dimensions as fallback for pages without explicit dimensions
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
     let { pageWidth: defaultWidth, pageHeight: defaultHeight } = this.config;
-    if (this.tileEngine) {
-      const dims = this.tileEngine.pageDimensions.get(1);
-      if (dims) {
-        defaultWidth = dims.width;
-        defaultHeight = dims.height;
-        // Update config to keep everything consistent
-        this.config.pageWidth = defaultWidth;
-        this.config.pageHeight = defaultHeight;
-      }
+    const dims = this.localPageDimensions.get(1) ?? this.tileEngine?.pageDimensions.get(1);
+    if (dims) {
+      defaultWidth = dims.width;
+      defaultHeight = dims.height;
+      // Update config to keep everything consistent
+      this.config.pageWidth = defaultWidth;
+      this.config.pageHeight = defaultHeight;
     }
 
     // PDF DIMENSION UNIFICATION (2026-01-23):
@@ -1163,14 +1178,13 @@ export class PdfInfiniteCanvas {
 
     for (let page = 1; page <= this.pageCount; page++) {
       // Get PDF native dimensions for this page
+      // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
       let pageW = defaultWidth;
       let pageH = defaultHeight;
-      if (this.tileEngine) {
-        const pageDims = this.tileEngine.pageDimensions.get(page);
-        if (pageDims) {
-          pageW = pageDims.width;
-          pageH = pageDims.height;
-        }
+      const pageDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
+      if (pageDims) {
+        pageW = pageDims.width;
+        pageH = pageDims.height;
       }
 
       // PDF DIMENSION UNIFICATION: Use PDF native dimensions directly
@@ -2390,12 +2404,12 @@ export class PdfInfiniteCanvas {
     // Get velocity-aware tile scale with pixelRatio for crisp rendering
     // ADAPTIVE TILE SIZE: With useAdaptiveTileSize feature flag:
     // - zoom <= 16: 512px tiles → max scale 16 (8192/512)
-    // - zoom <= 32: 256px tiles → max scale 32 (8192/256)
-    // - zoom > 32:  128px tiles → max scale 32 (4096/128)
-    // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles
-    // At zoom 32x, cssStretch will be 2x (slight blur) but rendering is much faster.
-    const MAX_TILE_SCALE = 32; // Reduced from 64 to match MAX_TILE_PIXELS cap
-    const MAX_TILE_PIXELS = 4096;
+    // amnesia-aqv FIX: With MAX_TILE_PIXELS=8192 and 128px tiles, max scale is 64.
+    // - zoom <= 4:  512px tiles → max scale 16 (8192/512)
+    // - zoom <= 16: 256px tiles → max scale 32 (8192/256)
+    // - zoom > 16:  128px tiles → max scale 64 (8192/128)
+    const MAX_TILE_SCALE = 64; // amnesia-aqv: Increased to support Retina at max zoom
+    const MAX_TILE_PIXELS = 8192; // amnesia-aqv: Match progressive-tile-renderer.ts
     const tileSize = getTileSize(zoom); // Returns 512, 256, or 128 based on zoom
     const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
     const rawScale = this.renderCoordinator.getTileScale(zoom, this.config.pixelRatio, this.velocity);
@@ -2656,7 +2670,8 @@ export class PdfInfiniteCanvas {
     
     if (!focalPage || !focalLayout) return;
 
-    const pdfDims = this.tileEngine.pageDimensions.get(focalPage);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    const pdfDims = this.localPageDimensions.get(focalPage) ?? this.tileEngine?.pageDimensions.get(focalPage);
     if (!pdfDims) return;
 
     // Get epoch for tile requests
@@ -2889,7 +2904,9 @@ export class PdfInfiniteCanvas {
     if (!layout) return;
 
     // Get native PDF dimensions for this page (used as fallback in renderTiles)
-    const pdfDimensions = this.tileEngine?.pageDimensions.get(page);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    // This prevents cross-document dimension contamination when multiple PDFs are open.
+    const pdfDimensions = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
 
     const element = new PdfPageElement({
       pageNumber: page,
@@ -3628,10 +3645,15 @@ export class PdfInfiniteCanvas {
     const containerHeight = element.getCurrentHeight();
     
     // Get PDF dimensions for pdfToElementScale calculation
-    // pageDimensions is populated when document is loaded via setDocument()
-    const pdfDims = this.tileEngine!.pageDimensions.get(page);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
     const pdfWidth = pdfDims?.width ?? containerWidth;
-    const pdfToElementScale = containerWidth / pdfWidth;
+    // amnesia-aqv FIX: Include zoom in pdfToElementScale calculation.
+    // BUG: pdfToElementScale = containerWidth / pdfWidth = 1 (since container = PDF size).
+    // This caused CSS dimensions to be calculated at 1x zoom (36x40 pixels) instead of
+    // 32x zoom (1152x1280 pixels), resulting in a tiny canvas that doesn't cover viewport.
+    // FIX: Multiply by zoom to get the correct scale for CSS positioning.
+    const pdfToElementScale = (containerWidth / pdfWidth) * zoom;
     
     const transformSnapshot: TransformSnapshot = {
       containerWidth,
@@ -3696,7 +3718,7 @@ export class PdfInfiniteCanvas {
       // TILE PIXEL CAP: With 512px fixed tile size (CACHE FIX), scale 32 produces
       // 16384px tiles which exceed GPU limits. Cap scale so tile pixels ≤ 4096.
       // MEMORY FIX (amnesia-e4i): Reduced from 8192 to 4096 to prevent 256MB tiles.
-      const MAX_TILE_PIXELS = 4096;
+      const MAX_TILE_PIXELS = 8192; // amnesia-aqv: Match progressive-tile-renderer.ts
       const tileSize = getTileSize(zoom);
       const maxScaleForTileSize = Math.floor(MAX_TILE_PIXELS / tileSize);
       const tileScale = Math.min(rawTileScale, maxScaleForTileSize);
@@ -3975,7 +3997,8 @@ export class PdfInfiniteCanvas {
         }
         
         // Get PDF dimensions for clamping
-        const pdfDims = this.tileEngine!.pageDimensions.get(page);
+        // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+        const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
         const pdfWidthForBounds = pdfDims?.width ?? containerWidth;
         const pdfHeightForBounds = pdfDims?.height ?? containerHeight;
         
@@ -4147,7 +4170,8 @@ export class PdfInfiniteCanvas {
         // SOLUTION: Always render available fallback FIRST, then start tile rendering
         // This gives users something to see within ~100ms instead of waiting 2-3s
         
-        const pdfDims = this.tileEngine?.pageDimensions.get(page);
+        // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+        const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
         
         if (hasFallback && pdfDims) {
           // TWO-TRACK FIX: Check if high-res tiles are already on the canvas.
@@ -4320,7 +4344,8 @@ export class PdfInfiniteCanvas {
         // Step 4: If we have critical tiles, render them (establishes render state)
         if (criticalTileImages.length > 0) {
           // Get PDF dimensions for renderTiles
-          const pdfDims = this.tileEngine!.pageDimensions.get(page);
+          // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+          const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
           
           console.log(`[STREAMING-RENDER] page=${page}: Calling renderTiles with ${criticalTileImages.length} tiles, pdfDims=${pdfDims?.width}x${pdfDims?.height}`);
           
@@ -4561,7 +4586,8 @@ export class PdfInfiniteCanvas {
 
       // Get PDF native dimensions for coordinate transform
       // Tiles are rendered in PDF coordinate space, but layout may be scaled
-      const pdfDimensions = this.tileEngine!.pageDimensions.get(page);
+      // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+      const pdfDimensions = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
 
       // Guard: If all tiles failed to produce ImageBitmaps, fall back to full-page rendering
       // Use current render version to ensure we render something
@@ -4717,7 +4743,8 @@ export class PdfInfiniteCanvas {
     const pdfTileSize = actualTileSize / tile.scale;
     
     // Get page dimensions to calculate total tiles
-    const pdfDims = this.tileEngine?.pageDimensions.get(tile.page);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    const pdfDims = this.localPageDimensions.get(tile.page) ?? this.tileEngine?.pageDimensions.get(tile.page);
     const pdfWidth = pdfDims?.width ?? layout.width;
     const pdfHeight = pdfDims?.height ?? layout.height;
     
@@ -4866,7 +4893,8 @@ export class PdfInfiniteCanvas {
           .filter((t): t is NonNullable<typeof t> => t !== null);
 
         // Get dimensions for rendering
-        const pdfDimensions = this.tileEngine!.pageDimensions.get(page);
+        // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+        const pdfDimensions = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
 
         // Use element's addRetryTiles method if available, otherwise log
         if (typeof (element as any).addRetryTiles === 'function') {
@@ -4930,7 +4958,8 @@ export class PdfInfiniteCanvas {
     //
     // This ensures full-page fallback produces SOMETHING rather than failing silently.
     const MAX_FULL_PAGE_DIMENSION = 4096; // MuPDF's internal cap
-    const pageDims = this.tileEngine?.pageDimensions.get(page);
+    // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
+    const pageDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
     const pageWidth = pageDims?.width ?? 612;
     const pageHeight = pageDims?.height ?? 792;
     const maxPageDim = Math.max(pageWidth, pageHeight);
