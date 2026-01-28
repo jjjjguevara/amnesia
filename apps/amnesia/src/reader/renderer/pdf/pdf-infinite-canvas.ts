@@ -11,7 +11,7 @@
  * - Page elements never resize - only the viewport moves
  */
 
-import { PdfPageElement, type PageRenderData, type PageHighlight, type ReadingMode, type TransformSnapshot } from './pdf-page-element';
+import { PdfPageElement, type PageRenderData, type PageHighlight, type ReadingMode, type TransformSnapshot, type RenderResult } from './pdf-page-element';
 import {
   type Camera,
   type Point,
@@ -44,6 +44,7 @@ import {
   getTargetScaleTier,
   getExactTargetScale,
   getProgressiveTileRenderer,
+  GPU_SAFE_MAX_SCALE,
   type ScaleTier,
 } from './progressive-tile-renderer';
 import { ZoomTransformLayer, type ZoomPhase } from './zoom-transform-layer';
@@ -483,6 +484,14 @@ export class PdfInfiniteCanvas {
     // is promoted to its own compositing layer for smooth 60fps zoom/pan.
     this.canvas = document.createElement('div');
     this.canvas.className = 'pdf-infinite-canvas';
+    // COMPOSITOR OPTIMIZATION (amnesia-aev): Add CSS containment to limit Chromium
+    // compositor tile creation. Without containment, at 32x zoom each page becomes
+    // ~19,584 × 25,344 px, and Chromium creates tiles for the entire transformed area.
+    // This causes "tile memory limits exceeded" errors.
+    //
+    // contain: layout style - Creates stacking context and containing block
+    // without breaking the auto-sizing or transform behavior we need.
+    // Do NOT use 'strict' or 'size' as they break layout.
     this.canvas.style.cssText = `
       position: absolute;
       top: 0;
@@ -490,6 +499,7 @@ export class PdfInfiniteCanvas {
       transform-origin: 0 0;
       will-change: transform;
       backface-visibility: hidden;
+      contain: layout style;
     `;
     this.viewport.appendChild(this.canvas);
 
@@ -3233,7 +3243,44 @@ export class PdfInfiniteCanvas {
     if (cachedTileImages.length === 0) {
       return;
     }
+
+    // amnesia-aqv FIX: Manage render state based on zoom level.
+    // At LOW zoom (< 8x): Page fits in viewport, offset should be (0,0)
+    // At HIGH zoom (>= 8x): Only part of page visible, use viewport offset
+    const isHighZoom = zoom >= 8;
+    const renderStateEpoch = this.zoomScaleService.getEpoch();
     
+    if (isHighZoom) {
+      // At high zoom, always call establishMinimalRenderState with viewport offset
+      // It internally checks if scale/offset changed and only reinitializes when needed
+      const viewportOffset = { x: viewportPdfX, y: viewportPdfY };
+      element.establishMinimalRenderState(zoom, pageDims, renderStateEpoch, tileScale, viewportOffset);
+    } else if (element.getLastRenderStateEpoch?.() === null) {
+      // At low zoom, only establish if not set, with offset (0,0)
+      console.log(`[compositeCachedTiles] page=${page}: Establishing minimal render state (low zoom)`);
+      element.establishMinimalRenderState(zoom, pageDims, renderStateEpoch, tileScale, { x: 0, y: 0 });
+    }
+
+    // amnesia-aqv FIX: Check scale compatibility before compositing.
+    //
+    // BUG: If canvas was rendered at scale 4 and we try to composite scale-64 tiles,
+    // they get shrunk 16x and positions are wrong. This causes blurry/blank output.
+    //
+    // The canvas needs to be re-rendered at the target scale before we can composite
+    // tiles at that scale. Skip compositing if scale mismatch is > 4x.
+    const canvasScale = element.getLastRenderStateTileScale?.() ?? 0;
+    const scaleMismatch = canvasScale > 0 ? Math.max(tileScale / canvasScale, canvasScale / tileScale) : Infinity;
+
+    if (scaleMismatch > 4) {
+      console.log(`[compositeCachedTiles] page=${page}: SKIP - scale mismatch ${scaleMismatch.toFixed(1)}x ` +
+        `(canvas=${canvasScale}, tiles=${tileScale}). Canvas needs re-render.`);
+      // Close bitmaps to prevent memory leak
+      for (const { bitmap } of cachedTileImages) {
+        bitmap.close();
+      }
+      return;
+    }
+
     // SPATIAL INDEX FIX: Use CURRENT epoch, not the stale tileEpoch.
     //
     // The original tileEpoch was captured when the tile render was requested, but
@@ -3327,10 +3374,36 @@ export class PdfInfiniteCanvas {
       }
       
       if (fallbackTileImages.length === 0) continue;
-      
+
       // Get PDF dimensions for proper tile positioning
       const pdfDimensions = this.tileEngine?.getPageDimensions(page);
+
+      // amnesia-aqv FIX: Manage render state based on zoom level.
+      const isHighZoom = zoom >= 8;
+      const pdfDims = this.tileEngine?.getPageDimensions(page);
       
+      if (!pdfDims && element.getLastRenderStateEpoch?.() === null) {
+        console.log(`[compositeFallbackTiles] page=${page}: Skipping - no lastRenderState and no pdfDims`);
+        fallbackTileImages.forEach(({ bitmap }) => bitmap.close());
+        continue;
+      }
+      
+      if (pdfDims) {
+        if (isHighZoom) {
+          // At high zoom, always update render state with viewport offset
+          const screenRect = this.getViewportRect();
+          const worldViewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
+          const intersectLeft = Math.max(worldViewport.x, layout.x);
+          const intersectTop = Math.max(worldViewport.y, layout.y);
+          const viewportOffset = { x: intersectLeft - layout.x, y: intersectTop - layout.y };
+          element.establishMinimalRenderState(zoom, pdfDims, epoch, targetScale, viewportOffset);
+        } else if (element.getLastRenderStateEpoch?.() === null) {
+          // At low zoom, only establish if not set, with offset (0,0)
+          console.log(`[compositeFallbackTiles] page=${page}: Establishing minimal render state (low zoom)`);
+          element.establishMinimalRenderState(zoom, pdfDims, epoch, targetScale, { x: 0, y: 0 });
+        }
+      }
+
       // Composite fallback tiles immediately (fire-and-forget)
       // Note: Using addTilesToExistingCanvas for additive compositing
       // so high-res tiles can overdraw later without clearing
@@ -3648,12 +3721,20 @@ export class PdfInfiniteCanvas {
     // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
     const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
     const pdfWidth = pdfDims?.width ?? containerWidth;
-    // amnesia-aqv FIX: Include zoom in pdfToElementScale calculation.
-    // BUG: pdfToElementScale = containerWidth / pdfWidth = 1 (since container = PDF size).
-    // This caused CSS dimensions to be calculated at 1x zoom (36x40 pixels) instead of
-    // 32x zoom (1152x1280 pixels), resulting in a tiny canvas that doesn't cover viewport.
-    // FIX: Multiply by zoom to get the correct scale for CSS positioning.
-    const pdfToElementScale = (containerWidth / pdfWidth) * zoom;
+    // amnesia-aqv FIX: pdfToElementScale is the BASE scale (no zoom).
+    //
+    // CRITICAL: containerWidth is already zoomed (element.getCurrentWidth() returns
+    // finalWidth = layout.width × zoom). We must divide by zoom to get base scale.
+    //
+    // The camera transform applies scale(zoom) to the entire canvas, so:
+    // - CSS dimensions = tile bounds × (containerWidth / pdfWidth / zoom) [base scale]
+    // - Camera = scale(zoom) [visual zoom]
+    // - Buffer = bounds × tileScale = bounds × zoom × DPR [high-res]
+    //
+    // This ensures buffer/display = DPR (crisp at any zoom level).
+    //
+    // PREVIOUS BUG: Including zoom (directly or via containerWidth) caused double-zoom.
+    const pdfToElementScale = containerWidth / pdfWidth / zoom;
     
     const transformSnapshot: TransformSnapshot = {
       containerWidth,
@@ -4261,6 +4342,26 @@ export class PdfInfiniteCanvas {
             }
           } else {
             console.log(`[FALLBACK-PRERENDER] page=${page}: Fallback timed out after ${FALLBACK_TIMEOUT_MS}ms, proceeding with tiles`);
+            
+            // amnesia-aqv FIX: Establish minimal render state so tiles can be composited.
+            // Without lastRenderState, tiles complete but addTilesToExistingCanvas rejects them.
+            // This creates a minimal state using existing canvas dimensions.
+            if (pdfDims) {
+              // amnesia-aqv FIX: Calculate viewport offset for proper tile positioning.
+              const layout = this.pageLayouts.get(page);
+              if (layout) {
+                const screenRect = this.getViewportRect();
+                const worldViewport = this.getVisibleBoundsForMode(this.camera, screenRect.width, screenRect.height);
+                const intersectLeft = Math.max(worldViewport.x, layout.x);
+                const intersectTop = Math.max(worldViewport.y, layout.y);
+                const viewportPdfX = intersectLeft - layout.x;
+                const viewportPdfY = intersectTop - layout.y;
+                const viewportOffset = { x: viewportPdfX, y: viewportPdfY };
+                element.establishMinimalRenderState(zoom, pdfDims, scaleSnapshot.epoch, tileScale, viewportOffset);
+              } else {
+                element.establishMinimalRenderState(zoom, pdfDims, scaleSnapshot.epoch, tileScale);
+              }
+            }
           }
         }
         
@@ -4346,11 +4447,11 @@ export class PdfInfiniteCanvas {
           // Get PDF dimensions for renderTiles
           // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
           const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
-          
+
           console.log(`[STREAMING-RENDER] page=${page}: Calling renderTiles with ${criticalTileImages.length} tiles, pdfDims=${pdfDims?.width}x${pdfDims?.height}`);
-          
+
           // Use the normal tile rendering path for critical batch
-          await element.renderTiles(
+          const renderResult = await element.renderTiles(
             criticalTileImages,
             undefined, // textLayerData - not needed for streaming
             zoom,
@@ -4360,13 +4461,90 @@ export class PdfInfiniteCanvas {
             false, // forceFullPage
             this.currentGestureId // amnesia-aqv: pass gestureId
           );
-          
-          console.log(`[STREAMING-RENDER] page=${page}: renderTiles completed for ${criticalTileImages.length} tiles`);
+
+          // STALE-TILE RECOVERY (amnesia-aqv): Two-Track Pipeline recovery mechanism.
+          // When tiles are filtered as stale (camera drifted too far during render),
+          // trigger recovery by requesting fresh tiles for current camera position.
+          // The fallback layer provides visual coverage while recovery tiles arrive.
+          if (!renderResult.success && renderResult.reason === 'stale-tiles-filtered') {
+            console.warn(`[STALE-TILE-RECOVERY] page=${page}: Initiating recovery (${JSON.stringify(renderResult.context)})`);
+
+            // Take fresh camera snapshot (current position, not stale snapshot)
+            const freshCamera = { ...this.camera };
+            const freshZoom = freshCamera.z;
+            const freshScaleSnapshot = this.zoomScaleService.captureSnapshot();
+
+            // Re-calculate visible tiles for current position
+            const freshScreenRect = this.getViewportRect();
+            const freshViewport = this.getVisibleBoundsForMode(freshCamera, freshScreenRect.width, freshScreenRect.height);
+            const { renderBuffer: freshRenderBuffer } = this.calculateBufferSizes(freshZoom);
+            const freshRenderBufferCanvas = freshRenderBuffer / freshZoom;
+            const freshExpandedViewport = {
+              x: freshViewport.x - freshRenderBufferCanvas,
+              y: freshViewport.y - freshRenderBufferCanvas,
+              width: freshViewport.width + 2 * freshRenderBufferCanvas,
+              height: freshViewport.height + 2 * freshRenderBufferCanvas,
+            };
+
+            // Get fresh tiles for current position
+            const freshTiles = this.tileEngine!.getVisibleTiles(freshExpandedViewport, [layout], freshZoom, gridTileScale);
+            const freshCriticalTiles = freshTiles.slice(0, CRITICAL_BATCH_SIZE);
+
+            console.log(`[STALE-TILE-RECOVERY] page=${page}: Requesting ${freshCriticalTiles.length} fresh tiles for current position`);
+
+            // Fire and forget - tiles will composite via onTileReady callback
+            // Don't await - we want to return immediately with fallback displayed
+            freshCriticalTiles.forEach(tile => {
+              this.renderCoordinator!.requestRender({
+                type: 'tile' as const,
+                tile,
+                priority: 'critical',
+                documentId: this.documentId ?? undefined,
+                sessionId: this.pendingSessionId,
+                scaleEpoch: freshScaleSnapshot.epoch,
+                renderParamsId: freshScaleSnapshot.snapshotId,
+                forceFreshRender: true, // Skip fallback - get high-res tiles
+                gestureId: this.currentGestureId,
+              }).catch(() => {
+                // Silently handle errors - streaming compositing will fill gaps
+              });
+            });
+          } else {
+            console.log(`[STREAMING-RENDER] page=${page}: renderTiles completed - ${renderResult.tilesDrawn} tiles drawn`);
+          }
+
           element.hideLoading();
         } else {
-          // No critical tiles succeeded - fall through to blocking mode
-          console.warn(`[STREAMING-RENDER] page=${page}: No critical tiles succeeded, falling back to blocking mode`);
-          // Close any bitmaps and continue to blocking mode below
+          // amnesia-aqv FIX: No critical tiles succeeded - STILL establish render state.
+          //
+          // BUG: When critical batch is empty, this code path returned immediately
+          // without calling renderTiles. This left lastRenderState=null.
+          // When background tiles completed later, addTilesToExistingCanvas rejected
+          // them with "REJECTED - no lastRenderState".
+          //
+          // FIX: Call renderTiles with empty array to establish lastRenderState.
+          // This allows background tiles to composite via addTilesToExistingCanvas.
+          // The fallback base layer (if cached) will be drawn, providing visual content
+          // while high-res tiles arrive in the background.
+          console.warn(`[STREAMING-RENDER] page=${page}: No critical tiles succeeded, establishing render state for background compositing`);
+          
+          const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
+          if (pdfDims) {
+            const establishResult = await element.renderTiles(
+              [], // No tiles - just establish render state with base layer fallback
+              undefined,
+              zoom,
+              pdfDims,
+              transformSnapshot,
+              scaleSnapshot.epoch,
+              false,
+              this.currentGestureId
+            );
+            console.log(`[STREAMING-RENDER] page=${page}: Render state established (success=${establishResult.success}), background tiles will composite`);
+          } else {
+            console.error(`[STREAMING-RENDER] page=${page}: CRITICAL - no pdfDims available, cannot establish render state!`);
+          }
+          element.hideLoading();
         }
         
         // Return immediately - background tiles will composite via onTileReady
@@ -4650,7 +4828,18 @@ export class PdfInfiniteCanvas {
       // FORCE FULL PAGE FIX: Pass forceFullPageTiles to prevent incorrect viewport-only
       // canvas sizing when some tiles are aborted during continuous zoom.
       // amnesia-aqv: Pass gestureId for hybrid guard tile lifecycle correlation
-      await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions, transformSnapshot, this.zoomScaleService.getEpoch(), forceFullPageTiles, this.currentGestureId);
+      const blockingRenderResult = await element.renderTiles(tileImages, textLayerData, zoom, pdfDimensions, transformSnapshot, this.zoomScaleService.getEpoch(), forceFullPageTiles, this.currentGestureId);
+
+      // STALE-TILE RECOVERY (amnesia-aqv): Handle stale tiles in blocking mode.
+      // Less common at lower zoom levels, but still possible during rapid pan.
+      if (!blockingRenderResult.success && blockingRenderResult.reason === 'stale-tiles-filtered') {
+        console.warn(`[BLOCKING-RENDER] page=${page}: Stale tiles detected, scheduling recovery via scroll rerender`);
+        // In blocking mode, trigger a scroll rerender to refresh tiles
+        this.scheduleScrollRerender();
+      } else {
+        console.log(`[BLOCKING-RENDER] page=${page}: renderTiles completed - ${blockingRenderResult.tilesDrawn} tiles drawn`);
+      }
+
       element.hideLoading();
 
       // STUCK TILE FIX: Track that this page was rendered with tiles
@@ -5164,15 +5353,14 @@ export class PdfInfiniteCanvas {
     const pixelRatio = this.config.pixelRatio;
 
     // Target scale for crisp rendering: zoom × pixelRatio
-    // At zoom 16x with DPR 2: idealScale = 32
+    // At zoom 32x with DPR 2: idealScale = 64
     const idealScale = zoom * pixelRatio;
 
-    // Cap at 32x to enable true retina quality at maximum zoom (16x on 2x DPR)
-    // This matches SCALE_TIERS max in progressive-tile-renderer.ts
-    // Memory is managed by tiled rendering (only visible tiles rendered)
-    const MAX_SCALE = 32.0;
-
-    return Math.min(idealScale, MAX_SCALE);
+    // amnesia-aqv FIX: Use GPU_SAFE_MAX_SCALE (64) instead of hardcoded 32.
+    // At zoom 32 with DPR 2, we need scale 64 for crisp rendering.
+    // Previous cap of 32 caused 2x blur at max zoom.
+    // Memory is managed by tiled rendering (only visible tiles rendered).
+    return Math.min(idealScale, GPU_SAFE_MAX_SCALE);
   }
 
   /**

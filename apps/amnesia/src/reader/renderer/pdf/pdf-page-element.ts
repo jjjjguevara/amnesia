@@ -429,6 +429,10 @@ export class PdfPageElement {
     // Some browsers don't properly clip transformed content with just overflow:hidden.
     // clip-path: inset(0) creates a clipping region exactly matching the element bounds,
     // which reliably clips all content including GPU-composited transformed children.
+    //
+    // NOTE (amnesia-aev): Do NOT add `contain: paint` here - it clips the box-shadow!
+    // The canvas-level containment (`contain: layout style` on .pdf-infinite-canvas)
+    // provides sufficient compositor optimization without breaking page borders.
     this.container.style.cssText = `
       position: relative;
       background: transparent;
