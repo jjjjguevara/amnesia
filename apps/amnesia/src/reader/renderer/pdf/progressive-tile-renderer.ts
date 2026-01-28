@@ -187,7 +187,11 @@ export const DEFAULT_MAX_SCALE_TIER: ScaleTier = 16;
  * IMPORTANT: This MUST match the value in tile-render-engine.ts, render-coordinator.ts,
  * pdf-infinite-canvas.ts, and scroll-strategy.ts.
  */
-export const MAX_TILE_PIXELS = 4096;
+// amnesia-aqv FIX: Increased from 4096 to 8192 to support scale 64.
+// On Retina (pixelRatio=2) at maxZoom=32: neededScale = 64.
+// With 128px tiles: maxScale = MAX_TILE_PIXELS / 128 = 64 (was 32).
+// This allows native resolution at max zoom on HiDPI displays.
+export const MAX_TILE_PIXELS = 8192;
 
 /**
  * GPU-safe maximum scale tier (absolute cap).
@@ -200,12 +204,13 @@ export const MAX_TILE_PIXELS = 4096;
  *
  * All produce the same 4096×4096 pixel tiles (~64MB RGBA each).
  *
- * With adaptive tile sizing:
+ * With adaptive tile sizing (MAX_TILE_PIXELS=8192):
  * - At zoom 8: scale 16, DPR = 2.0 (Retina crisp with 512px tiles)
  * - At zoom 16: scale 32, DPR = 2.0 (Retina crisp with 256px tiles)
- * - At zoom 32: scale 32, DPR = 1.0 (non-Retina crisp, Retina 2x stretch)
+ * - At zoom 32: scale 64, DPR = 2.0 (Retina crisp with 128px tiles)
  */
-export const GPU_SAFE_MAX_SCALE: ScaleTier = 32;
+// amnesia-aqv FIX: Increased from 32 to 64 to support Retina at max zoom.
+export const GPU_SAFE_MAX_SCALE: ScaleTier = 64;
 
 /**
  * Calculate the maximum achievable scale for a given zoom level.
@@ -449,6 +454,13 @@ export function getTargetScaleTier(
   const maxScaleForTileSize = getMaxScaleForZoom(zoom, pixelRatio);
   maxScale = Math.min(maxScale, maxScaleForTileSize) as ScaleTier;
 
+  // amnesia-aqv FIX: Also cap by device memory limits.
+  // getDynamicMaxScaleTier() returns 64 for 8GB+, 32 for 4-8GB, 16 for <4GB.
+  // Without this, we might return tier 64 when the device can only render scale 32,
+  // causing SINGLE-SCALE-ENFORCE to reject all tiles rendered at the device's actual max.
+  const deviceMaxScale = getDynamicMaxScaleTier();
+  maxScale = Math.min(maxScale, deviceMaxScale) as ScaleTier;
+
   tier = Math.min(tier, maxScale) as ScaleTier;
 
   // Calculate cssStretch (how much CSS scaling is needed)
@@ -490,6 +502,69 @@ export const EXACT_SCALE_PRECISION = 0.01;
  */
 export function roundScaleForCache(scale: number): number {
   return Math.round(scale / EXACT_SCALE_PRECISION) * EXACT_SCALE_PRECISION;
+}
+
+/**
+ * Apply all scale caps consistently.
+ *
+ * INV-6: This function centralizes scale capping logic to ensure cache keys
+ * match rendered tile scales. All scale paths should use this function.
+ *
+ * Caps applied (in order):
+ * 1. GPU_SAFE_MAX_SCALE (64) - Canvas 2D memory protection
+ * 2. deviceMaxScale - Device memory limits from getDynamicMaxScaleTier()
+ * 3. maxTileScale - MAX_TILE_PIXELS/tileSize limit
+ * 4. configuredMaxScale - maxZoom × pixelRatio (if maxZoom provided)
+ *
+ * This function is idempotent: applyScaleCaps(applyScaleCaps(x)) === applyScaleCaps(x)
+ *
+ * @param scale Raw scale value to cap
+ * @param pixelRatio Device pixel ratio (typically 2)
+ * @param maxZoom Optional maximum zoom level from config
+ * @returns Capped scale value that respects all limits
+ */
+export function applyScaleCaps(
+  scale: number,
+  pixelRatio: number,
+  maxZoom?: number
+): number {
+  // Guard against invalid scale values
+  if (scale <= 0 || !Number.isFinite(scale)) {
+    return 1;
+  }
+
+  let cappedScale = scale;
+
+  // Cap 1: GPU_SAFE_MAX_SCALE - Canvas 2D memory protection
+  cappedScale = Math.min(cappedScale, GPU_SAFE_MAX_SCALE);
+
+  // Cap 2: Device memory limits
+  const deviceMaxScale = getDynamicMaxScaleTier();
+  cappedScale = Math.min(cappedScale, deviceMaxScale);
+
+  // Cap 3: MAX_TILE_PIXELS/tileSize limit
+  // At high zoom with small tiles (128px), max achievable scale is limited
+  const maxTileScale = getMaxScaleForZoom(cappedScale / pixelRatio, pixelRatio);
+  cappedScale = Math.min(cappedScale, maxTileScale);
+
+  // Cap 4: Configured max from maxZoom × pixelRatio (if provided)
+  if (maxZoom !== undefined && maxZoom > 0) {
+    const configuredMaxScale = maxZoom * pixelRatio;
+    cappedScale = Math.min(cappedScale, configuredMaxScale);
+  }
+
+  // Quantize to recognized tier for cache consistency
+  const scaleTiers = getScaleTiers();
+  let quantizedScale = scaleTiers[0];
+  for (const tier of scaleTiers) {
+    if (tier <= cappedScale) {
+      quantizedScale = tier;
+    } else {
+      break;
+    }
+  }
+
+  return quantizedScale;
 }
 
 /**
@@ -536,10 +611,10 @@ export function getExactTargetScale(
   // This caused tiles to be capped at scale 16 even at 32x zoom, resulting in
   // cssStretch of 3.33 and blurry/stretched content at max zoom.
   //
-  // With maxZoom=32 and pixelRatio=1.67:
-  // - configuredMaxScale = 32 × 1.67 = 53.3
-  // - Capped to GPU_SAFE_MAX_SCALE = 32
-  // - At zoom 32x: scale 32, cssStretch = 53.3/32 = 1.67 (much better than 3.33!)
+  // With maxZoom=32 and pixelRatio=2 (Retina):
+  // - configuredMaxScale = 32 × 2 = 64
+  // - Capped to GPU_SAFE_MAX_SCALE = 64
+  // - At zoom 32x: scale 64, cssStretch = 1.0 (crisp!)
   let maxScale: number;
   if (maxZoom !== undefined) {
     const configuredMaxScale = maxZoom * pixelRatio;
@@ -557,6 +632,13 @@ export function getExactTargetScale(
       maxScale = getDynamicMaxScaleTier();
     }
   }
+
+  // amnesia-aqv FIX: Also cap by device memory limits.
+  // This matches getTargetScaleTier() behavior to prevent scale divergence.
+  // Without this, getExactTargetScale returns scale=64 while getTargetScaleTier
+  // returns tier=32, causing cache key/content mismatches.
+  const deviceMaxScale = getDynamicMaxScaleTier();
+  maxScale = Math.min(maxScale, deviceMaxScale);
 
   const wasCapped = exactScale > maxScale;
   const cappedScale = Math.min(exactScale, maxScale);
@@ -693,39 +775,40 @@ export function getCssScaleFactor(renderedScale: number, displayScale: number): 
  */
 export function getAdaptiveTileSize(zoom: number, pixelRatio?: number): number {
   // amnesia-rwe: CRITICAL FIX - account for devicePixelRatio
+  // amnesia-aqv: Updated for MAX_TILE_PIXELS = 8192
   //
   // For crisp rendering: neededScale = zoom * pixelRatio
-  // Max achievable scale: MAX_TILE_PIXELS (4096) / tileSize
+  // Max achievable scale: MAX_TILE_PIXELS (8192) / tileSize
   //
   // On Retina (pixelRatio=2):
-  //   - 512px tiles: max scale = 8 → max crisp zoom = 4
-  //   - 256px tiles: max scale = 16 → max crisp zoom = 8
-  //   - 128px tiles: max scale = 32 → max crisp zoom = 16
+  //   - 512px tiles: max scale = 16 → max crisp zoom = 8
+  //   - 256px tiles: max scale = 32 → max crisp zoom = 16
+  //   - 128px tiles: max scale = 64 → max crisp zoom = 32
   //
   // On non-Retina (pixelRatio=1):
-  //   - 512px tiles: max scale = 8 → max crisp zoom = 8
-  //   - 256px tiles: max scale = 16 → max crisp zoom = 16
-  //   - 128px tiles: max scale = 32 → max crisp zoom = 32
+  //   - 512px tiles: max scale = 16 → max crisp zoom = 16
+  //   - 256px tiles: max scale = 32 → max crisp zoom = 32
+  //   - 128px tiles: max scale = 64 → max crisp zoom = 64
   
   const dpr = pixelRatio ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 2);
   const neededScale = zoom * dpr;
   
   // amnesia-aqv A/B TEST: Use larger tiles at high zoom for faster coverage
-  // Trade-off: fewer tiles (40 vs 135) but max scale 16 instead of 32
+  // Trade-off: fewer tiles (40 vs 135) but max scale 32 instead of 64
   // This flag lets users compare:
-  //   - useLargeTilesAtHighZoom=false: 128px tiles, max scale 32, ~135 tiles at 32x zoom
-  //   - useLargeTilesAtHighZoom=true:  256px tiles, max scale 16, ~40 tiles at 32x zoom
+  //   - useLargeTilesAtHighZoom=false: 128px tiles, max scale 64, ~135 tiles at 32x zoom
+  //   - useLargeTilesAtHighZoom=true:  256px tiles, max scale 32, ~40 tiles at 32x zoom
   const useLargeTiles = isFeatureEnabled('useLargeTilesAtHighZoom');
-  
+
   // Pick smallest tile size that can achieve needed scale
-  // MAX_TILE_PIXELS = 4096, so:
-  // 512px tiles: max scale = 8
-  // 256px tiles: max scale = 16
-  // 128px tiles: max scale = 32
-  
+  // MAX_TILE_PIXELS = 8192, so:
+  // 512px tiles: max scale = 16
+  // 256px tiles: max scale = 32
+  // 128px tiles: max scale = 64
+
   if (useLargeTiles) {
     // A/B test: prefer larger tiles for faster coverage
-    // Cap at 256px tiles (max scale 16) even at extreme zoom
+    // Cap at 256px tiles (max scale 32) even at extreme zoom
     if (neededScale <= 8) {
       return 512;
     } else {

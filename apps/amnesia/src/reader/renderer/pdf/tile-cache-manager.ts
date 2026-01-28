@@ -372,6 +372,215 @@ export interface CachedTileData {
 }
 
 /**
+ * Error thrown when tile data violates INV-7 (Tile Data Integrity)
+ *
+ * INV-7 states: "Cached tile data must have non-zero dimensions and matching
+ * rgba array size (width × height × 4 bytes)."
+ *
+ * This error is thrown by TileCacheManager.set() when:
+ * - width === 0 or height === 0
+ * - rgba array size !== width × height × 4
+ * - Legacy Blob without dimensions
+ */
+export class TileDataIntegrityError extends Error {
+  /** The tile that failed validation */
+  public readonly tile: { page: number; tileX: number; tileY: number; scale: number };
+
+  /** The specific violation type */
+  public readonly violationType: 'zero_width' | 'zero_height' | 'rgba_mismatch' | 'legacy_blob';
+
+  /** Additional context about the violation */
+  public readonly context: {
+    width: number;
+    height: number;
+    expectedRgbaSize?: number;
+    actualRgbaSize?: number;
+  };
+
+  constructor(
+    message: string,
+    tile: { page: number; tileX: number; tileY: number; scale: number },
+    violationType: 'zero_width' | 'zero_height' | 'rgba_mismatch' | 'legacy_blob',
+    context: { width: number; height: number; expectedRgbaSize?: number; actualRgbaSize?: number }
+  ) {
+    super(message);
+    this.name = 'TileDataIntegrityError';
+    this.tile = tile;
+    this.violationType = violationType;
+    this.context = context;
+
+    // Maintains proper stack trace for where error was thrown (V8 engines)
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, TileDataIntegrityError);
+    }
+  }
+}
+
+// ============================================================================
+// TILE CIRCUIT BREAKER (amnesia-aqv Phase 3)
+// ============================================================================
+// Prevents infinite retry loops when tiles are repeatedly rejected.
+// Tracks consecutive rejections and triggers fallback behavior.
+// ============================================================================
+
+/**
+ * Configuration for the tile circuit breaker
+ */
+export interface CircuitBreakerConfig {
+  /** Number of consecutive failures before circuit trips (default: 10) */
+  threshold?: number;
+  /** Scale reduction factor when using fallback (default: 2) */
+  fallbackScaleReduction?: number;
+}
+
+/**
+ * Circuit breaker statistics
+ */
+export interface CircuitBreakerStats {
+  totalRejections: number;
+  totalSuccesses: number;
+  rejectionsByReason: Record<string, number>;
+}
+
+/**
+ * Circuit breaker state snapshot
+ */
+export interface CircuitBreakerState {
+  isTripped: boolean;
+  consecutiveFailures: number;
+  threshold: number;
+}
+
+/**
+ * Circuit breaker for tile rejection handling.
+ *
+ * Problem: When tiles are repeatedly rejected (epoch mismatch, scale mismatch),
+ * the system can enter an infinite retry loop with no mechanism to detect
+ * deadlock or trigger fallback behavior.
+ *
+ * Solution: Track consecutive rejections and:
+ * 1. Trip circuit after threshold rejections (default: 10)
+ * 2. Signal fallback to lower-scale tiles when tripped
+ * 3. Reset on successful composite
+ */
+export class TileCircuitBreaker {
+  private consecutiveFailures = 0;
+  private threshold: number;
+  private fallbackScaleReduction: number;
+  private totalRejections = 0;
+  private totalSuccesses = 0;
+  private rejectionsByReason: Record<string, number> = {};
+  private tripped = false;
+
+  constructor(config: CircuitBreakerConfig = {}) {
+    this.threshold = config.threshold ?? 10;
+    this.fallbackScaleReduction = config.fallbackScaleReduction ?? 2;
+  }
+
+  /**
+   * Record a tile rejection.
+   * @param reason The reason for rejection (e.g., 'epoch_expired', 'scale_mismatch')
+   */
+  recordRejection(reason: string): void {
+    this.consecutiveFailures++;
+    this.totalRejections++;
+    this.rejectionsByReason[reason] = (this.rejectionsByReason[reason] || 0) + 1;
+
+    if (this.consecutiveFailures >= this.threshold) {
+      this.tripped = true;
+      console.warn(
+        `[CIRCUIT-BREAKER] Tripped after ${this.consecutiveFailures} consecutive rejections. ` +
+        `Last reason: ${reason}. Fallback scale reduction: ${this.fallbackScaleReduction}x`
+      );
+    }
+  }
+
+  /**
+   * Record a successful tile composite.
+   * Resets the failure counter and closes the circuit.
+   */
+  recordSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.totalSuccesses++;
+    if (this.tripped) {
+      console.log(`[CIRCUIT-BREAKER] Reset after successful composite`);
+      this.tripped = false;
+    }
+  }
+
+  /**
+   * Check if the circuit is tripped (threshold reached).
+   */
+  isTripped(): boolean {
+    return this.tripped;
+  }
+
+  /**
+   * Check if fallback behavior should be used.
+   * Returns true when circuit is tripped.
+   */
+  shouldUseFallback(): boolean {
+    return this.tripped;
+  }
+
+  /**
+   * Get the scale reduction factor for fallback.
+   * Returns 1 (no reduction) if circuit is not tripped.
+   * Returns the configured reduction factor (default: 2) if tripped.
+   */
+  getFallbackScaleReduction(): number {
+    return this.tripped ? this.fallbackScaleReduction : 1;
+  }
+
+  /**
+   * Get the current consecutive failure count.
+   */
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  /**
+   * Get circuit breaker statistics.
+   */
+  getStats(): CircuitBreakerStats {
+    return {
+      totalRejections: this.totalRejections,
+      totalSuccesses: this.totalSuccesses,
+      rejectionsByReason: { ...this.rejectionsByReason },
+    };
+  }
+
+  /**
+   * Get current state snapshot for debugging.
+   */
+  getState(): CircuitBreakerState {
+    return {
+      isTripped: this.tripped,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.threshold,
+    };
+  }
+
+  /**
+   * Reset the circuit breaker to initial state.
+   */
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.tripped = false;
+    this.totalRejections = 0;
+    this.totalSuccesses = 0;
+    this.rejectionsByReason = {};
+  }
+}
+
+/**
+ * Factory function to create a TileCircuitBreaker instance.
+ */
+export function createTileCircuitBreaker(config?: CircuitBreakerConfig): TileCircuitBreaker {
+  return new TileCircuitBreaker(config);
+}
+
+/**
  * Cached page classification data (Phase 5: Content-Type Detection)
  */
 export interface CachedPageClassification {
@@ -649,6 +858,12 @@ export class TileCacheManager {
    * Key: page number, Value: { width, height } in PDF units
    */
   private pageDimensionsCache: Map<number, PageDimensions> = new Map();
+
+  /**
+   * Counter for INV-7 (Tile Data Integrity) violations.
+   * Tracks how many tiles have been rejected due to invalid data.
+   */
+  private inv7ViolationCount = 0;
 
   constructor(options?: {
     l1MaxSize?: number;
@@ -1130,19 +1345,79 @@ export class TileCacheManager {
     let cacheData: CachedTileData;
     let size: number;
 
-    if (data instanceof Blob) {
-      // Legacy Blob format
-      cacheData = {
-        format: 'png',
-        blob: data,
-        width: 0, // Unknown for legacy blobs
-        height: 0,
-      };
-      size = data.size;
-    } else {
+    // amnesia-aqv FIX: Use duck-typing for cross-realm safety
+    // In Electron, instanceof checks can be unreliable across contexts
+    const isCachedTileData = data && typeof data === 'object' && 'format' in data;
+
+    if (isCachedTileData) {
       // New CachedTileData format
-      cacheData = data;
-      size = this.getCachedDataSize(data);
+      cacheData = data as CachedTileData;
+      size = this.getCachedDataSize(cacheData);
+    } else if (data instanceof Blob) {
+      // INV-7: Legacy Blob format without dimensions is no longer allowed
+      this.inv7ViolationCount++;
+      console.error(`[INV-7-VIOLATION] Legacy Blob without dimensions: key=${key}`);
+      throw new TileDataIntegrityError(
+        `INV-7 violation: Legacy Blob without dimensions is not allowed. ` +
+        `Use TileRenderResult with explicit width/height instead.`,
+        { page: tile.page, tileX: tile.tileX, tileY: tile.tileY, scale: tile.scale },
+        'legacy_blob',
+        { width: 0, height: 0 }
+      );
+    } else {
+      console.error(`[TileCacheManager] UNKNOWN-DATA:`, typeof data);
+      return; // Don't cache invalid data
+    }
+
+    // =========================================================================
+    // INV-7: Tile Data Integrity Validation
+    // =========================================================================
+    // "Cached tile data must have non-zero dimensions and matching
+    // rgba array size (width × height × 4 bytes)."
+    // =========================================================================
+
+    // INV-7-1: Reject tiles with zero width
+    if (cacheData.width === 0) {
+      this.inv7ViolationCount++;
+      console.error(`[INV-7-VIOLATION] Zero width tile: key=${key} scale=${tile.scale}`);
+      throw new TileDataIntegrityError(
+        `INV-7 violation: Tile has zero width. Expected non-zero width.`,
+        { page: tile.page, tileX: tile.tileX, tileY: tile.tileY, scale: tile.scale },
+        'zero_width',
+        { width: cacheData.width, height: cacheData.height }
+      );
+    }
+
+    // INV-7-2: Reject tiles with zero height
+    if (cacheData.height === 0) {
+      this.inv7ViolationCount++;
+      console.error(`[INV-7-VIOLATION] Zero height tile: key=${key} scale=${tile.scale}`);
+      throw new TileDataIntegrityError(
+        `INV-7 violation: Tile has zero height. Expected non-zero height.`,
+        { page: tile.page, tileX: tile.tileX, tileY: tile.tileY, scale: tile.scale },
+        'zero_height',
+        { width: cacheData.width, height: cacheData.height }
+      );
+    }
+
+    // INV-7-3: Reject tiles with rgba size mismatch
+    if (cacheData.format === 'rgba' && cacheData.rgba) {
+      const expectedSize = cacheData.width * cacheData.height * 4;
+      const actualSize = cacheData.rgba.length;
+      if (actualSize !== expectedSize) {
+        this.inv7ViolationCount++;
+        console.error(
+          `[INV-7-VIOLATION] RGBA size mismatch: key=${key} ` +
+          `expected=${expectedSize} (${cacheData.width}×${cacheData.height}×4), actual=${actualSize}`
+        );
+        throw new TileDataIntegrityError(
+          `INV-7 violation: RGBA array size mismatch. ` +
+          `Expected ${expectedSize} bytes (${cacheData.width}×${cacheData.height}×4), got ${actualSize} bytes.`,
+          { page: tile.page, tileX: tile.tileX, tileY: tile.tileY, scale: tile.scale },
+          'rgba_mismatch',
+          { width: cacheData.width, height: cacheData.height, expectedRgbaSize: expectedSize, actualRgbaSize: actualSize }
+        );
+      }
     }
 
     // Always store in L2 (larger capacity)
@@ -1160,6 +1435,38 @@ export class TileCacheManager {
     // This enables O(log n) multi-resolution lookup without epoch validation
     // MEMORY FIX (amnesia-aqv): Only pass cache key, not actual data - prevents memory duplication
     this.spatialIndex.insert(tile, key);
+
+    // DIAGNOSTIC (amnesia-aqv): Log call stack when storing high-scale tiles to find blank tile source
+    if (tile.scale >= 32 && isFeatureEnabled('useTileQualityVerification')) {
+      const stackLines = new Error().stack?.split('\n').slice(1, 6).join('\n') || 'no stack';
+      console.log(
+        `[TILE-CACHE-INSERT] scale=${tile.scale} key=${key}`,
+        `\n  size=${size} format=${cacheData.format}`,
+        `\n  dims=${cacheData.width}x${cacheData.height}`,
+        `\n  STACK:\n${stackLines}`
+      );
+
+      // Sample content if RGBA format to detect blank at insertion
+      if (cacheData.format === 'rgba' && cacheData.rgba) {
+        const w = cacheData.width;
+        const h = cacheData.height;
+        const rgba = cacheData.rgba;
+        const centerIdx = (Math.floor(h / 2) * w + Math.floor(w / 2)) * 4;
+        const cornerIdx = 0;
+
+        const isWhite = (idx: number) =>
+          rgba[idx] >= 250 && rgba[idx + 1] >= 250 &&
+          rgba[idx + 2] >= 250 && rgba[idx + 3] >= 250;
+
+        if (isWhite(centerIdx) && isWhite(cornerIdx)) {
+          console.error(
+            `[TILE-CACHE-INSERT-BLANK] Storing BLANK tile at scale ${tile.scale}!`,
+            `key=${key}`,
+            `center=[${rgba[centerIdx]},${rgba[centerIdx+1]},${rgba[centerIdx+2]},${rgba[centerIdx+3]}]`
+          );
+        }
+      }
+    }
 
     // Reset consecutive misses since we just cached something
     this.consecutiveMisses = 0;
@@ -3439,6 +3746,14 @@ export class TileCacheManager {
       l2Bytes: this.l2Cache.bytes,
       l3Count: this.l3Cache.size,
     };
+  }
+
+  /**
+   * Get the count of INV-7 (Tile Data Integrity) violations.
+   * Useful for monitoring and debugging tile rejection issues.
+   */
+  getInv7ViolationCount(): number {
+    return this.inv7ViolationCount;
   }
 
   /**

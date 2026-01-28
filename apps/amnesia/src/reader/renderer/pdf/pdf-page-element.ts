@@ -31,9 +31,47 @@ import {
   isDiagnosticsEnabled,
 } from './tile-corruption-diagnostics';
 import { getTileLifecycleTracer } from './tile-lifecycle-tracer';
+import {
+  auditTileDimensions,
+  sampleBitmapContent,
+  isQualityVerificationEnabled,
+} from './tile-quality-verification';
 
 export type ReadingMode = 'device' | 'light' | 'sepia' | 'dark' | 'night';
 export type RenderMode = 'page' | 'reflow';
+
+/**
+ * Calculate adaptive epoch tolerance based on zoom level.
+ *
+ * INV-2: Epoch tolerance must scale with zoom to accommodate longer render times
+ * at high zoom levels while still rejecting stale tiles.
+ *
+ * Problem: At 32x zoom, tiles take 300-500ms to render, but fixed EPOCH_TOLERANCE=5
+ * (≈160ms) causes tiles to be rejected as "stale" immediately after completing.
+ *
+ * Solution: Tolerance scales with zoom:
+ * - zoom <= 4:   tolerance = 5  (160ms) - fast renders, tight validation
+ * - 4 < zoom <= 16: tolerance = 10 (320ms) - medium zoom, moderate tolerance
+ * - zoom > 16:   tolerance = 15 (480ms) - high zoom, allows for slower renders
+ *
+ * @param zoom Current zoom level
+ * @returns Epoch tolerance value (5-15)
+ */
+export function getEpochTolerance(zoom: number): number {
+  // Handle edge cases
+  if (!Number.isFinite(zoom) || zoom <= 0) {
+    return 5; // Default to minimum for invalid inputs
+  }
+
+  // Stepped tolerance based on zoom ranges
+  if (zoom <= 4) {
+    return 5; // ≈160ms tolerance
+  } else if (zoom <= 16) {
+    return 10; // ≈320ms tolerance
+  } else {
+    return 15; // ≈480ms tolerance (max)
+  }
+}
 
 export interface PageRenderData {
   imageBlob: Blob;
@@ -140,6 +178,18 @@ export interface TransformSnapshot {
    */
   canvasOffsetX?: number;
   canvasOffsetY?: number;
+  
+  /**
+   * TWO-TRACK FIX: Indicates CSS was pre-set in the Interaction Track.
+   * 
+   * When true, renderTiles() should NOT set canvas CSS dimensions.
+   * This respects the Two-Track Pipeline architecture where:
+   * - Interaction Track (synchronous): Sets CSS for visual feedback
+   * - Refinement Track (async): Composites tiles, no CSS changes
+   * 
+   * @see balancing-forces.md Section 3: TWO-TRACK PIPELINE
+   */
+  cssPreset?: boolean;
 }
 
 /**
@@ -164,6 +214,30 @@ export interface CanvasRenderState {
   /** Canvas buffer dimensions in pixels */
   canvasWidth: number;
   canvasHeight: number;
+}
+
+/**
+ * amnesia-aqv: Render result for recovery coordination.
+ *
+ * When renderTiles() returns with success=false, the caller should:
+ * 1. Keep existing canvas content visible (don't clear)
+ * 2. Take a fresh camera snapshot for the CURRENT position
+ * 3. Schedule immediate tile re-request with the new snapshot
+ *
+ * This implements the recovery mechanism described in balancing-forces.md:
+ * "No blank space during zoom" - always show SOMETHING.
+ *
+ * @see balancing-forces.md Section 7.2: Progressive Quality
+ */
+export interface RenderResult {
+  /** Whether tiles were successfully rendered to canvas */
+  success: boolean;
+  /** Number of tiles actually drawn */
+  tilesDrawn: number;
+  /** Reason for failure (when success=false) */
+  reason?: 'stale-tiles-filtered' | 'epoch-mismatch' | 'aspect-mismatch' | 'canvas-error';
+  /** Additional context for debugging */
+  context?: Record<string, unknown>;
 }
 
 /**
@@ -729,9 +803,29 @@ export class PdfPageElement {
     // This ensures the canvas can hold high-res content for the new zoom level
     // Use window.devicePixelRatio directly to handle DPR changes at runtime (e.g., moving window between displays)
     const dpr = window.devicePixelRatio || this.config.pixelRatio;
+
+    // amnesia-aqv FIX: Account for zoom in buffer sizing to prevent blur at high zoom.
+    //
+    // ROOT CAUSE: In viewport-only mode, CSS transform:scale(zoom) stretches the buffer.
+    // Without this fix, at zoom 32 with DPR 2:
+    //   - Buffer: 896 × 2 = 1792 pixels
+    //   - After CSS scale(32): displayed over 57,344 physical pixels
+    //   - Each buffer pixel covers 32 physical pixels → severe blur
+    //
+    // FIX: Increase buffer size proportionally to zoom (capped to limit memory).
+    // At zoom 32 with MAX_FACTOR=2: buffer = 896 × 2 × 2 = 3584 pixels
+    // This reduces stretch from 32× to 16× → significantly sharper.
+    //
+    // Memory impact: 3584² × 4 bytes ≈ 51MB per page (acceptable).
+    const MAX_ZOOM_BUFFER_FACTOR = 2;
+    const ZOOM_THRESHOLD = 4; // Start increasing buffer above this zoom
+    const zoomBufferFactor = this.currentZoom > ZOOM_THRESHOLD
+      ? Math.min(this.currentZoom / ZOOM_THRESHOLD, MAX_ZOOM_BUFFER_FACTOR)
+      : 1;
+
     // amnesia-5hf FIX: Use rounded dimensions for consistent buffer sizing
-    const bufferWidth = Math.ceil(roundedWidth * dpr);
-    const bufferHeight = Math.ceil(roundedHeight * dpr);
+    const bufferWidth = Math.ceil(roundedWidth * dpr * zoomBufferFactor);
+    const bufferHeight = Math.ceil(roundedHeight * dpr * zoomBufferFactor);
 
     // ALWAYS update canvas CSS to match final dimensions
     // BUG FIX: Previously this was inside needsBufferResize block, causing canvas CSS
@@ -756,6 +850,41 @@ export class PdfPageElement {
     if (!this.isRendered) {
       this.showPlaceholder();
     }
+  }
+
+  /**
+   * TWO-TRACK FIX: Pre-set canvas CSS for viewport-only mode.
+   * 
+   * Called from Interaction Track BEFORE tiles are requested.
+   * This respects the Two-Track Pipeline (balancing-forces.md Section 3):
+   * - Interaction Track (synchronous, <1ms): Sets CSS for visual feedback
+   * - Refinement Track (async, 50-500ms): Composites tiles, NO CSS changes
+   * 
+   * By setting CSS here, we ensure the canvas is correctly sized BEFORE
+   * tiles arrive, preventing the 44x56px bug where CSS was calculated
+   * from incomplete tile results.
+   * 
+   * @param expectedBounds - Tile bounds in PDF coordinates (from transformSnapshot)
+   * @param pdfToElementScale - Scale from PDF to element coordinates
+   */
+  presetViewportOnlyCss(
+    expectedBounds: { x: number; y: number; width: number; height: number },
+    pdfToElementScale: number
+  ): void {
+    // Calculate CSS dimensions from expected bounds
+    const cssWidth = Math.round(expectedBounds.width * pdfToElementScale);
+    const cssHeight = Math.round(expectedBounds.height * pdfToElementScale);
+    const cssOffsetX = expectedBounds.x * pdfToElementScale;
+    const cssOffsetY = expectedBounds.y * pdfToElementScale;
+    
+    // Set CSS immediately (Interaction Track - synchronous)
+    this.canvas.style.width = `${cssWidth}px`;
+    this.canvas.style.height = `${cssHeight}px`;
+    this.canvas.style.transform = `translate(${cssOffsetX}px, ${cssOffsetY}px)`;
+    this.canvas.style.transformOrigin = '0 0';
+    
+    // Track for debugging
+    console.log(`[TWO-TRACK] page=${this.config.pageNumber}: CSS pre-set to ${cssWidth}x${cssHeight} at (${cssOffsetX.toFixed(1)}, ${cssOffsetY.toFixed(1)})`);
   }
 
   /**
@@ -1003,7 +1132,7 @@ export class PdfPageElement {
      *    - Prevents low-res fallbacks from overwriting high-res tiles
      */
     gestureId?: string
-  ): Promise<void> {
+  ): Promise<RenderResult> {
     const startTime = performance.now();
     const telemetry = getTelemetry();
 
@@ -1058,7 +1187,8 @@ export class PdfPageElement {
         for (const t of tiles) {
           t.bitmap.close();
         }
-        return; // Discard tiles
+        // Return success - existing high-res content is preserved (intentional rejection)
+        return { success: true, tilesDrawn: 0 };
       }
 
       if (isNewGesture) {
@@ -1207,12 +1337,21 @@ export class PdfPageElement {
         // that should be upgradeable by higher-res tiles.
         this.lastTileScale = fallback.actualScale;
         this.currentZoom = zoom;
-        
-        return; // Successfully rendered fallback
+
+        // Return success - fallback was rendered, page has content
+        return { success: true, tilesDrawn: 0 };
       }
       
-      console.warn(`[PdfPageElement] renderTiles called with 0 tiles and no fallback available, skipping render`);
-      return;
+      // amnesia-aqv: DO NOT establish full-page canvas with 0 tiles.
+      // At scale 64 with 441x666 page, this would create a 28224x42624 canvas (1.2B pixels)
+      // causing "tile memory limits exceeded" and OOM crashes.
+      //
+      // The normal render flow will establish lastRenderState when actual tiles arrive.
+      // Callers (compositeCachedTilesForPage, compositeFallbackTilesImmediately) now skip
+      // compositing when there's no lastRenderState, so this early return is safe.
+      console.log(`[PdfPageElement] renderTiles with 0 tiles and no fallback: skipping (lastRenderState will be established by normal render)`);
+      // Return success - this is intentional no-op, not a failure
+      return { success: true, tilesDrawn: 0 };
     }
 
     // =========================================================================
@@ -1328,25 +1467,43 @@ export class PdfPageElement {
       if (hasScaleMixing) {
         const originalCount = tiles.length;
         
-        // Strategy: Keep tiles at the target scale. If none at target scale,
-        // keep tiles at the scale with the most tiles (best coverage).
+        // amnesia-aqv FIX: Pick scale CLOSEST to target, not most common.
+        // Previously picked most common scale which could be wildly wrong
+        // (e.g., picking scale 4 when target is 24 just because more scale-4 tiles exist).
+        // Now picks scale closest to target for better visual quality.
         const hasTargetScaleTiles = scaleDistribution.has(targetScale);
         const scaleToKeep = hasTargetScaleTiles 
           ? targetScale 
-          : uniqueScales.reduce((best, s) => 
-              (scaleDistribution.get(s) ?? 0) > (scaleDistribution.get(best) ?? 0) ? s : best,
+          : uniqueScales.reduce((closest, s) => 
+              Math.abs(s - targetScale) < Math.abs(closest - targetScale) ? s : closest,
               uniqueScales[0]
             );
         
-        tiles = tiles.filter(({ tile }) => tile.scale === scaleToKeep);
+        // Additional check: If closest scale is more than 4x away from target,
+        // the tiles are too low resolution to be useful. Reject all and let
+        // new tiles be generated at the correct scale.
+        const scaleRatio = Math.max(targetScale / scaleToKeep, scaleToKeep / targetScale);
+        const MAX_SCALE_RATIO = 4; // 4x stretch is the maximum acceptable
         
-        const filteredCount = originalCount - tiles.length;
-        if (filteredCount > 0) {
+        if (scaleRatio > MAX_SCALE_RATIO) {
           console.warn(
             `[SINGLE-SCALE-ENFORCE] page=${this.config.pageNumber}: ` +
-            `Filtered ${filteredCount}/${originalCount} tiles to enforce single scale ${scaleToKeep} ` +
-            `(target=${targetScale}, had scales: ${uniqueScales.join(', ')})`
+            `Rejecting all ${originalCount} tiles - closest scale ${scaleToKeep} is ${scaleRatio.toFixed(1)}x ` +
+            `away from target ${targetScale} (max allowed: ${MAX_SCALE_RATIO}x). ` +
+            `Had scales: ${uniqueScales.join(', ')}`
           );
+          tiles = []; // Reject all tiles to trigger new generation
+        } else {
+          tiles = tiles.filter(({ tile }) => tile.scale === scaleToKeep);
+          
+          const filteredCount = originalCount - tiles.length;
+          if (filteredCount > 0) {
+            console.warn(
+              `[SINGLE-SCALE-ENFORCE] page=${this.config.pageNumber}: ` +
+              `Filtered ${filteredCount}/${originalCount} tiles to enforce single scale ${scaleToKeep} ` +
+              `(target=${targetScale}, ratio=${scaleRatio.toFixed(2)}x, had scales: ${uniqueScales.join(', ')})`
+            );
+          }
         }
       }
     }
@@ -1362,37 +1519,41 @@ export class PdfPageElement {
     // The epoch counter increments on zoom/pan/mode changes. Tiles carry their
     // request epoch (scaleEpoch). We filter out tiles with epoch drift > tolerance.
     //
-    // TOLERANCE RATIONALE (10 epochs):
+    // TOLERANCE RATIONALE (5 epochs):
     // - Epochs increment every 32ms during scroll/zoom (~31 epochs/second)
     // - High-res tiles take 100-500ms to render
-    // - 10 epochs = ~320ms tolerance = allows most tiles to complete
+    // - 5 epochs = ~160ms tolerance = balanced for tile completion
     // - Too strict (0-3): Causes high-res tile starvation (permanent blurry)
     // - Too loose (>20): Allows tiles from completely different viewports
     //
     // Previously epoch validation was REMOVED entirely, causing stale tiles to
     // be drawn at wrong positions. This restores it with a balanced tolerance.
+    //
+    // amnesia-aqv FIX: Use adaptive epoch tolerance based on zoom level.
+    // At high zoom (32x), tiles take longer to render (300-500ms), so we need more
+    // tolerance to avoid rejecting valid tiles immediately after completion.
     if (currentEpoch !== undefined && tiles.length > 0) {
-      const EPOCH_TOLERANCE = 10;
+      const EPOCH_TOLERANCE = getEpochTolerance(zoom);
       const tilesWithEpoch = tiles.filter(t => t.scaleEpoch !== undefined);
-      
+
       if (tilesWithEpoch.length > 0) {
         const staleTiles = tilesWithEpoch.filter(
           t => Math.abs(currentEpoch - t.scaleEpoch!) > EPOCH_TOLERANCE
         );
-        
+
         if (staleTiles.length > 0) {
           const originalCount = tiles.length;
           tiles = tiles.filter(t => {
             if (t.scaleEpoch === undefined) return true; // Keep tiles without epoch
             return Math.abs(currentEpoch - t.scaleEpoch) <= EPOCH_TOLERANCE;
           });
-          
+
           const filteredCount = originalCount - tiles.length;
           if (filteredCount > 0) {
             console.warn(
               `[EPOCH-VALIDATION] page=${this.config.pageNumber}: ` +
               `Filtered ${filteredCount}/${originalCount} stale tiles with epoch drift > ${EPOCH_TOLERANCE} ` +
-              `(currentEpoch=${currentEpoch})`
+              `(currentEpoch=${currentEpoch}, zoom=${zoom.toFixed(1)})`
             );
           }
         }
@@ -1617,6 +1778,46 @@ export class PdfPageElement {
             `Filtered ${originalTileCountBeforeFilter - tiles.length}/${originalTileCountBeforeFilter} ` +
             `stale tiles outside snapshot bounds`);
         }
+
+        // amnesia-aqv FIX: Early return when ALL tiles are filtered due to pan drift.
+        //
+        // BUG: When all tiles are filtered as stale:
+        // 1. CSS was already preset for viewport-only bounds (e.g., 896x896)
+        // 2. With tiles.length=0, canvas falls back to full-page sizing (28224x42624)
+        // 3. Buffer aspect (0.6622) != CSS aspect (1.0) → 33.8% mismatch → ASPECT-ABORT
+        //
+        // This happens during mode transitions or significant pan where:
+        // - Tiles were requested for old viewport position
+        // - By arrival time, viewport moved significantly
+        // - Snapshot bounds (new position) don't overlap with tile positions (old position)
+        //
+        // amnesia-aqv FIX: When ALL tiles are filtered, return failure to trigger recovery.
+        //
+        // Previous behavior: Return early with no recovery mechanism.
+        // Problem: Canvas goes blank and stays blank until manual re-render.
+        //
+        // New behavior: Return RenderResult with success=false so caller can:
+        // 1. Keep existing canvas content visible
+        // 2. Take a fresh camera snapshot for CURRENT position
+        // 3. Schedule immediate tile re-request with the new snapshot
+        //
+        // This implements the recovery mechanism from balancing-forces.md:
+        // "No blank space during zoom" - always show SOMETHING.
+        if (tiles.length === 0) {
+          console.warn(`[STALE-TILE-FILTER] page=${this.config.pageNumber}: ` +
+            `ALL tiles filtered (pan drift too large), returning failure for recovery`);
+          return {
+            success: false,
+            tilesDrawn: 0,
+            reason: 'stale-tiles-filtered',
+            context: {
+              page: this.config.pageNumber,
+              originalTileCount: originalTileCountBeforeFilter,
+              snapshotBounds: snapBounds,
+              boundsDrift: { x: Math.abs(snapBounds.x - adjustedTileBoundsX), y: Math.abs(snapBounds.y - adjustedTileBoundsY) },
+            },
+          };
+        }
       }
     }
 
@@ -1835,8 +2036,26 @@ export class PdfPageElement {
     // Better to show blank gaps temporarily than corrupted overlapping content.
     const hasRealCanvasContent = this.canvas.width > 300 && this.canvas.height > 150;
     const viewportPositionUnchanged = !offsetChanged && !tileBoundsChanged;
-    // CRITICAL: Scale must also match - preserving content at wrong scale causes stretching
-    const preserveAsLastResort = hasIncompleteCoverage && hasRealCanvasContent && viewportPositionUnchanged && !scaleChanged;
+
+    // amnesia-aqv FIX: Allow preserving content during ZOOM-OUT (scale decrease).
+    //
+    // BUG: During zoom-out, !scaleChanged is false, so old content was never preserved.
+    // This caused blank rectangular gaps while new lower-scale tiles loaded.
+    //
+    // FIX: During zoom-OUT (tileScale < lastTileScale), the high-res content can be
+    // safely scaled DOWN to fit the new canvas. This is standard behavior in apps
+    // like Google Maps - higher-res tiles are shown scaled down until lower-res tiles
+    // arrive. The result is slightly blurry but NEVER blank.
+    //
+    // During zoom-IN, preserving old content would show stretched/blurry content being
+    // ENLARGED, which looks worse than waiting for high-res tiles. So we only allow
+    // preservation during zoom-OUT.
+    const isZoomingOut = this.lastTileScale > 0 && tileScale < this.lastTileScale;
+    const scaleChangeAllowed = !scaleChanged || isZoomingOut;
+
+    // CRITICAL: Scale change during zoom-OUT is ok (content scaled down), but zoom-IN
+    // should not preserve (content would be stretched/enlarged which looks bad)
+    const preserveAsLastResort = hasIncompleteCoverage && hasRealCanvasContent && viewportPositionUnchanged && scaleChangeAllowed;
 
     if ((shouldPreserveContent || preserveAsLastResort) && hasRealCanvasContent) {
       try {
@@ -2031,7 +2250,36 @@ export class PdfPageElement {
         bitmap.close();
         continue;
       }
-      
+
+      // TILE QUALITY VERIFICATION (amnesia-aqv): Audit actual bitmap dimensions
+      // This is the ground truth check - if bitmap dimensions don't match claimed scale,
+      // we have proof that content is actually lower-res than claimed.
+      if (isQualityVerificationEnabled()) {
+        auditTileDimensions(
+          bitmap,
+          this.config.pageNumber,
+          tile.tileX,
+          tile.tileY,
+          tile.scale,
+          tile.tileSize ?? actualTileSize
+        );
+
+        // BITMAP CONTENT VERIFICATION (amnesia-aqv): Sample bitmap pixels BEFORE drawing
+        // This detects blank/white bitmaps that would result in invisible content.
+        // Sample every 10th tile to balance diagnostics vs performance.
+        if (tilesDrawn % 10 === 0) {
+          const tileKey = `p${this.config.pageNumber}-t${tile.tileX}x${tile.tileY}-s${tile.scale}`;
+          const sample = sampleBitmapContent(bitmap, tileKey, 5);
+          if (sample.isBlank) {
+            console.error(
+              `[BLANK-BITMAP-BEFORE-DRAW] ${tileKey}: ` +
+              `Bitmap content is ${sample.blankReason} BEFORE ctx.drawImage()! ` +
+              `This means mupdf-worker returned blank content.`
+            );
+          }
+        }
+      }
+
       // amnesia-e4i: Skip fallback tiles if target-scale tile exists for this position
       const tilePositionKey = `${tile.tileX},${tile.tileY}`;
       const effectiveStretch = cssStretch ?? (tileScale / tile.scale);
@@ -2204,7 +2452,7 @@ export class PdfPageElement {
     if (renderSeq !== this.latestRenderSeq) {
       console.warn(`[RENDER-SEQ] page=${this.config.pageNumber} seq=${renderSeq} DISCARDED-EARLY ` +
         `(latestRenderSeq=${this.latestRenderSeq}) - stale before canvas update`);
-      return;
+      return { success: false, tilesDrawn: 0, reason: 'epoch-mismatch' };
     }
 
     // Now atomically update the visible canvas
@@ -2320,6 +2568,20 @@ export class PdfPageElement {
       // (e.g., PDF Dimension Unification changed from baseWidth=400 to native 441).
       // A stale snapshot causes buffer/CSS aspect mismatch → visual corruption.
       const snapshotPdfToElementScale = transformSnapshot?.pdfToElementScale;
+      // amnesia-aqv FIX: CSS should NOT include zoom - camera scale(zoom) handles visual magnification.
+      //
+      // PREVIOUS BUG: pdfToElementScale included zoom, causing double-zoom:
+      // - CSS = bounds × (effectiveWidth/pdfWidth) × zoom
+      // - Camera = scale(zoom)
+      // - Result: CSS zoomed TWICE → buffer severely stretched (16× at zoom 32)
+      //
+      // CORRECT: pdfToElementScale is the base scale to fit PDF in container (no zoom).
+      // - CSS = bounds × (effectiveWidth/pdfWidth) [base scale only]
+      // - Camera = scale(zoom) [handles visual zoom]
+      // - Buffer = bounds × tileScale = bounds × zoom × DPR [high-res]
+      // - Buffer/displayed = DPR (crisp!)
+      //
+      // NOTE: Snapshot staleness detection now compares base scales without zoom.
       const currentPdfToElementScale = effectiveWidth / pdfWidth;
 
       // Check for significant divergence (>5% indicates stale snapshot)
@@ -2398,7 +2660,7 @@ export class PdfPageElement {
         for (const { bitmap } of tiles) {
           bitmap.close();
         }
-        return;
+        return { success: false, tilesDrawn: 0, reason: 'aspect-mismatch' };
       }
 
       if (aspectDivergence > 0.01) {
@@ -2479,7 +2741,7 @@ export class PdfPageElement {
         `stale render would corrupt canvas. Tiles drawn to offscreen but NOT committed.`);
       // Don't commit to main canvas - just return
       // The localOffscreen buffer is garbage collected automatically
-      return;
+      return { success: false, tilesDrawn: 0, reason: 'epoch-mismatch' };
     }
     // ==========================================================================
     // CONCURRENT RENDER FIX (amnesia-d9f 2026-01-23): Apply CSS AFTER gate passes
@@ -2499,7 +2761,14 @@ export class PdfPageElement {
     // 3. Render A passes gate, applies CSS (184, 112), commits tiles
     // 4. Render B fails gate (A incremented latestRenderSeq), discarded
     // 5. DOM has A's CSS with A's tiles → correct
-    if (pendingCssWidth > 0 && pendingCssHeight > 0) {
+    //
+    // TWO-TRACK FIX: Skip CSS setting if pre-set by Interaction Track.
+    // When transformSnapshot.cssPreset is true, CSS was already set by
+    // presetViewportOnlyCss() before tiles were requested. This respects
+    // the Two-Track Pipeline (balancing-forces.md Section 3).
+    const cssAlreadyPreset = transformSnapshot?.cssPreset === true;
+    
+    if (pendingCssWidth > 0 && pendingCssHeight > 0 && !cssAlreadyPreset) {
       this.canvas.style.width = `${pendingCssWidth}px`;
       this.canvas.style.height = `${pendingCssHeight}px`;
       this.canvas.style.transform = pendingCssTransform;
@@ -2516,6 +2785,9 @@ export class PdfPageElement {
         offsetY: pendingCssOffsetY,
       });
 
+    } else if (cssAlreadyPreset) {
+      // CSS was pre-set by Interaction Track - log for debugging
+      console.log(`[TWO-TRACK] page=${this.config.pageNumber}: CSS skip in renderTiles (pre-set by Interaction Track)`);
     }
 
     // Copy offscreen buffer to visible canvas in one operation
@@ -2569,6 +2841,9 @@ export class PdfPageElement {
 
     // Apply reading mode styles now that we have content
     this.applyReadingModeStyles();
+
+    // Return success with actual tiles drawn
+    return { success: true, tilesDrawn };
   }
 
   /**
@@ -2595,7 +2870,120 @@ export class PdfPageElement {
   getLastRenderStateEpoch(): number | null {
     return this.lastRenderState?.epoch ?? null;
   }
-  
+
+  getLastRenderStateTileScale(): number | null {
+    return this.lastRenderState?.tileScale ?? null;
+  }
+
+  /**
+   * amnesia-aqv: Establish minimal render state to allow tile compositing.
+   * 
+   * Called when fallback rendering times out but we need tiles to be compositable.
+   * This creates a minimal lastRenderState using the EXISTING canvas dimensions
+   * (or a small placeholder) without creating a massive full-page canvas.
+   * 
+   * Key insight: lastRenderState is needed for addTilesToExistingCanvas to work.
+   * Without it, completed tiles are rejected. This method establishes that state
+   * so tiles can be composited as they complete from the queue.
+   * 
+   * @param zoom Current zoom level
+   * @param pdfDims PDF page dimensions
+   * @param epoch Current scale epoch
+   * @param tileScale Target tile scale
+   */
+  establishMinimalRenderState(
+    zoom: number,
+    pdfDims: { width: number; height: number },
+    epoch: number,
+    tileScale: number,
+    viewportOffset?: { x: number; y: number }
+  ): void {
+    // amnesia-aqv FIX: Update render state when viewport offset OR scale changes.
+    // This is critical for tile positioning at high zoom - the canvas must match
+    // the current viewport and scale, not values from when the canvas was first created.
+    if (this.lastRenderState) {
+      const offsetChanged = viewportOffset && (
+        Math.abs(this.lastRenderState.canvasOffsetX - viewportOffset.x) > 0.1 ||
+        Math.abs(this.lastRenderState.canvasOffsetY - viewportOffset.y) > 0.1
+      );
+      const scaleChanged = Math.abs(this.lastRenderState.tileScale - tileScale) > 0.5;
+      
+      if (offsetChanged || scaleChanged) {
+        // Scale or offset changed - need to reinitialize render state
+        console.log(`[establishMinimalRenderState] page=${this.config.pageNumber}: ` +
+          `Reinitializing - ${scaleChanged ? `scale ${this.lastRenderState.tileScale}→${tileScale}` : ''} ` +
+          `${offsetChanged ? `offset (${this.lastRenderState.canvasOffsetX.toFixed(1)},${this.lastRenderState.canvasOffsetY.toFixed(1)})→(${viewportOffset!.x.toFixed(1)},${viewportOffset!.y.toFixed(1)})` : ''}`);
+        // Fall through to reinitialize
+        this.lastRenderState = null as any; // Clear to trigger full reinitialization
+      } else {
+        // No significant change - skip
+        return;
+      }
+    }
+
+    // amnesia-aqv FIX: Calculate proper canvas dimensions based on viewport, not 1x1 placeholder.
+    //
+    // BUG: Using 1x1 canvas caused CSS to stay at 1x1 even after buffer was resized,
+    // making all rendered content invisible (1792x1792 buffer displayed at 1x1 CSS).
+    //
+    // SOLUTION: Use container dimensions (which match the page element's current size in the layout)
+    // to establish both buffer AND CSS dimensions. This ensures content is visible immediately.
+    const containerWidth = this.container.offsetWidth || this.currentWidth || 100;
+    const containerHeight = this.container.offsetHeight || this.currentHeight || 100;
+
+    // Calculate buffer dimensions at the target tile scale
+    // For viewport-only mode, we'll render at the container size
+    const bufferWidth = Math.ceil(containerWidth * tileScale / zoom);
+    const bufferHeight = Math.ceil(containerHeight * tileScale / zoom);
+
+    // Cap buffer size to prevent memory issues (8192 max per dimension)
+    const maxDim = 8192;
+    const cappedBufferWidth = Math.min(bufferWidth, maxDim);
+    const cappedBufferHeight = Math.min(bufferHeight, maxDim);
+
+    // Set canvas buffer dimensions
+    this.canvas.width = cappedBufferWidth;
+    this.canvas.height = cappedBufferHeight;
+
+    // CRITICAL: Set CSS dimensions to match container (makes content visible!)
+    this.canvas.style.width = `${containerWidth}px`;
+    this.canvas.style.height = `${containerHeight}px`;
+    this.canvas.style.opacity = '1';
+
+    // amnesia-aqv FIX: Use viewport offset for proper tile positioning at high zoom.
+    //
+    // BUG: When canvasOffsetX/Y = 0, tiles at viewport position (162, 247) get placed at
+    // canvas position (162 - 0) * 32 = 5184, which is way outside the ~900px canvas!
+    //
+    // FIX: Store the viewport's PDF origin so tile positions are calculated relative to it:
+    // canvasX = (tilePdfX - viewportOffsetX) * tileScale
+    // For tile at (220, 332) and viewport at (162, 247): (220-162)*32 = 1856 (within bounds)
+    const canvasOffsetX = viewportOffset?.x ?? 0;
+    const canvasOffsetY = viewportOffset?.y ?? 0;
+
+    // Set lastRenderState with calculated dimensions
+    this.lastRenderState = {
+      canvasOffsetX,
+      canvasOffsetY,
+      tileScale,
+      pdfWidth: pdfDims.width,
+      pdfHeight: pdfDims.height,
+      canvasWidth: cappedBufferWidth,
+      canvasHeight: cappedBufferHeight,
+      epoch,
+    };
+    this.lastTileScale = tileScale;
+    this.currentZoom = zoom;
+
+    // Update currentWidth/Height for consistency
+    this.currentWidth = containerWidth;
+    this.currentHeight = containerHeight;
+
+    console.log(`[establishMinimalRenderState] page=${this.config.pageNumber}: ` +
+      `Established render state (buffer=${cappedBufferWidth}x${cappedBufferHeight}, css=${containerWidth}x${containerHeight}, ` +
+      `scale=${tileScale}, epoch=${epoch}, offset=(${canvasOffsetX.toFixed(1)},${canvasOffsetY.toFixed(1)}))`);
+  }
+
   addTilesToExistingCanvas(
     tiles: Array<{
       tile: TileCoordinate;
@@ -2609,6 +2997,7 @@ export class PdfPageElement {
     // Only draw tiles if their epoch matches the canvas render state epoch.
     // Guard: Need render state for coordinate calculations
     if (!this.lastRenderState) {
+      console.warn(`[addTilesToExistingCanvas] page=${this.config.pageNumber}: REJECTED - no lastRenderState`);
       return false;
     }
     
@@ -2631,9 +3020,14 @@ export class PdfPageElement {
     // 5. But tile content is from (100, 100) viewport → wrong position!
     //
     // The epoch check ensures we only composite tiles from the SAME render session.
-    const EPOCH_TOLERANCE = 3; // Allow small epoch drift for race conditions
+    // amnesia-aqv FIX: Use adaptive tolerance based on zoom level. At high zoom (32x),
+    // tiles take longer to render, so we allow more epoch drift.
+    const EPOCH_TOLERANCE = getEpochTolerance(this.currentZoom);
     const epochDiff = Math.abs(this.lastRenderState.epoch - tileEpoch);
     if (epochDiff > EPOCH_TOLERANCE) {
+      console.warn(`[addTilesToExistingCanvas] page=${this.config.pageNumber}: REJECTED - epoch mismatch: ` +
+        `lastRenderState.epoch=${this.lastRenderState.epoch}, tileEpoch=${tileEpoch}, diff=${epochDiff}, ` +
+        `tolerance=${EPOCH_TOLERANCE} (zoom=${this.currentZoom.toFixed(1)})`);
       // Close bitmaps to prevent memory leak
       for (const { bitmap } of tiles) {
         bitmap.close();
@@ -2644,9 +3038,25 @@ export class PdfPageElement {
     // Use STORED canvas state for coordinate calculations.
     // This is the state from when renderTiles() last completed successfully.
     const { canvasOffsetX, canvasOffsetY, tileScale, pdfWidth, pdfHeight, canvasWidth, canvasHeight } = this.lastRenderState;
-    
+
+    // amnesia-aqv DIAGNOSTIC: Log render state values for debugging
+    if (tiles.length > 0) {
+      const firstTile = tiles[0].tile;
+      const tilePdfTileSize = (firstTile.tileSize ?? 128) / firstTile.scale;
+      const tilePdfX = firstTile.tileX * tilePdfTileSize;
+      const tilePdfY = firstTile.tileY * tilePdfTileSize;
+      const canvasX = Math.round((tilePdfX - canvasOffsetX) * tileScale);
+      const canvasY = Math.round((tilePdfY - canvasOffsetY) * tileScale);
+      console.log(`[addTiles-DIAGNOSTIC] page=${this.config.pageNumber}: ` +
+        `canvas=${canvasWidth}x${canvasHeight}, offset=(${canvasOffsetX.toFixed(1)},${canvasOffsetY.toFixed(1)}), ` +
+        `tileScale=${tileScale}, firstTile=(${firstTile.tileX},${firstTile.tileY}), ` +
+        `tilePdf=(${tilePdfX.toFixed(1)},${tilePdfY.toFixed(1)}), canvasPos=(${canvasX},${canvasY})`);
+    }
+
     // Verify canvas dimensions haven't changed unexpectedly
     if (this.canvas.width !== canvasWidth || this.canvas.height !== canvasHeight) {
+      console.warn(`[addTilesToExistingCanvas] page=${this.config.pageNumber}: REJECTED - dimension mismatch: ` +
+        `canvas=${this.canvas.width}x${this.canvas.height}, lastRenderState=${canvasWidth}x${canvasHeight}`);
       return false;
     }
     
@@ -2683,16 +3093,49 @@ export class PdfPageElement {
         bitmap.close();
         continue;
       }
-      
+
+      // BITMAP CONTENT VERIFICATION (amnesia-aqv): Sample bitmap pixels BEFORE drawing
+      // in additive composite path. Sample every 10th tile.
+      if (isQualityVerificationEnabled() && tilesDrawn % 10 === 0) {
+        const tileKey = `p${this.config.pageNumber}-t${tile.tileX}x${tile.tileY}-s${tile.scale}-additive`;
+        const sample = sampleBitmapContent(bitmap, tileKey, 5);
+        if (sample.isBlank) {
+          console.error(
+            `[BLANK-BITMAP-ADDITIVE] ${tileKey}: ` +
+            `Bitmap content is ${sample.blankReason} BEFORE ctx.drawImage()!`
+          );
+        }
+      }
+
+      // SCALE MISMATCH DIAGNOSTIC (amnesia-aqv): Log when tile scale differs from render scale
+      // This is the root cause of blur - stretching low-res tiles to high-res canvas
+      const scaleMismatch = tile.scale !== tileScale;
+      const stretchFactor = tileScale / tile.scale;
+      if (scaleMismatch && tilesDrawn < 3) {
+        console.warn(`[SCALE-MISMATCH] page=${this.config.pageNumber} tile=(${tile.tileX},${tile.tileY}): ` +
+          `tile.scale=${tile.scale}, renderState.tileScale=${tileScale}, ` +
+          `stretch=${stretchFactor.toFixed(1)}x, bitmap=${bitmap.width}×${bitmap.height}, ` +
+          `drawSize=${drawWidth}×${drawHeight}`);
+      }
+
       // Draw tile (additive - no clearing)
       ctx.drawImage(
         bitmap,
         0, 0, bitmap.width, bitmap.height,
         canvasX, canvasY, drawWidth, drawHeight
       );
-      
+
       tilesDrawn++;
       bitmap.close();
+    }
+
+    console.log(`[addTilesToExistingCanvas] page=${this.config.pageNumber}: SUCCESS drew ${tilesDrawn}/${tiles.length} tiles`);
+    
+    // amnesia-aqv FIX: Show canvas after drawing tiles.
+    // Canvas starts with opacity:0 to prevent blank flash. After tiles are drawn,
+    // we need to make the canvas visible. Without this, content is drawn but stays invisible!
+    if (tilesDrawn > 0) {
+      this.showCanvas();
     }
     
     return true;

@@ -25,6 +25,69 @@ export interface Camera {
   z: number;
 }
 
+/**
+ * CameraState - Alias for Camera interface for semantic clarity.
+ * Used when the camera state is being read/modified in real-time.
+ */
+export type CameraState = Camera;
+
+/**
+ * Immutable camera snapshot captured at a specific point in time.
+ *
+ * INV-4: Viewport snapshots prevent coordinate drift when camera moves
+ * during debounced render operations. At 32x zoom, 1px of camera drift
+ * causes 32px of tile misalignment.
+ *
+ * Key properties:
+ * - Immutable: Once created, values cannot be modified
+ * - Timestamped: Includes capture time for debugging
+ * - Bounds-clamped: Values are constrained to valid ranges
+ */
+export interface CameraSnapshot {
+  /** X offset in canvas coordinates (clamped to >= 0) */
+  readonly x: number;
+  /** Y offset in canvas coordinates (clamped to >= 0) */
+  readonly y: number;
+  /** Zoom level (clamped to 0.1-64 range) */
+  readonly z: number;
+  /** Timestamp when snapshot was captured */
+  readonly timestamp: number;
+}
+
+// Bounds for camera snapshot clamping
+const SNAPSHOT_MIN_ZOOM = 0.1;
+const SNAPSHOT_MAX_ZOOM = 64;
+
+/**
+ * Create an immutable camera snapshot from current camera state.
+ *
+ * INV-4: This function is critical for preventing coordinate drift.
+ * The snapshot captures camera state at tile REQUEST time, ensuring
+ * tiles are positioned correctly even if the camera moves during
+ * debounced render operations.
+ *
+ * The snapshot is frozen to prevent accidental modification.
+ *
+ * @param camera Current camera state to snapshot
+ * @returns Immutable camera snapshot
+ */
+export function createCameraSnapshot(camera: CameraState): CameraSnapshot {
+  // Clamp values to valid ranges
+  const x = Math.max(0, camera.x);
+  const y = Math.max(0, camera.y);
+  const z = clamp(camera.z, SNAPSHOT_MIN_ZOOM, SNAPSHOT_MAX_ZOOM);
+
+  // Create frozen object for immutability
+  const snapshot: CameraSnapshot = Object.freeze({
+    x,
+    y,
+    z,
+    timestamp: Date.now(),
+  });
+
+  return snapshot;
+}
+
 export interface CameraConstraints {
   minZoom: number;
   maxZoom: number;
