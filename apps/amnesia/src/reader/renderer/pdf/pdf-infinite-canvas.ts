@@ -466,6 +466,10 @@ export class PdfInfiniteCanvas {
     };
 
     // Create viewport (clips content, handles overflow)
+    // REVERTED (amnesia-aev): Viewport containment removed as part of CVV revert.
+    // The LLM Council determined that while viewport containment itself doesn't break
+    // coordinates, the overall CVV approach (with content-visibility on pages) is
+    // incompatible with getBoundingClientRect()-based tile positioning.
     this.viewport = document.createElement('div');
     this.viewport.className = 'pdf-infinite-viewport';
     this.viewport.style.cssText = `
@@ -482,16 +486,15 @@ export class PdfInfiniteCanvas {
     // Create canvas (transformed container for all pages)
     // GPU LAYER PROMOTION: will-change + backface-visibility ensure the canvas
     // is promoted to its own compositing layer for smooth 60fps zoom/pan.
+    //
+    // TILE MEMORY FIX (amnesia-aev): Add `contain: layout style` to create a
+    // stacking context boundary. This helps Chromium's compositor bound its
+    // tile calculations to this subtree, reducing memory pressure at high zoom.
+    // Unlike `contain: paint` (which clips content) or `contain: size` (which
+    // breaks auto-sizing), `layout style` preserves coordinate accuracy while
+    // providing isolation benefits.
     this.canvas = document.createElement('div');
     this.canvas.className = 'pdf-infinite-canvas';
-    // COMPOSITOR OPTIMIZATION (amnesia-aev): Add CSS containment to limit Chromium
-    // compositor tile creation. Without containment, at 32x zoom each page becomes
-    // ~19,584 × 25,344 px, and Chromium creates tiles for the entire transformed area.
-    // This causes "tile memory limits exceeded" errors.
-    //
-    // contain: layout style - Creates stacking context and containing block
-    // without breaking the auto-sizing or transform behavior we need.
-    // Do NOT use 'strict' or 'size' as they break layout.
     this.canvas.style.cssText = `
       position: absolute;
       top: 0;
@@ -3169,15 +3172,30 @@ export class PdfInfiniteCanvas {
     const viewportPdfWidth = intersectRight - intersectLeft;
     const viewportPdfHeight = intersectBottom - intersectTop;
     
-    // Add 50% buffer for camera drift during async operations
-    const bufferX = viewportPdfWidth * 0.5;
-    const bufferY = viewportPdfHeight * 0.5;
-    
+    // amnesia-5ec FIX: Query region must match CANVAS bounds, not viewport bounds.
+    //
+    // BUG: At high zoom, the screen viewport is larger than the canvas (which is sized
+    // to the page container element). Query used viewport bounds, but canvas was smaller:
+    // - viewport: 59x86 PDF units (from camera intersection)
+    // - canvas: 27x42 PDF units (from container / zoom)
+    // Tiles at PDF X=220 were fetched but canvas only covered [191, 218], causing
+    // "All 60 tiles out of bounds" error.
+    //
+    // FIX: Cap query region to what canvas can actually display.
+    // Canvas PDF coverage = container size / zoom (not tileScale!)
+    // This ensures every tile returned will fit within the canvas bounds.
+    const containerWidth = element?.getCurrentWidth?.() || 441;
+    const containerHeight = element?.getCurrentHeight?.() || 666;
+
+    // Canvas PDF coverage (what the canvas can actually display)
+    const canvasPdfWidth = containerWidth / zoom;
+    const canvasPdfHeight = containerHeight / zoom;
+
     const queryRegion = {
-      x: Math.max(0, viewportPdfX - bufferX),
-      y: Math.max(0, viewportPdfY - bufferY),
-      width: Math.min(pageDims.width - Math.max(0, viewportPdfX - bufferX), viewportPdfWidth + bufferX * 2),
-      height: Math.min(pageDims.height - Math.max(0, viewportPdfY - bufferY), viewportPdfHeight + bufferY * 2),
+      x: Math.max(0, viewportPdfX),
+      y: Math.max(0, viewportPdfY),
+      width: Math.min(canvasPdfWidth, pageDims.width - viewportPdfX, viewportPdfWidth),
+      height: Math.min(canvasPdfHeight, pageDims.height - viewportPdfY, viewportPdfHeight),
     };
     
     const spatialResults = cacheManager.getBestAvailableSpatial(page, queryRegion, tileScale);
@@ -3249,15 +3267,25 @@ export class PdfInfiniteCanvas {
     // At HIGH zoom (>= 8x): Only part of page visible, use viewport offset
     const isHighZoom = zoom >= 8;
     const renderStateEpoch = this.zoomScaleService.getEpoch();
-    
+
+    // CRITICAL FIX (amnesia-aev): Check if scale changed significantly.
+    // BUG: When zooming from 32x to 1x, isHighZoom=false and lastRenderState exists,
+    // so establishMinimalRenderState was skipped. This left the old high-scale render
+    // state (tileScale=64), causing a 16x scale mismatch rejection loop.
+    const currentCanvasScale = element.getLastRenderStateTileScale?.() ?? 0;
+    const scaleChanged = currentCanvasScale > 0 &&
+      Math.max(tileScale / currentCanvasScale, currentCanvasScale / tileScale) > 2;
+
     if (isHighZoom) {
       // At high zoom, always call establishMinimalRenderState with viewport offset
       // It internally checks if scale/offset changed and only reinitializes when needed
       const viewportOffset = { x: viewportPdfX, y: viewportPdfY };
       element.establishMinimalRenderState(zoom, pageDims, renderStateEpoch, tileScale, viewportOffset);
-    } else if (element.getLastRenderStateEpoch?.() === null) {
-      // At low zoom, only establish if not set, with offset (0,0)
-      console.log(`[compositeCachedTiles] page=${page}: Establishing minimal render state (low zoom)`);
+    } else if (element.getLastRenderStateEpoch?.() === null || scaleChanged) {
+      // At low zoom, establish if not set OR if scale changed significantly
+      if (scaleChanged) {
+        console.log(`[compositeCachedTiles] page=${page}: Scale change detected (${currentCanvasScale}→${tileScale}), reinitializing render state`);
+      }
       element.establishMinimalRenderState(zoom, pageDims, renderStateEpoch, tileScale, { x: 0, y: 0 });
     }
 
@@ -3721,20 +3749,22 @@ export class PdfInfiniteCanvas {
     // amnesia-aqv FIX: Use localPageDimensions first (per-document), then tileEngine (shared singleton)
     const pdfDims = this.localPageDimensions.get(page) ?? this.tileEngine?.pageDimensions.get(page);
     const pdfWidth = pdfDims?.width ?? containerWidth;
-    // amnesia-aqv FIX: pdfToElementScale is the BASE scale (no zoom).
+    // amnesia-5ec FIX: pdfToElementScale is the BASE scale (no zoom).
     //
-    // CRITICAL: containerWidth is already zoomed (element.getCurrentWidth() returns
-    // finalWidth = layout.width × zoom). We must divide by zoom to get base scale.
+    // COORDINATE SPACE AWARENESS:
+    // - Unified mode: containerWidth = layout.width × zoom → divide by zoom to get base
+    // - Legacy mode: containerWidth = layout.width (NOT zoomed) → use directly
     //
-    // The camera transform applies scale(zoom) to the entire canvas, so:
-    // - CSS dimensions = tile bounds × (containerWidth / pdfWidth / zoom) [base scale]
-    // - Camera = scale(zoom) [visual zoom]
-    // - Buffer = bounds × tileScale = bounds × zoom × DPR [high-res]
+    // PREVIOUS BUG: Always dividing by zoom assumed unified mode, but in legacy mode
+    // containerWidth is already the base width. This caused pdfToElementScale to be
+    // 1/zoom of the correct value (0.0313 instead of 1.0 at zoom 32), triggering
+    // STALE-SNAPSHOT warnings with 96.9% divergence.
     //
-    // This ensures buffer/display = DPR (crisp at any zoom level).
-    //
-    // PREVIOUS BUG: Including zoom (directly or via containerWidth) caused double-zoom.
-    const pdfToElementScale = containerWidth / pdfWidth / zoom;
+    // The camera transform applies scale(zoom) to the entire canvas, so CSS should
+    // use the BASE scale (no zoom) - camera handles visual magnification.
+    const pdfToElementScale = this.useUnifiedCoordinateSpace
+      ? containerWidth / pdfWidth / zoom  // unified: containerWidth is zoomed
+      : containerWidth / pdfWidth;         // legacy: containerWidth is base
     
     const transformSnapshot: TransformSnapshot = {
       containerWidth,
